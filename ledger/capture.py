@@ -115,9 +115,7 @@ class CaptureService:
                         f"[{overlap['window_start']}, {overlap['window_end']}]"
                     )
 
-                decision_at = self.clock()
-                if decision_at.tzinfo is None or decision_at.utcoffset() is None:
-                    raise SnapshotCaptureError("capture clock must return a timezone-aware value")
+                decision_at = self._clock_time()
                 prediction_id = f"pred_{uuid.uuid4().hex}"
                 run_id = f"run_{uuid.uuid4().hex}"
                 pending = PendingPrediction(
@@ -131,6 +129,7 @@ class CaptureService:
                     created_at=decision_at,
                 )
                 snapshot = self._capture_snapshot(pending, decision_at)
+                committed_at = self._clock_time()
                 draft = PredictionDraft(
                     prediction_id=prediction_id,
                     run_id=run_id,
@@ -148,6 +147,7 @@ class CaptureService:
                     draft,
                     connection=connection,
                     expected_schema_hash=schema_hash,
+                    committed_at=committed_at,
                 )
                 self.registry.register_capture_request(
                     idempotency_key=capture.idempotency_key,
@@ -206,6 +206,12 @@ class CaptureService:
             raise
         except Exception as exc:
             raise SnapshotCaptureError("snapshot capture failed") from exc
+
+    def _clock_time(self) -> datetime:
+        value = self.clock()
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise SnapshotCaptureError("capture clock must return a timezone-aware value")
+        return value
 
     @staticmethod
     def _coerce_request(

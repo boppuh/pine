@@ -5,10 +5,11 @@ import threading
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import JsonValue
 
 from ledger.capture import CaptureService
@@ -23,6 +24,7 @@ from ledger.snapshot import PendingPrediction
 from ledger.writer import LedgerWriter
 
 DECISION_AT = datetime(2026, 7, 16, 13, 30, tzinfo=UTC)
+COMMITTED_AT = DECISION_AT + timedelta(seconds=5)
 
 
 class FakeSnapshotProvider:
@@ -94,6 +96,7 @@ def test_capture_creates_preregistered_record_with_snapshot(
     assert row["registration_status"] == RegistrationStatus.PREREGISTERED.value
     assert row["transaction_state"] == "committed"
     assert row["created_at"] == DECISION_AT.isoformat()
+    assert row["committed_at"] == DECISION_AT.isoformat()
     assert len(provider.calls) == 1
     pending, captured_at = provider.calls[0]
     assert pending.prediction_id == result.prediction_id
@@ -109,6 +112,27 @@ def test_capture_creates_preregistered_record_with_snapshot(
     assert binding is not None
     assert binding["idempotency_key"] == capture_request.idempotency_key
     assert binding["prediction_id"] == result.prediction_id
+
+
+def test_capture_uses_injected_clock_for_decision_and_commit_times(
+    vault: Path,
+    capture_request: PreregisteredCaptureRequest,
+) -> None:
+    times = iter((DECISION_AT, COMMITTED_AT))
+    provider = FakeSnapshotProvider(delay=0.01)
+    service = CaptureService(vault, provider, clock=lambda: next(times))
+
+    result = service.capture(capture_request)
+
+    row = service.registry.get_prediction(result.prediction_id)
+    assert row is not None
+    assert row["created_at"] == DECISION_AT.isoformat()
+    assert row["committed_at"] == COMMITTED_AT.isoformat()
+    _, yaml_text, _ = result.record_path.read_text(encoding="utf-8").split("---", maxsplit=2)
+    frontmatter = yaml.safe_load(yaml_text)
+    assert frontmatter["created_at"] == DECISION_AT.isoformat()
+    assert frontmatter["committed_at"] == COMMITTED_AT.isoformat()
+    assert provider.calls[0][1] == DECISION_AT
 
 
 def test_capture_refuses_touched_window_before_snapshot(

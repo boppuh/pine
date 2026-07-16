@@ -182,6 +182,7 @@ class LedgerWriter:
         *,
         connection: sqlite3.Connection,
         expected_schema_hash: str | None = None,
+        committed_at: datetime | None = None,
     ) -> StagedWrite:
         """Stage artifacts and rows inside a caller-owned immediate transaction.
 
@@ -200,6 +201,7 @@ class LedgerWriter:
         committed = self._prepare_committed(
             draft,
             expected_schema_hash=expected_schema_hash,
+            committed_at=committed_at,
         )
         return self._stage_committed(committed, connection=connection)
 
@@ -208,6 +210,7 @@ class LedgerWriter:
         draft: PredictionDraft,
         *,
         expected_schema_hash: str | None = None,
+        committed_at: datetime | None = None,
     ) -> CommittedPrediction:
         forecast = draft.forecast.model_dump(mode="json")
         schema = self.schema_registry.load(draft.schema_id)
@@ -218,6 +221,11 @@ class LedgerWriter:
         schema_hash = self.schema_registry.hash(schema)
         if expected_schema_hash is not None and schema_hash != expected_schema_hash:
             raise IntegrityError("forecast schema changed during the capture transaction")
+        commit_time = committed_at or datetime.now(UTC)
+        if commit_time.tzinfo is None or commit_time.utcoffset() is None:
+            raise IntegrityError("committed_at must be timezone-aware")
+        if commit_time < draft.created_at:
+            raise IntegrityError("committed_at cannot precede created_at")
         snapshot_ref = f".ledger/snapshots/{draft.prediction_id}.json"
         immutable_hash = sha256_json(
             immutable_payload(
@@ -231,7 +239,7 @@ class LedgerWriter:
             schema_hash=schema_hash,
             snapshot_ref=snapshot_ref,
             immutable_hash=immutable_hash,
-            committed_at=datetime.now(UTC),
+            committed_at=commit_time,
         )
 
     def _stage_committed(
