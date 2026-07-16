@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Runtime ledger state is local and never version-controlled.
+.ledger/registry.db
+.ledger/registry.db-shm
+.ledger/registry.db-wal
+.ledger/registry.lock
+.ledger/snapshots/
+
+# JSON Schemas under .ledger/schemas/ are intentionally tracked.

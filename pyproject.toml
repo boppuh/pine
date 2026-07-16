@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "decision-edge-ledger"
+version = "0.1.0"
+description = "Local-first integrity substrate for the Decision Edge Engine"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "filelock>=3.15,<4",
+  "jsonschema[format]>=4.22,<5",
+  "pydantic>=2.7,<3",
+  "PyYAML>=6.0,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2,<9",
+  "pytest-cov>=5,<7",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["ledger"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["ledger"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:decision-edge:forecast:finance/strategy-edge:1",
+  "title": "Finance Strategy Edge Forecast v1",
+  "description": "A falsifiable pre-run forecast for a trading strategy edge.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "strategy_id",
+    "expected_metrics",
+    "in_sample_window",
+    "out_of_sample_window",
+    "invalidation",
+    "edge_source"
+  ],
+  "properties": {
+    "strategy_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "expected_metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sharpe", "win_rate", "max_drawdown", "expectancy"],
+      "properties": {
+        "sharpe": {"type": "number"},
+        "win_rate": {"type": "number", "minimum": 0, "maximum": 1},
+        "max_drawdown": {"type": "number"},
+        "expectancy": {"type": "number"}
+      }
+    },
+    "in_sample_window": {
+      "$ref": "#/$defs/date_window"
+    },
+    "out_of_sample_window": {
+      "$ref": "#/$defs/date_window"
+    },
+    "invalidation": {
+      "type": "string",
+      "minLength": 1
+    },
+    "edge_source": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "$defs": {
+    "date_window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end"],
+      "properties": {
+        "start": {"type": "string", "format": "date"},
+        "end": {"type": "string", "format": "date"}
+      }
+    }
+  }
+}
