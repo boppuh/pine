@@ -6,6 +6,8 @@ from ledger.errors import (
     FreshWindowError,
     IdempotencyConflictError,
     IntegrityError,
+    RunExecutionError,
+    RunStateError,
     SchemaNotFoundError,
     SnapshotCaptureError,
 )
@@ -18,6 +20,13 @@ from ledger.integrity import (
 )
 from ledger.msm import MSMSnapshotProvider, MSMSnapshotSource, StrategySnapshot
 from ledger.registry import LedgerRegistry
+from ledger.run import (
+    ExploratoryRunRequest,
+    PreregisteredRunRequest,
+    RunResult,
+    RunService,
+    RunState,
+)
 from ledger.schema_registry import SchemaRegistry
 from ledger.snapshot import PendingPrediction, SnapshotProvider
 from ledger.writer import LedgerWriter, StagedWrite, WriteResult
@@ -26,6 +35,7 @@ __all__ = [
     "CaptureService",
     "CommittedPrediction",
     "ForecastValidationError",
+    "ExploratoryRunRequest",
     "FreshWindowError",
     "IdempotencyConflictError",
     "IntegrityError",
@@ -37,7 +47,13 @@ __all__ = [
     "PredictionDraft",
     "PredictionStatus",
     "PreregisteredCaptureRequest",
+    "PreregisteredRunRequest",
     "RegistrationStatus",
+    "RunExecutionError",
+    "RunResult",
+    "RunService",
+    "RunState",
+    "RunStateError",
     "SchemaNotFoundError",
     "SchemaRegistry",
     "SnapshotCaptureError",
