@@ -267,6 +267,31 @@ class PredictionDraft(_WriteOnceModel):
         return value
 
 
+class PreregisteredCaptureRequest(_WriteOnceModel):
+    """Structured, pre-snapshot input for the confirmatory capture path.
+
+    Registration status is intentionally absent: this type can only create a new
+    preregistered record and therefore cannot promote an exploratory record.
+    """
+
+    _integrity_fields = frozenset({"forecast", "decision", "lineage"})
+
+    idempotency_key: str = Field(min_length=1, max_length=256)
+    schema_id: str = "finance/strategy-edge:1"
+    forecast: StrategyEdgeForecast
+    decision: str = Field(min_length=1)
+    lineage: dict[str, JsonValue]
+    body: str = ""
+
+    @field_validator("lineage")
+    @classmethod
+    def lineage_requires_family_id(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
+        family_id = value.get("family_id")
+        if not isinstance(family_id, str) or not family_id.strip():
+            raise ValueError("lineage.family_id must be a non-empty string")
+        return value
+
+
 class CommittedPrediction(_WriteOnceModel):
     """Sealed representation of the exact state committed by ``LedgerWriter``."""
 

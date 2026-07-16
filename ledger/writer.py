@@ -31,12 +31,67 @@ class WriteResult:
     """Paths and hashes for an atomic write attempt."""
 
     prediction_id: str
+    run_id: str
     record_path: Path
     snapshot_path: Path
     schema_id: str
     schema_hash: str
     immutable_hash: str
     created: bool
+
+
+@dataclass(slots=True)
+class StagedWrite:
+    """Filesystem publication awaiting its caller-owned SQLite commit."""
+
+    result: WriteResult
+    writer: LedgerWriter
+    manifest_path: Path | None = None
+    record_temp: Path | None = None
+    snapshot_temp: Path | None = None
+    record_published: bool = False
+    snapshot_published: bool = False
+    finished: bool = False
+
+    def finalize(self) -> None:
+        """Remove recovery metadata after the caller durably commits SQLite."""
+
+        if self.finished:
+            return
+        self.writer._remove_paths(
+            *(path for path in (self.record_temp, self.snapshot_temp, self.manifest_path) if path)
+        )
+        self.writer._fsync_directory(self.writer.records_dir)
+        self.writer._fsync_directory(self.writer.snapshots_dir)
+        self.finished = True
+
+    def rollback(self) -> None:
+        """Remove only artifacts proven to belong to this staged write."""
+
+        if self.finished:
+            return
+        record_owned = self.record_published or self._temp_owns(
+            self.record_temp, self.result.record_path
+        )
+        snapshot_owned = self.snapshot_published or self._temp_owns(
+            self.snapshot_temp, self.result.snapshot_path
+        )
+        cleanup = [
+            path
+            for path in (self.record_temp, self.snapshot_temp, self.manifest_path)
+            if path is not None
+        ]
+        if record_owned:
+            cleanup.append(self.result.record_path)
+        if snapshot_owned:
+            cleanup.append(self.result.snapshot_path)
+        self.writer._remove_paths(*cleanup)
+        self.writer._fsync_directory(self.writer.records_dir)
+        self.writer._fsync_directory(self.writer.snapshots_dir)
+        self.finished = True
+
+    def _temp_owns(self, temporary: Path | None, published: Path) -> bool:
+        return temporary is not None and self.writer._paths_share_inode(temporary, published)
 
 
 class LedgerWriter:
@@ -76,7 +131,7 @@ class LedgerWriter:
         self.failure_injector = failure_injector
 
         with ledger_lock(self.ledger_dir, timeout=self.lock_timeout):
-            self._recover_unfinished_transactions()
+            self.recover_unfinished_transactions_locked()
 
     def write(self, prediction: PredictionDraft | Mapping[str, Any]) -> WriteResult:
         """Validate and atomically commit a record, or no-op on duplicate ID."""
@@ -84,40 +139,110 @@ class LedgerWriter:
         draft = self._coerce_draft(prediction)
 
         with ledger_lock(self.ledger_dir, timeout=self.lock_timeout):
-            self._recover_unfinished_transactions()
-            existing = self.registry.get_prediction(draft.prediction_id)
-            if existing is not None:
-                return self._idempotent_result(existing)
-
-            forecast = draft.forecast.model_dump(mode="json")
-            valid, errors = self.schema_registry.validate(forecast, draft.schema_id)
-            if not valid:
-                raise ForecastValidationError(errors)
-
-            schema = self.schema_registry.load(draft.schema_id)
-            schema_hash = self.schema_registry.hash(schema)
-            snapshot_ref = f".ledger/snapshots/{draft.prediction_id}.json"
-            immutable_hash = sha256_json(
-                immutable_payload(
-                    draft,
-                    schema_hash=schema_hash,
-                    snapshot_ref=snapshot_ref,
+            self.recover_unfinished_transactions_locked()
+            connection = self.registry.connect()
+            staged: StagedWrite | None = None
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                staged = self.stage_in_transaction(draft, connection=connection)
+                connection.commit()
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                if staged is not None:
+                    try:
+                        committed = self.registry.is_committed(staged.result.prediction_id)
+                    except Exception:
+                        committed = None
+                    if committed is True:
+                        staged.finalize()
+                    elif committed is False:
+                        staged.rollback()
+                logger.exception(
+                    "ledger_prediction_commit_failed",
+                    extra={"prediction_id": draft.prediction_id},
                 )
-            )
-            committed_at = datetime.now(UTC)
-            committed = CommittedPrediction(
-                **draft.model_dump(),
+                raise
+            else:
+                staged.finalize()
+                logger.info(
+                    "ledger_prediction_committed",
+                    extra={
+                        "prediction_id": staged.result.prediction_id,
+                        "schema_id": staged.result.schema_id,
+                    },
+                )
+                return staged.result
+            finally:
+                connection.close()
+
+    def stage_in_transaction(
+        self,
+        prediction: PredictionDraft | Mapping[str, Any],
+        *,
+        connection: sqlite3.Connection,
+        expected_schema_hash: str | None = None,
+    ) -> StagedWrite:
+        """Stage artifacts and rows inside a caller-owned immediate transaction.
+
+        The caller must commit SQLite and then call ``finalize()``, or roll back
+        SQLite and call ``rollback()``. The durable manifest covers a process crash
+        between those steps.
+        """
+
+        if not connection.in_transaction:
+            raise IntegrityError("stage_in_transaction requires an active transaction")
+        draft = self._coerce_draft(prediction)
+        existing = self.registry.get_prediction(draft.prediction_id, connection=connection)
+        if existing is not None:
+            return StagedWrite(result=self.result_for_row(existing), writer=self, finished=True)
+
+        committed = self._prepare_committed(
+            draft,
+            expected_schema_hash=expected_schema_hash,
+        )
+        return self._stage_committed(committed, connection=connection)
+
+    def _prepare_committed(
+        self,
+        draft: PredictionDraft,
+        *,
+        expected_schema_hash: str | None = None,
+    ) -> CommittedPrediction:
+        forecast = draft.forecast.model_dump(mode="json")
+        schema = self.schema_registry.load(draft.schema_id)
+        valid, errors = self.schema_registry.validate_schema(forecast, schema)
+        if not valid:
+            raise ForecastValidationError(errors)
+
+        schema_hash = self.schema_registry.hash(schema)
+        if expected_schema_hash is not None and schema_hash != expected_schema_hash:
+            raise IntegrityError("forecast schema changed during the capture transaction")
+        snapshot_ref = f".ledger/snapshots/{draft.prediction_id}.json"
+        immutable_hash = sha256_json(
+            immutable_payload(
+                draft,
                 schema_hash=schema_hash,
                 snapshot_ref=snapshot_ref,
-                immutable_hash=immutable_hash,
-                committed_at=committed_at,
             )
-            return self._commit(committed)
+        )
+        return CommittedPrediction(
+            **draft.model_dump(),
+            schema_hash=schema_hash,
+            snapshot_ref=snapshot_ref,
+            immutable_hash=immutable_hash,
+            committed_at=datetime.now(UTC),
+        )
 
-    def _commit(self, prediction: CommittedPrediction) -> WriteResult:
+    def _stage_committed(
+        self,
+        prediction: CommittedPrediction,
+        *,
+        connection: sqlite3.Connection,
+    ) -> StagedWrite:
         record_path = self.records_dir / f"{prediction.prediction_id}.md"
         snapshot_path = self.snapshots_dir / f"{prediction.prediction_id}.json"
-        if record_path.exists() or snapshot_path.exists():
+        if os.path.lexists(record_path) or os.path.lexists(snapshot_path):
             raise IntegrityError(
                 "unregistered artifact collision; refusing to overwrite possible audit evidence"
             )
@@ -133,88 +258,56 @@ class LedgerWriter:
             "record_temp": str(record_temp),
             "snapshot_temp": str(snapshot_temp),
         }
-
-        database_committed = False
-        snapshot_published = False
-        record_published = False
+        staged = StagedWrite(
+            result=WriteResult(
+                prediction_id=prediction.prediction_id,
+                run_id=prediction.run_id,
+                record_path=record_path,
+                snapshot_path=snapshot_path,
+                schema_id=prediction.schema_id,
+                schema_hash=prediction.schema_hash,
+                immutable_hash=prediction.immutable_hash,
+                created=True,
+            ),
+            writer=self,
+            manifest_path=manifest_path,
+            record_temp=record_temp,
+            snapshot_temp=snapshot_temp,
+        )
         try:
             self._atomic_manifest_write(manifest_path, manifest)
             self._write_new_file(snapshot_temp, self._snapshot_bytes(prediction))
             self._write_new_file(record_temp, self._record_bytes(prediction))
 
-            with self.registry.transaction() as connection:
-                self.registry.begin_prediction(prediction, connection=connection)
+            self.registry.begin_prediction(prediction, connection=connection)
 
-                self._inject_failure("before_snapshot_publish")
-                self._publish_no_replace(snapshot_temp, snapshot_path)
-                snapshot_published = True
-                snapshot_temp.unlink()
-                self._fsync_directory(self.snapshots_dir)
-                self._inject_failure("after_snapshot_publish")
+            self._inject_failure("before_snapshot_publish")
+            self._publish_no_replace(snapshot_temp, snapshot_path)
+            staged.snapshot_published = True
+            snapshot_temp.unlink()
+            self._fsync_directory(self.snapshots_dir)
+            self._inject_failure("after_snapshot_publish")
 
-                self._publish_no_replace(record_temp, record_path)
-                record_published = True
-                record_temp.unlink()
-                self._fsync_directory(self.records_dir)
-                self._inject_failure("after_record_publish")
-
-                self.registry.commit_prediction(
-                    prediction.prediction_id,
-                    committed_at=prediction.committed_at,
-                    connection=connection,
-                )
-            database_committed = True
-        except BaseException:
-            authoritatively_committed: bool | None = database_committed
-            if not database_committed:
-                try:
-                    authoritatively_committed = self.registry.is_committed(prediction.prediction_id)
-                except Exception:
-                    authoritatively_committed = None
-            if authoritatively_committed is True:
-                self._remove_paths(record_temp, snapshot_temp, manifest_path)
-            elif authoritatively_committed is False:
-                cleanup_paths = [record_temp, snapshot_temp, manifest_path]
-                if record_published or self._paths_share_inode(record_temp, record_path):
-                    cleanup_paths.append(record_path)
-                if snapshot_published or self._paths_share_inode(snapshot_temp, snapshot_path):
-                    cleanup_paths.append(snapshot_path)
-                self._remove_paths(*cleanup_paths)
-            else:
-                logger.error(
-                    "ledger_prediction_commit_state_unknown",
-                    extra={"prediction_id": prediction.prediction_id},
-                )
+            self._publish_no_replace(record_temp, record_path)
+            staged.record_published = True
+            record_temp.unlink()
             self._fsync_directory(self.records_dir)
-            self._fsync_directory(self.snapshots_dir)
-            logger.exception(
-                "ledger_prediction_commit_failed",
-                extra={"prediction_id": prediction.prediction_id},
+            self._inject_failure("after_record_publish")
+
+            self.registry.commit_prediction(
+                prediction.prediction_id,
+                committed_at=prediction.committed_at,
+                connection=connection,
             )
+        except BaseException:
+            staged.rollback()
             raise
-        else:
-            self._remove_paths(manifest_path)
-            self._fsync_directory(self.snapshots_dir)
 
-        logger.info(
-            "ledger_prediction_committed",
-            extra={
-                "prediction_id": prediction.prediction_id,
-                "schema_id": prediction.schema_id,
-                "registration_status": prediction.registration_status.value,
-            },
-        )
-        return WriteResult(
-            prediction_id=prediction.prediction_id,
-            record_path=record_path,
-            snapshot_path=snapshot_path,
-            schema_id=prediction.schema_id,
-            schema_hash=prediction.schema_hash,
-            immutable_hash=prediction.immutable_hash,
-            created=True,
-        )
+        return staged
 
-    def _idempotent_result(self, row: sqlite3.Row) -> WriteResult:
+    def result_for_row(self, row: sqlite3.Row) -> WriteResult:
+        """Build an idempotent result from an authoritative committed row."""
+
         if row["transaction_state"] != "committed":
             raise IntegrityError(
                 f"prediction exists in non-committed state: {row['prediction_id']}"
@@ -231,6 +324,7 @@ class LedgerWriter:
         )
         return WriteResult(
             prediction_id=row["prediction_id"],
+            run_id=row["run_id"],
             record_path=record_path,
             snapshot_path=snapshot_path,
             schema_id=row["schema_id"],
@@ -239,7 +333,9 @@ class LedgerWriter:
             created=False,
         )
 
-    def _recover_unfinished_transactions(self) -> None:
+    def recover_unfinished_transactions_locked(self) -> None:
+        """Recover manifests while the caller holds the process-level ledger lock."""
+
         # A crash while writing the manifest cannot have produced artifact temps yet,
         # because artifact staging begins only after the manifest rename returns.
         self._remove_paths(*self.snapshots_dir.glob(".txn-*.manifest-tmp"))

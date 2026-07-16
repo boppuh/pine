@@ -6,7 +6,7 @@ import logging
 import sqlite3
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +16,7 @@ from ledger.json_utils import canonical_json
 
 logger = logging.getLogger(__name__)
 
-_MIGRATION_VERSION = 1
+_MIGRATION_VERSION = 2
 
 _MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -102,6 +102,33 @@ BEGIN
 END;
 """
 
+_MIGRATION_2 = """
+CREATE TABLE IF NOT EXISTS capture_requests (
+    idempotency_key TEXT PRIMARY KEY,
+    request_hash TEXT NOT NULL,
+    prediction_id TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (prediction_id) REFERENCES predictions(prediction_id) ON DELETE RESTRICT
+);
+
+CREATE TRIGGER IF NOT EXISTS capture_requests_write_once_update
+BEFORE UPDATE ON capture_requests
+BEGIN
+    SELECT RAISE(ABORT, 'capture request identity is write-once');
+END;
+
+CREATE TRIGGER IF NOT EXISTS capture_requests_write_once_delete
+BEFORE DELETE ON capture_requests
+BEGIN
+    SELECT RAISE(ABORT, 'capture request identity is permanent');
+END;
+
+CREATE INDEX IF NOT EXISTS idx_touched_windows_overlap
+    ON touched_windows(family_id, window_start, window_end);
+"""
+
+_MIGRATIONS = {1: _MIGRATION_1, 2: _MIGRATION_2}
+
 
 class LedgerRegistry:
     """Own SQLite schema, transactions, and the only supported lifecycle mutations."""
@@ -153,6 +180,31 @@ class LedgerRegistry:
         try:
             return active.execute(
                 "SELECT * FROM predictions WHERE prediction_id = ?", (prediction_id,)
+            ).fetchone()
+        finally:
+            if owns_connection:
+                active.close()
+
+    def get_prediction_by_idempotency_key(
+        self,
+        idempotency_key: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> sqlite3.Row | None:
+        """Return the prediction and request hash assigned to an idempotency key."""
+
+        owns_connection = connection is None
+        active = connection or self.connect()
+        try:
+            return active.execute(
+                """
+                SELECT predictions.*, capture_requests.request_hash,
+                       capture_requests.idempotency_key
+                FROM capture_requests
+                JOIN predictions USING (prediction_id)
+                WHERE capture_requests.idempotency_key = ?
+                """,
+                (idempotency_key,),
             ).fetchone()
         finally:
             if owns_connection:
@@ -221,6 +273,26 @@ class LedgerRegistry:
         if cursor.rowcount != 1:
             raise IntegrityError(f"prediction is not in progress: {prediction_id}")
 
+    def register_capture_request(
+        self,
+        *,
+        idempotency_key: str,
+        request_hash: str,
+        prediction_id: str,
+        created_at: datetime,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Bind a successful capture identity inside its prediction transaction."""
+
+        connection.execute(
+            """
+            INSERT INTO capture_requests (
+                idempotency_key, request_hash, prediction_id, created_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (idempotency_key, request_hash, prediction_id, created_at.isoformat()),
+        )
+
     def update_resolution(
         self,
         prediction_id: str,
@@ -260,13 +332,14 @@ class LedgerRegistry:
     def mark_window_touched(
         self,
         family_id: str,
-        window_start: str,
-        window_end: str,
+        window_start: date | str,
+        window_end: date | str,
         *,
         touched_at: datetime | None = None,
     ) -> None:
         """Record an observed research window without overwriting its first touch."""
 
+        start, end = _normalize_window(window_start, window_end)
         timestamp = touched_at or datetime.now(UTC)
         with self.transaction() as connection:
             connection.execute(
@@ -275,12 +348,18 @@ class LedgerRegistry:
                     family_id, window_start, window_end, touched_at
                 ) VALUES (?, ?, ?, ?)
                 """,
-                (family_id, window_start, window_end, timestamp.isoformat()),
+                (family_id, start, end, timestamp.isoformat()),
             )
 
-    def is_window_touched(self, family_id: str, window_start: str, window_end: str) -> bool:
+    def is_window_touched(
+        self,
+        family_id: str,
+        window_start: date | str,
+        window_end: date | str,
+    ) -> bool:
         """Return whether a family has already observed the exact data window."""
 
+        start, end = _normalize_window(window_start, window_end)
         connection = self.connect()
         try:
             row = connection.execute(
@@ -288,11 +367,61 @@ class LedgerRegistry:
                 SELECT 1 FROM touched_windows
                 WHERE family_id = ? AND window_start = ? AND window_end = ?
                 """,
-                (family_id, window_start, window_end),
+                (family_id, start, end),
             ).fetchone()
             return row is not None
         finally:
             connection.close()
+
+    def find_touched_window_overlap(
+        self,
+        family_id: str,
+        window_start: date | str,
+        window_end: date | str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> sqlite3.Row | None:
+        """Return the first inclusive overlap for a strategy family's data window."""
+
+        start, end = _normalize_window(window_start, window_end)
+        owns_connection = connection is None
+        active = connection or self.connect()
+        try:
+            return active.execute(
+                """
+                SELECT family_id, window_start, window_end, touched_at
+                FROM touched_windows
+                WHERE family_id = ?
+                  AND window_start <= ?
+                  AND window_end >= ?
+                ORDER BY touched_at, window_start, window_end
+                LIMIT 1
+                """,
+                (family_id, end, start),
+            ).fetchone()
+        finally:
+            if owns_connection:
+                active.close()
+
+    def window_overlaps_touched(
+        self,
+        family_id: str,
+        window_start: date | str,
+        window_end: date | str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> bool:
+        """Return whether any previously observed family window overlaps inclusively."""
+
+        return (
+            self.find_touched_window_overlap(
+                family_id,
+                window_start,
+                window_end,
+                connection=connection,
+            )
+            is not None
+        )
 
     def record_integrity_violation(
         self,
@@ -317,19 +446,35 @@ class LedgerRegistry:
     def _migrate(self) -> None:
         connection = self.connect()
         try:
-            connection.executescript(
-                "BEGIN IMMEDIATE;\n"
-                + _MIGRATION_1
-                + f"""
-                INSERT OR IGNORE INTO schema_migrations (version, applied_at)
-                VALUES (
-                    {_MIGRATION_VERSION},
-                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                );
-                PRAGMA user_version = {_MIGRATION_VERSION};
-                COMMIT;
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )
                 """
             )
+            applied = {
+                row[0] for row in connection.execute("SELECT version FROM schema_migrations")
+            }
+            for version, migration in _MIGRATIONS.items():
+                if version in applied:
+                    continue
+                connection.executescript(
+                    "BEGIN IMMEDIATE;\n"
+                    + migration
+                    + f"""
+                    INSERT OR IGNORE INTO schema_migrations (version, applied_at)
+                    VALUES ({version}, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+                    PRAGMA user_version = {version};
+                    COMMIT;
+                    """
+                )
+            actual_version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if actual_version != _MIGRATION_VERSION:
+                raise IntegrityError(
+                    f"unsupported registry version {actual_version}; expected {_MIGRATION_VERSION}"
+                )
         except BaseException:
             connection.rollback()
             raise
@@ -339,3 +484,11 @@ class LedgerRegistry:
 
 def _optional_json(value: Mapping[str, Any] | None) -> str | None:
     return None if value is None else canonical_json(dict(value))
+
+
+def _normalize_window(window_start: date | str, window_end: date | str) -> tuple[str, str]:
+    start = window_start if isinstance(window_start, date) else date.fromisoformat(window_start)
+    end = window_end if isinstance(window_end, date) else date.fromisoformat(window_end)
+    if end < start:
+        raise ValueError("window_end must be on or after window_start")
+    return start.isoformat(), end.isoformat()

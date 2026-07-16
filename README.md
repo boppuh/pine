@@ -1,10 +1,14 @@
-# Decision Edge Engine — Week 1 Foundation
+# Decision Edge Engine
 
 This repository contains the local-first integrity substrate for the Decision Edge
 Engine: strict forecast validation, a versioned schema registry, a WAL-mode SQLite
 authority, frozen committed records, and atomic/idempotent snapshot + Markdown writes.
+The structured capture service serializes the full preregistration critical section:
+schema revalidation, fresh-window enforcement, ID creation, snapshot capture, artifact
+publication, and registry commit.
 
-It intentionally contains no network, LLM, Obsidian, or MSM integration.
+It intentionally contains no network, LLM, Obsidian, or live MSM integration yet. MSM
+state enters through the local `SnapshotProvider` protocol.
 
 ## Development
 
@@ -16,6 +20,19 @@ uv run pytest
 The first forecast shape is `finance/strategy-edge:1`, stored at
 `.ledger/schemas/finance/strategy-edge.1.json`. Runtime database, lock, and snapshot
 files are ignored by git.
+
+## Structured capture
+
+Construct a `PreregisteredCaptureRequest` after the user confirms a hypothesis, then
+pass it to `CaptureService.capture`. The request type deliberately has no
+`registration_status` input: this path can only create a new preregistered record and
+cannot promote an exploratory record. The provider is called under the shared ledger
+lock and must return the frozen, point-in-time state without executing a backtest.
+
+Retries must reuse the same `idempotency_key`. An identical retry returns the original
+prediction without recapturing; reusing a key for different content fails closed. The
+advisory `check_fresh_window` method supports pre-confirmation UI feedback, while
+`capture` always repeats the inclusive overlap check under the lock.
 
 ## Atomicity boundary
 
