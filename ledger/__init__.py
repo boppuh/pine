@@ -16,6 +16,7 @@ from ledger.integrity import (
     PreregisteredCaptureRequest,
     RegistrationStatus,
 )
+from ledger.msm import MSMSnapshotProvider, MSMSnapshotSource, StrategySnapshot
 from ledger.registry import LedgerRegistry
 from ledger.schema_registry import SchemaRegistry
 from ledger.snapshot import PendingPrediction, SnapshotProvider
@@ -30,6 +31,8 @@ __all__ = [
     "IntegrityError",
     "LedgerRegistry",
     "LedgerWriter",
+    "MSMSnapshotProvider",
+    "MSMSnapshotSource",
     "PendingPrediction",
     "PredictionDraft",
     "PredictionStatus",
@@ -39,6 +42,7 @@ __all__ = [
     "SchemaRegistry",
     "SnapshotCaptureError",
     "SnapshotProvider",
+    "StrategySnapshot",
     "StagedWrite",
     "WriteResult",
 ]
