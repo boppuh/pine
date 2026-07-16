@@ -7,8 +7,9 @@ The structured capture service serializes the full preregistration critical sect
 schema revalidation, fresh-window enforcement, ID creation, snapshot capture, artifact
 publication, and registry commit.
 
-It intentionally contains no network, LLM, Obsidian, or live MSM integration yet. MSM
-state enters through the local `SnapshotProvider` protocol.
+It intentionally contains no network, LLM, or Obsidian integration. MSM state enters
+through the local `SnapshotProvider` protocol; `MSMSnapshotProvider` is the strict
+adapter for MSM's point-in-time ClickHouse snapshot source.
 
 ## Development
 
@@ -33,6 +34,28 @@ Retries must reuse the same `idempotency_key`. An identical retry returns the or
 prediction without recapturing; reusing a key for different content fails closed. The
 advisory `check_fresh_window` method supports pre-confirmation UI feedback, while
 `capture` always repeats the inclusive overlap check under the lock.
+
+### Local MSM composition
+
+When both projects are installed in the same Python environment, compose the local
+source and ledger adapter explicitly:
+
+```python
+from ledger import CaptureService, MSMSnapshotProvider
+from msm.ch.client import get_client
+from msm.utils.ledger_snapshot import LedgerSnapshotSource
+
+provider = MSMSnapshotProvider(LedgerSnapshotSource(get_client()))
+service = CaptureService(vault_root="/path/to/vault", snapshot_provider=provider)
+result = service.capture(confirmed_request)
+```
+
+The MSM source never runs a backtest. It requires a clean MSM commit, a recent
+timezone-aware decision timestamp, complete active-part coverage for every configured
+table, and two identical reads of the ClickHouse part manifest. Pine independently
+validates the full response and binds its strategy, date windows, and data-as-of time
+to the pending prediction. Any mismatch aborts before artifacts or registry rows are
+published.
 
 ## Atomicity boundary
 
