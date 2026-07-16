@@ -164,6 +164,12 @@ class StrategySnapshot(_SnapshotModel):
     def cross_field_invariants_hold(self) -> Self:
         if self.parameter_count != len(self.parameter_set):
             raise ValueError("parameter_count does not match parameter_set")
+        expected_dataset_window = SnapshotDateWindow(
+            start=min(self.in_sample_window.start, self.out_of_sample_window.start),
+            end=max(self.in_sample_window.end, self.out_of_sample_window.end),
+        )
+        if self.dataset_manifest.window != expected_dataset_window:
+            raise ValueError("dataset manifest window does not match research windows")
         expected_dataset_version = sha256_json(self.dataset_manifest.model_dump(mode="json"))
         if self.dataset_version != expected_dataset_version:
             raise ValueError("dataset_version does not match dataset_manifest")

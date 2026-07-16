@@ -183,6 +183,21 @@ def test_snapshot_contract_rejects_incomplete_or_inconsistent_state(mutation: st
         StrategySnapshot.model_validate(snapshot)
 
 
+def test_snapshot_contract_rejects_manifest_window_that_omits_oos_coverage() -> None:
+    snapshot = copy.deepcopy(_snapshot())
+    manifest = snapshot["dataset_manifest"]
+    manifest["window"]["end"] = "2025-06-30"
+    manifest["tables"][0]["max_date"] = "2025-06-30"
+    manifest["tables"][0]["parts"][0]["max_date"] = "2025-06-30"
+    snapshot["dataset_version"] = sha256_json(manifest)
+
+    with pytest.raises(
+        ValidationError,
+        match="dataset manifest window does not match research windows",
+    ):
+        StrategySnapshot.model_validate(snapshot)
+
+
 def test_msm_provider_commits_validated_snapshot_through_atomic_capture(
     vault: Path,
     valid_forecast: dict[str, object],
