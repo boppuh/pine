@@ -24,3 +24,15 @@ class ForecastValidationError(LedgerError):
         self.errors = list(errors)
         detail = "; ".join(self.errors) if self.errors else "forecast is invalid"
         super().__init__(detail)
+
+
+class FreshWindowError(IntegrityError):
+    """Raised when a preregistered OOS window overlaps previously observed data."""
+
+
+class IdempotencyConflictError(IntegrityError):
+    """Raised when an idempotency key is reused for a different capture request."""
+
+
+class SnapshotCaptureError(IntegrityError):
+    """Raised when a snapshot provider fails or returns invalid frozen state."""

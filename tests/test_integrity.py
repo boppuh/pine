@@ -6,6 +6,7 @@ from ledger.errors import IntegrityError
 from ledger.integrity import (
     CommittedPrediction,
     PredictionStatus,
+    PreregisteredCaptureRequest,
     RegistrationStatus,
 )
 
@@ -48,3 +49,9 @@ def test_promotion_has_no_code_path(draft) -> None:
         draft.model_copy(update={"registration_status": RegistrationStatus.PREREGISTERED})
     with pytest.raises(IntegrityError, match="copied with field changes"):
         draft.copy(update={"registration_status": RegistrationStatus.PREREGISTERED})
+
+
+def test_confirmed_capture_type_has_no_registration_status_input() -> None:
+    assert "registration_status" not in PreregisteredCaptureRequest.model_fields
+    assert not hasattr(PreregisteredCaptureRequest, "promote")
+    assert not hasattr(PreregisteredCaptureRequest, "set_registration_status")

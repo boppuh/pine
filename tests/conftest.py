@@ -37,18 +37,20 @@ def vault(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def draft(valid_forecast: dict[str, object]) -> PredictionDraft:
-    return PredictionDraft(
-        prediction_id="pred_01",
-        run_id="run_01",
-        registration_status=RegistrationStatus.PREREGISTERED,
-        forecast=valid_forecast,
-        decision="Run the frozen specification against the untouched OOS window.",
-        snapshot={
-            "strategy_spec_hash": "sha256:strategy",
-            "parameter_count": 4,
-            "random_seed": 42,
-            "features": ["orb", {"regime": "low-vol"}],
+    return PredictionDraft.model_validate(
+        {
+            "prediction_id": "pred_01",
+            "run_id": "run_01",
+            "registration_status": RegistrationStatus.PREREGISTERED,
+            "forecast": valid_forecast,
+            "decision": "Run the frozen specification against the untouched OOS window.",
+            "snapshot": {
+                "strategy_spec_hash": "sha256:strategy",
+                "parameter_count": 4,
+                "random_seed": 42,
+                "features": ["orb", {"regime": "low-vol"}],
+            },
+            "lineage": {"family_id": "fam_01", "parent_prediction_id": None},
+            "body": "# ORB edge hypothesis\n\nThe breakout should persist out of sample.",
         },
-        lineage={"family_id": "fam_01", "parent_prediction_id": None},
-        body="# ORB edge hypothesis\n\nThe breakout should persist out of sample.",
     )

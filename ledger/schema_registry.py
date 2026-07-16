@@ -51,6 +51,15 @@ class SchemaRegistry:
         """Validate a forecast and return all deterministic, human-readable errors."""
 
         schema = self.load(schema_id)
+        return self.validate_schema(forecast, schema)
+
+    @staticmethod
+    def validate_schema(
+        forecast: Mapping[str, Any],
+        schema: Mapping[str, Any],
+    ) -> tuple[bool, list[str]]:
+        """Validate against an already-loaded schema so its hash covers the same bytes."""
+
         try:
             canonical_json(dict(forecast))
         except (TypeError, ValueError) as exc:
@@ -61,7 +70,7 @@ class SchemaRegistry:
             validator.iter_errors(dict(forecast)),
             key=lambda error: (list(error.absolute_path), error.message),
         )
-        errors = [self._format_error(error) for error in failures]
+        errors = [SchemaRegistry._format_error(error) for error in failures]
         return not errors, errors
 
     @staticmethod
