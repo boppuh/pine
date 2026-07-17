@@ -12,6 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from ledger.errors import LedgerError
+from ledger.external import (
+    ExternalRunEvidence,
+    ExternalRunImportResult,
+    ExternalRunIngestor,
+    ExternalRunIngestRequest,
+)
 from ledger.msm import SnapshotDateWindow
 from ledger.run import (
     ExploratoryRunRequest,
@@ -26,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="msm-ledger",
-        description="Persist a ledger run envelope before invoking a local MSM command.",
+        description="Enforce or recover auditable local MSM run provenance.",
     )
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
     run = subparsers.add_parser("run", help="capture, register, and execute one MSM run")
@@ -66,6 +72,24 @@ def build_parser() -> argparse.ArgumentParser:
         nargs=argparse.REMAINDER,
         help="MSM command argv after --, for example: -- uv run msm ...",
     )
+    ingest = subparsers.add_parser(
+        "ingest-external",
+        help="import explicit evidence for a completed MSM run that bypassed the wrapper",
+    )
+    ingest.add_argument(
+        "--vault-root",
+        "--vault",
+        dest="vault_root",
+        type=Path,
+        default=Path.cwd(),
+        help="vault containing .ledger/ (default: current directory)",
+    )
+    ingest.add_argument(
+        "--evidence",
+        required=True,
+        type=Path,
+        help="JSON evidence document for one completed direct MSM run",
+    )
     return parser
 
 
@@ -74,6 +98,8 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
 
     parser = build_parser()
     arguments = parser.parse_args(argv)
+    if arguments.subcommand == "ingest-external":
+        return _ingest_external_cli(arguments.vault_root, arguments.evidence)
     if arguments.subcommand != "run":  # pragma: no cover - argparse enforces this
         parser.error("a subcommand is required")
 
@@ -166,4 +192,37 @@ def _result_payload(result: RunResult) -> dict[str, Any]:
         "exit_code": result.exit_code,
         "failure_note": result.failure_note,
         "executed": result.executed,
+    }
+
+
+def _ingest_external_cli(vault_root: Path, evidence_path: Path) -> int:
+    try:
+        raw = json.loads(evidence_path.read_text(encoding="utf-8"))
+        evidence = ExternalRunEvidence.model_validate(raw)
+        result = ExternalRunIngestor(vault_root).ingest(ExternalRunIngestRequest(evidence=evidence))
+    except LedgerError as exc:
+        print(f"msm-ledger: {exc}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as exc:
+        print(f"msm-ledger: invalid external evidence: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(_external_result_payload(result), sort_keys=True))
+    return 0
+
+
+def _external_result_payload(result: ExternalRunImportResult) -> dict[str, Any]:
+    return {
+        "run_id": result.run_id,
+        "source_system": result.source_system,
+        "source_run_id": result.source_run_id,
+        "registration_status": result.registration_status.value,
+        "strategy_id": result.strategy_id,
+        "dataset_version": result.dataset_version,
+        "evidence_hash": result.evidence_hash,
+        "envelope_hash": result.envelope_hash,
+        "state": result.state.value,
+        "exit_code": result.exit_code,
+        "failure_note": result.failure_note,
+        "created": result.created,
     }

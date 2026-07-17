@@ -10,6 +10,13 @@ from ledger.errors import (
     SchemaNotFoundError,
     SnapshotCaptureError,
 )
+from ledger.external import (
+    ExternalArtifactEvidence,
+    ExternalRunEvidence,
+    ExternalRunImportResult,
+    ExternalRunIngestor,
+    ExternalRunIngestRequest,
+)
 from ledger.integrity import (
     CommittedPrediction,
     PredictionDraft,
@@ -33,6 +40,11 @@ from ledger.writer import LedgerWriter, StagedWrite, WriteResult
 __all__ = [
     "CaptureService",
     "CommittedPrediction",
+    "ExternalArtifactEvidence",
+    "ExternalRunEvidence",
+    "ExternalRunIngestRequest",
+    "ExternalRunIngestor",
+    "ExternalRunImportResult",
     "ForecastValidationError",
     "ExploratoryRunRequest",
     "FreshWindowError",

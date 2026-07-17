@@ -109,6 +109,34 @@ exact commit frozen in the snapshot. A per-run process lock distinguishes a live
 execution from a wrapper that disappeared mid-run; the next retry permanently marks an
 orphaned `running` entry as failed and never launches a duplicate process.
 
+## External-run audit recovery
+
+A completed MSM run that bypassed the wrapper can be recovered from one explicit JSON
+evidence document:
+
+```bash
+msm-ledger ingest-external \
+  --vault-root /path/to/pine-vault \
+  --evidence /path/to/direct-run-evidence.json
+```
+
+The document is validated by `ExternalRunEvidence`. It must identify the source system
+and source run, actual start/completion times and exit state, the original argv and
+absolute working directory, a complete `StrategySnapshot`, and a non-empty artifact
+manifest. Artifact entries contain a normalized output-relative path, byte size, and
+`sha256:...` content digest, sorted by path. Optional JSON metadata may preserve
+additional source-specific context.
+
+This path never executes MSM and never creates a prediction. It atomically creates an
+already-terminal run binding with permanent registration status
+`unregistered_external`, low-integrity reason `wrapper_bypass`, and the complete
+evidence embedded in its hashed envelope. An exact retry of the same
+`(source_system, source_run_id)` is a no-op (`created: false`); changed evidence for that
+identity fails closed. Registry triggers prohibit rewriting or deleting the evidence
+and status, and there is no promotion API. Because the evidence is retrospective, its
+content hashes are preserved as claims rather than treated as preregistration-grade
+attestation.
+
 ## Atomicity boundary
 
 The SQLite row with `transaction_state = committed` is the visibility boundary for a
