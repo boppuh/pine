@@ -7,9 +7,9 @@ The structured capture service serializes the full preregistration critical sect
 schema revalidation, fresh-window enforcement, ID creation, snapshot capture, artifact
 publication, and registry commit.
 
-It intentionally contains no external-network LLM provider or Obsidian integration.
 The loopback HTTP backend exposes provider-neutral extraction and atomic capture
-contracts, while MSM state enters through the local `SnapshotProvider` protocol;
+contracts. Its first production frontier-model adapter uses OpenAI structured outputs,
+while MSM state enters through the local `SnapshotProvider` protocol;
 `MSMSnapshotProvider` is the strict adapter for MSM's point-in-time ClickHouse snapshot
 source. The `msm-ledger run` wrapper is the local execution boundary: it persists an
 immutable pre-run envelope before it hands control to an MSM process.
@@ -68,8 +68,43 @@ Both protected endpoints require `Authorization: Bearer <token>`. Capture reques
 still have no `registration_status` input, and extractor output cannot assign one; a
 ready draft is preregistered by construction. Stable error envelopes distinguish
 authentication, request validation, schema, fresh-window, idempotency, snapshot, and
-integrity failures. The production frontier-model adapter and Obsidian client remain
-separate milestones.
+integrity failures. The Obsidian client remains a separate milestone.
+
+### OpenAI hypothesis extraction
+
+`OpenAIHypothesisExtractor` implements the provider-neutral extraction boundary with
+the async Responses API. It sends the note and authoritative forecast schema with
+`store=False`, accepts only strict Pydantic structured output, and converts refusals,
+truncation, explicit unable responses, and invalid model output into the existing clean
+`unable` result. Provider/model/prompt/schema provenance is stamped by the adapter into
+the proposal lineage; the model cannot author it.
+
+Set the API key in the process environment, never in the vault:
+
+```bash
+export OPENAI_API_KEY='...'
+```
+
+Then compose the backend with the production extractor:
+
+```python
+from ledger import OpenAIExtractorConfig, OpenAIHypothesisExtractor
+
+extractor = OpenAIHypothesisExtractor(OpenAIExtractorConfig.from_env())
+```
+
+Optional non-secret configuration uses `PINE_OPENAI_MODEL`,
+`PINE_OPENAI_PROMPT_VERSION`, `PINE_OPENAI_TIMEOUT_SECONDS`,
+`PINE_OPENAI_MAX_RETRIES`, and `PINE_OPENAI_MAX_OUTPUT_TOKENS`. Retries are bounded by
+the OpenAI SDK and apply only to its transient transport/status classes. Extraction
+does not acquire the ledger lock or write registry, note, or snapshot state.
+
+The normal test suite is fully offline. To run the opt-in live smoke:
+
+```bash
+PINE_RUN_OPENAI_SMOKE=1 uv run pytest -m live_openai \
+  tests/test_openai_extractor_live.py
+```
 
 ## Structured capture
 

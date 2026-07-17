@@ -36,6 +36,13 @@ from ledger.integrity import (
     RegistrationStatus,
 )
 from ledger.msm import MSMSnapshotProvider, MSMSnapshotSource, StrategySnapshot
+from ledger.openai_extractor import (
+    DEFAULT_OPENAI_MODEL,
+    DEFAULT_PROMPT_VERSION,
+    OpenAIExtractionError,
+    OpenAIExtractorConfig,
+    OpenAIHypothesisExtractor,
+)
 from ledger.record_integrity import (
     IntegrityCheckResult,
     IntegrityCheckState,
@@ -70,6 +77,8 @@ __all__ = [
     "CaptureResponse",
     "CaptureService",
     "CommittedPrediction",
+    "DEFAULT_OPENAI_MODEL",
+    "DEFAULT_PROMPT_VERSION",
     "DraftProposal",
     "ExternalArtifactEvidence",
     "ExternalRunEvidence",
@@ -100,6 +109,9 @@ __all__ = [
     "ManagedViolationReason",
     "ManagedViolationReporter",
     "PendingPrediction",
+    "OpenAIExtractionError",
+    "OpenAIExtractorConfig",
+    "OpenAIHypothesisExtractor",
     "PredictionDraft",
     "PredictionStatus",
     "PreregisteredCaptureRequest",
