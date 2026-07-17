@@ -137,6 +137,41 @@ and status, and there is no promotion API. Because the evidence is retrospective
 content hashes are preserved as claims rather than treated as preregistration-grade
 attestation.
 
+## Vault observation
+
+`VaultWatcher` provides the read-only boundary for later registry revalidation and
+indexing. Callers supply a record callback and a managed-path violation reporter; the
+watcher never changes either records or managed state:
+
+```python
+from ledger import VaultWatcher
+
+watcher = VaultWatcher(
+    "/path/to/pine-vault",
+    on_record=lambda event: reindex_queue.put(event),
+    on_violation=lambda violation: integrity_queue.put(violation),
+)
+watcher.start()
+try:
+    run_local_backend()
+finally:
+    watcher.stop()
+```
+
+Markdown events are debounced per path. A note is treated as a ledger record when its
+frontmatter identifies a prediction or its filename resolves to a committed registry
+row; the latter ensures damaged frontmatter still reaches the future mismatch checker.
+Native watchdog events are backed by a narrow reconciliation pass over `.ledger/` and
+configured record roots so atomic hard-link publication is observed consistently
+across platforms. The default record root is `predictions/`; custom `LedgerWriter`
+record directories should also be supplied through `record_roots`.
+
+The managed-directory policy ignores expected SQLite/WAL/lock churn, accepts a new
+snapshot only when it belongs to a committed registry row, and reports snapshot
+rewrites/deletes, unregistered snapshots, schema changes, registry removal, and unknown
+managed files. The re-index and violation callbacks are intentionally integration
+stubs: embedding and note-to-registry quarantine remain later milestones.
+
 ## Atomicity boundary
 
 The SQLite row with `transaction_state = committed` is the visibility boundary for a
