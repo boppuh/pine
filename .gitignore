@@ -13,6 +13,10 @@ build/
 .ledger/registry.db-shm
 .ledger/registry.db-wal
 .ledger/registry.lock
+.ledger/backend.json
+.ledger/backend.lock
+.ledger/backend.token
+.ledger/.backend-*.tmp
 .ledger/run-locks/
 .ledger/snapshots/
 

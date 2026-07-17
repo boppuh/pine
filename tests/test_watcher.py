@@ -222,6 +222,21 @@ def test_sqlite_runtime_churn_is_not_reported(vault: Path) -> None:
     assert records.empty()
 
 
+@pytest.mark.parametrize("filename", ["backend.json", "backend.lock", "backend.token"])
+def test_backend_runtime_churn_is_not_reported(vault: Path, filename: str) -> None:
+    records: queue.Queue[LedgerRecordEvent] = queue.Queue()
+    violations: queue.Queue[ManagedPathViolation] = queue.Queue()
+    runtime_file = vault / ".ledger" / filename
+
+    with _watcher(vault, records, violations):
+        runtime_file.write_text("runtime state", encoding="utf-8")
+        _assert_no_event(violations)
+        runtime_file.unlink()
+        _assert_no_event(violations)
+
+    assert records.empty()
+
+
 def test_registry_recreation_after_settled_delete_is_reported(vault: Path) -> None:
     records: queue.Queue[LedgerRecordEvent] = queue.Queue()
     violations: queue.Queue[ManagedPathViolation] = queue.Queue()

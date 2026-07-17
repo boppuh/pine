@@ -1,5 +1,7 @@
 """Decision Edge Engine integrity substrate."""
 
+from ledger.api import API_VERSION, CaptureResponse, HealthResponse, create_app
+from ledger.backend import BackendDescriptor, BackendRuntimeFiles, BackendServer
 from ledger.capture import CaptureService
 from ledger.errors import (
     ForecastValidationError,
@@ -16,6 +18,15 @@ from ledger.external import (
     ExternalRunImportResult,
     ExternalRunIngestor,
     ExternalRunIngestRequest,
+)
+from ledger.extraction import (
+    DraftProposal,
+    ExtractedHypothesis,
+    ExtractionResult,
+    ExtractionService,
+    ExtractionStatus,
+    HypothesisExtractionRequest,
+    HypothesisExtractor,
 )
 from ledger.integrity import (
     CommittedPrediction,
@@ -52,16 +63,29 @@ from ledger.watcher import (
 from ledger.writer import LedgerWriter, StagedWrite, WriteResult
 
 __all__ = [
+    "API_VERSION",
+    "BackendDescriptor",
+    "BackendRuntimeFiles",
+    "BackendServer",
+    "CaptureResponse",
     "CaptureService",
     "CommittedPrediction",
+    "DraftProposal",
     "ExternalArtifactEvidence",
     "ExternalRunEvidence",
     "ExternalRunIngestRequest",
     "ExternalRunIngestor",
     "ExternalRunImportResult",
+    "ExtractedHypothesis",
+    "ExtractionResult",
+    "ExtractionService",
+    "ExtractionStatus",
     "ForecastValidationError",
     "ExploratoryRunRequest",
     "FreshWindowError",
+    "HealthResponse",
+    "HypothesisExtractionRequest",
+    "HypothesisExtractor",
     "FileChangeKind",
     "IdempotencyConflictError",
     "IntegrityCheckResult",
@@ -95,4 +119,5 @@ __all__ = [
     "StagedWrite",
     "WriteResult",
     "VaultWatcher",
+    "create_app",
 ]
