@@ -103,7 +103,9 @@ an existing key fails closed. The child receives `LEDGER_RUN_ID`,
 `LEDGER_REGISTRATION_STATUS`, `LEDGER_DATASET_VERSION`, and `LEDGER_ENVELOPE_HASH`.
 Preregistered children also receive `LEDGER_PREDICTION_ID`. Immediately before process
 start, the wrapper verifies that `--working-directory` is a clean Git checkout at the
-exact commit frozen in the snapshot.
+exact commit frozen in the snapshot. A per-run process lock distinguishes a live
+execution from a wrapper that disappeared mid-run; the next retry permanently marks an
+orphaned `running` entry as failed and never launches a duplicate process.
 
 ## Atomicity boundary
 

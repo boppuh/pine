@@ -13,6 +13,7 @@ build/
 .ledger/registry.db-shm
 .ledger/registry.db-wal
 .ledger/registry.lock
+.ledger/run-locks/
 .ledger/snapshots/
 
 # JSON Schemas under .ledger/schemas/ are intentionally tracked.

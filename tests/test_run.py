@@ -14,10 +14,12 @@ from ledger.errors import (
     IdempotencyConflictError,
     IntegrityError,
     RunExecutionError,
+    RunStateError,
     SnapshotCaptureError,
 )
 from ledger.integrity import PredictionDraft, RegistrationStatus
 from ledger.json_utils import sha256_json
+from ledger.locking import run_execution_lock
 from ledger.msm import SnapshotDateWindow
 from ledger.run import (
     ExploratoryRunRequest,
@@ -201,6 +203,60 @@ def test_exploratory_retry_does_not_recapture_or_reexecute(vault: Path) -> None:
     assert second.executed is False
     assert calls == 1
     assert len(source.calls) == 1
+
+
+def test_retry_reconciles_orphaned_running_run_without_reexecution(vault: Path) -> None:
+    source = FakeMSMSource(_snapshot())
+    executed = False
+
+    def executor(*_args: Any) -> int:
+        nonlocal executed
+        executed = True
+        return 0
+
+    service = RunService(
+        vault,
+        source,
+        clock=lambda: DECISION_AT,
+        executor=executor,
+        git_state_reader=_clean_git,
+    )
+    request = _exploratory_request(vault)
+    prepared = service._prepare_exploratory(request)
+    service.registry.start_run(prepared.run_id, started_at=DECISION_AT)
+
+    result = service.run_exploratory(request)
+
+    assert result.run_id == prepared.run_id
+    assert result.state is RunState.FAILED
+    assert result.exit_code == 1
+    assert result.executed is False
+    assert executed is False
+    assert len(source.calls) == 1
+    row = service.registry.get_run(prepared.run_id)
+    assert row is not None
+    assert row["failure_note"] == "wrapper exited before recording process completion"
+
+
+def test_retry_does_not_reconcile_running_run_while_owner_lock_is_live(vault: Path) -> None:
+    service = RunService(
+        vault,
+        FakeMSMSource(_snapshot()),
+        clock=lambda: DECISION_AT,
+        executor=lambda *_args: 0,
+        git_state_reader=_clean_git,
+    )
+    request = _exploratory_request(vault)
+    prepared = service._prepare_exploratory(request)
+    service.registry.start_run(prepared.run_id, started_at=DECISION_AT)
+
+    with run_execution_lock(service.writer.ledger_dir, prepared.run_id):
+        with pytest.raises(RunStateError, match="currently executing"):
+            service.run_exploratory(request)
+
+    row = service.registry.get_run(prepared.run_id)
+    assert row is not None
+    assert row["state"] == RunState.RUNNING.value
 
 
 def test_exploratory_idempotency_key_cannot_change_command(vault: Path) -> None:

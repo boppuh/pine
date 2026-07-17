@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import yaml
+from filelock import Timeout as FileLockTimeout
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ledger.errors import (
@@ -27,7 +28,7 @@ from ledger.errors import (
 )
 from ledger.integrity import RegistrationStatus, StrategyEdgeForecast
 from ledger.json_utils import canonical_json, sha256_json
-from ledger.locking import ledger_lock
+from ledger.locking import ledger_lock, run_execution_lock
 from ledger.msm import MSMSnapshotSource, SnapshotDateWindow, StrategySnapshot
 from ledger.writer import LedgerWriter
 
@@ -315,8 +316,39 @@ class RunService:
             raise IntegrityError(f"run has no durable execution envelope: {run_id}")
         if row["state"] in (RunState.COMPLETED.value, RunState.FAILED.value):
             return self._result(row, executed=False)
+
+        execution_lock = run_execution_lock(self.writer.ledger_dir, run_id)
+        try:
+            execution_lock.acquire()
+        except FileLockTimeout as exc:
+            raise RunStateError(f"run is currently executing: {run_id}") from exc
+        try:
+            return self._execute_locked(run_id)
+        finally:
+            execution_lock.release()
+
+    def _execute_locked(self, run_id: str) -> RunResult:
+        """Execute or reconcile a run while holding its process-owned lease."""
+
+        row = self.registry.get_run(run_id)
+        if row is None or row["envelope_json"] is None:
+            raise IntegrityError(f"run has no durable execution envelope: {run_id}")
+        if row["state"] in (RunState.COMPLETED.value, RunState.FAILED.value):
+            return self._result(row, executed=False)
+        if row["state"] == RunState.RUNNING.value:
+            self.registry.finish_run(
+                run_id,
+                completed_at=self._clock_time(),
+                exit_code=1,
+                failure_note="wrapper exited before recording process completion",
+            )
+            orphaned = self.registry.get_run(run_id)
+            if orphaned is None:  # pragma: no cover - permanent registry identity
+                raise IntegrityError(f"orphaned run disappeared: {run_id}")
+            logger.warning("ledger_orphaned_run_failed", extra={"run_id": run_id})
+            return self._result(orphaned, executed=False)
         if row["state"] != RunState.REGISTERED.value:
-            raise RunStateError(f"run is already {row['state']}: {run_id}")
+            raise RunStateError(f"run has unsupported state {row['state']}: {run_id}")
 
         envelope = self._verified_envelope(row)
         command = tuple(str(value) for value in envelope["command"]["argv"])
