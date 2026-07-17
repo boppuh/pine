@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 _MAX_FRONTMATTER_BYTES = 1024 * 1024
 _RUNTIME_LEDGER_FILES = frozenset(
     {
+        "backend.json",
+        "backend.lock",
+        "backend.token",
         "registry.db",
         "registry.db-shm",
         "registry.db-wal",

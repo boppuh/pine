@@ -7,11 +7,12 @@ The structured capture service serializes the full preregistration critical sect
 schema revalidation, fresh-window enforcement, ID creation, snapshot capture, artifact
 publication, and registry commit.
 
-It intentionally contains no network, LLM, or Obsidian integration. MSM state enters
-through the local `SnapshotProvider` protocol; `MSMSnapshotProvider` is the strict
-adapter for MSM's point-in-time ClickHouse snapshot source. The `msm-ledger run`
-wrapper is the local execution boundary: it persists an immutable pre-run envelope
-before it hands control to an MSM process.
+It intentionally contains no external-network LLM provider or Obsidian integration.
+The loopback HTTP backend exposes provider-neutral extraction and atomic capture
+contracts, while MSM state enters through the local `SnapshotProvider` protocol;
+`MSMSnapshotProvider` is the strict adapter for MSM's point-in-time ClickHouse snapshot
+source. The `msm-ledger run` wrapper is the local execution boundary: it persists an
+immutable pre-run envelope before it hands control to an MSM process.
 
 ## Development
 
@@ -23,6 +24,52 @@ uv run pytest
 The first forecast shape is `finance/strategy-edge:1`, stored at
 `.ledger/schemas/finance/strategy-edge.1.json`. Runtime database, lock, and snapshot
 files are ignored by git.
+
+## Local HTTP backend
+
+`BackendServer` exposes the capture boundary to future local clients on
+`127.0.0.1` only. It pre-binds an ephemeral port, publishes non-secret connection
+metadata atomically to `.ledger/backend.json`, and keeps the persistent bearer token in
+`.ledger/backend.token` with mode `0600`. The discovery document contains only a token
+reference—never the token itself—and is removed on graceful shutdown. A per-vault
+process lock prevents two backend servers from claiming the same discovery file.
+
+Compose the server with the existing local snapshot provider and an asynchronous
+`HypothesisExtractor` implementation:
+
+```python
+from ledger import BackendServer, CaptureService, ExtractionService
+
+capture = CaptureService(vault_root, snapshot_provider)
+extraction = ExtractionService(
+    vault_root,
+    hypothesis_extractor,
+    schema_registry=capture.schema_registry,
+    registry=capture.registry,
+)
+server = BackendServer(
+    vault_root,
+    extraction_service=extraction,
+    capture_service=capture,
+)
+server.run()  # blocking; call server.stop() from the owning process to shut down
+```
+
+The API contract is:
+
+- `GET /health` — unauthenticated liveness and API version.
+- `POST /v1/drafts` — bearer-authenticated, side-effect-free extraction. It returns
+  either a schema-validated proposal with advisory fresh-window state or an explicit
+  `unable` result.
+- `POST /v1/captures` — bearer-authenticated confirmation through the existing atomic,
+  idempotent `CaptureService` transaction.
+
+Both protected endpoints require `Authorization: Bearer <token>`. Capture requests
+still have no `registration_status` input, and extractor output cannot assign one; a
+ready draft is preregistered by construction. Stable error envelopes distinguish
+authentication, request validation, schema, fresh-window, idempotency, snapshot, and
+integrity failures. The production frontier-model adapter and Obsidian client remain
+separate milestones.
 
 ## Structured capture
 
