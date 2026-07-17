@@ -16,7 +16,7 @@ from ledger.json_utils import canonical_json
 
 logger = logging.getLogger(__name__)
 
-_MIGRATION_VERSION = 3
+_MIGRATION_VERSION = 4
 
 _MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -221,7 +221,96 @@ BEGIN
 END;
 """
 
-_MIGRATIONS = {1: _MIGRATION_1, 2: _MIGRATION_2, 3: _MIGRATION_3}
+_MIGRATION_4 = """
+DROP TRIGGER run_bindings_write_once_update;
+DROP TRIGGER run_bindings_permanent_delete;
+
+ALTER TABLE run_bindings RENAME TO run_bindings_v3;
+
+CREATE TABLE run_bindings (
+    run_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    request_hash TEXT NOT NULL,
+    registration_status TEXT NOT NULL CHECK (
+        registration_status IN (
+            'preregistered', 'exploratory', 'unregistered_external'
+        )
+    ),
+    strategy_id TEXT NOT NULL,
+    dataset_version TEXT NOT NULL,
+    envelope_json TEXT NOT NULL,
+    envelope_hash TEXT NOT NULL,
+    bound_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
+);
+
+INSERT INTO run_bindings (
+    run_id, idempotency_key, request_hash, registration_status,
+    strategy_id, dataset_version, envelope_json, envelope_hash, bound_at
+)
+SELECT
+    run_id, idempotency_key, request_hash, registration_status,
+    strategy_id, dataset_version, envelope_json, envelope_hash, bound_at
+FROM run_bindings_v3;
+
+DROP TABLE run_bindings_v3;
+
+CREATE TRIGGER run_bindings_write_once_update
+BEFORE UPDATE ON run_bindings
+BEGIN
+    SELECT RAISE(ABORT, 'run binding is write-once');
+END;
+
+CREATE TRIGGER run_bindings_permanent_delete
+BEFORE DELETE ON run_bindings
+BEGIN
+    SELECT RAISE(ABORT, 'run binding is permanent');
+END;
+
+CREATE TABLE external_run_imports (
+    run_id TEXT PRIMARY KEY,
+    source_system TEXT NOT NULL,
+    source_run_id TEXT NOT NULL,
+    evidence_hash TEXT NOT NULL UNIQUE,
+    ingested_at TEXT NOT NULL,
+    UNIQUE (source_system, source_run_id),
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
+);
+
+CREATE TRIGGER external_run_imports_require_low_integrity_terminal_run
+BEFORE INSERT ON external_run_imports
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM runs
+    JOIN run_bindings USING (run_id)
+    WHERE runs.run_id = NEW.run_id
+      AND runs.prediction_id IS NULL
+      AND runs.state IN ('completed', 'failed')
+      AND run_bindings.registration_status = 'unregistered_external'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'external import requires a terminal low-integrity run');
+END;
+
+CREATE TRIGGER external_run_imports_write_once_update
+BEFORE UPDATE ON external_run_imports
+BEGIN
+    SELECT RAISE(ABORT, 'external run evidence is write-once');
+END;
+
+CREATE TRIGGER external_run_imports_permanent_delete
+BEFORE DELETE ON external_run_imports
+BEGIN
+    SELECT RAISE(ABORT, 'external run evidence is permanent');
+END;
+"""
+
+_MIGRATIONS = {
+    1: _MIGRATION_1,
+    2: _MIGRATION_2,
+    3: _MIGRATION_3,
+    4: _MIGRATION_4,
+}
 
 
 class LedgerRegistry:
@@ -379,6 +468,40 @@ class LedgerRegistry:
             if owns_connection:
                 active.close()
 
+    def get_external_run_import(
+        self,
+        source_system: str,
+        source_run_id: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> sqlite3.Row | None:
+        """Return a retroactively imported run by its permanent source identity."""
+
+        owns_connection = connection is None
+        active = connection or self.connect()
+        try:
+            return active.execute(
+                """
+                SELECT runs.*, run_bindings.idempotency_key,
+                       run_bindings.request_hash, run_bindings.registration_status,
+                       run_bindings.strategy_id, run_bindings.dataset_version,
+                       run_bindings.envelope_json, run_bindings.envelope_hash,
+                       run_bindings.bound_at, external_run_imports.source_system,
+                       external_run_imports.source_run_id,
+                       external_run_imports.evidence_hash,
+                       external_run_imports.ingested_at
+                FROM external_run_imports
+                JOIN runs USING (run_id)
+                JOIN run_bindings USING (run_id)
+                WHERE external_run_imports.source_system = ?
+                  AND external_run_imports.source_run_id = ?
+                """,
+                (source_system, source_run_id),
+            ).fetchone()
+        finally:
+            if owns_connection:
+                active.close()
+
     def is_committed(self, prediction_id: str) -> bool:
         """Return whether the registry authoritatively committed this prediction."""
 
@@ -495,6 +618,78 @@ class LedgerRegistry:
             envelope_hash=envelope_hash,
             bound_at=started_at,
             connection=connection,
+        )
+
+    def create_external_run_import(
+        self,
+        *,
+        run_id: str,
+        source_system: str,
+        source_run_id: str,
+        evidence_hash: str,
+        idempotency_key: str,
+        strategy_id: str,
+        dataset_version: str,
+        envelope_json: str,
+        envelope_hash: str,
+        started_at: datetime,
+        completed_at: datetime,
+        ingested_at: datetime,
+        exit_code: int,
+        failure_note: str | None,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Atomically register a terminal run recovered after wrapper bypass."""
+
+        state = "completed" if exit_code == 0 and failure_note is None else "failed"
+        connection.execute(
+            """
+            INSERT INTO runs (run_id, prediction_id, started_at, state)
+            VALUES (?, NULL, ?, 'registered')
+            """,
+            (run_id, started_at.isoformat()),
+        )
+        self._bind_run(
+            run_id=run_id,
+            idempotency_key=idempotency_key,
+            request_hash=evidence_hash,
+            registration_status="unregistered_external",
+            strategy_id=strategy_id,
+            dataset_version=dataset_version,
+            envelope_json=envelope_json,
+            envelope_hash=envelope_hash,
+            bound_at=ingested_at,
+            connection=connection,
+        )
+        connection.execute(
+            """
+            UPDATE runs
+            SET state = 'running', execution_started_at = ?
+            WHERE run_id = ? AND state = 'registered'
+            """,
+            (started_at.isoformat(), run_id),
+        )
+        connection.execute(
+            """
+            UPDATE runs
+            SET state = ?, completed_at = ?, exit_code = ?, failure_note = ?
+            WHERE run_id = ? AND state = 'running'
+            """,
+            (state, completed_at.isoformat(), exit_code, failure_note, run_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO external_run_imports (
+                run_id, source_system, source_run_id, evidence_hash, ingested_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                source_system,
+                source_run_id,
+                evidence_hash,
+                ingested_at.isoformat(),
+            ),
         )
 
     def bind_preregistered_run(

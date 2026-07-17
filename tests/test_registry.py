@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from ledger.integrity import PredictionStatus
-from ledger.registry import _MIGRATION_1, _MIGRATION_2, LedgerRegistry
+from ledger.registry import _MIGRATION_1, _MIGRATION_2, _MIGRATION_3, LedgerRegistry
 from ledger.writer import LedgerWriter
 
 
@@ -15,11 +15,11 @@ def test_registry_uses_wal_and_has_migration_stamp(vault: Path) -> None:
     connection = registry.connect()
     try:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-        assert [row[0] for row in versions] == [1, 2, 3]
+        assert [row[0] for row in versions] == [1, 2, 3, 4]
     finally:
         connection.close()
 
@@ -40,7 +40,7 @@ def test_existing_version_one_registry_migrates_forward(vault: Path) -> None:
     registry = LedgerRegistry(db_path)
     upgraded = registry.connect()
     try:
-        assert upgraded.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert upgraded.execute("PRAGMA user_version").fetchone()[0] == 4
         assert (
             upgraded.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'capture_requests'"
@@ -50,6 +50,15 @@ def test_existing_version_one_registry_migrates_forward(vault: Path) -> None:
         assert (
             upgraded.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_bindings'"
+            ).fetchone()
+            is not None
+        )
+        assert (
+            upgraded.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name = 'external_run_imports'
+                """
             ).fetchone()
             is not None
         )
@@ -99,6 +108,48 @@ def test_version_two_migration_preserves_allocated_prediction_run(vault: Path) -
     assert row["prediction_id"] == "pred_legacy"
     assert row["state"] == "registered"
     assert row["envelope_json"] is None
+
+
+def test_version_three_migration_preserves_existing_run_binding(vault: Path) -> None:
+    db_path = vault / ".ledger" / "registry.db"
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.executescript(_MIGRATION_1)
+        connection.executescript(_MIGRATION_2)
+        connection.executescript(_MIGRATION_3)
+        connection.execute(
+            """
+            INSERT INTO runs (run_id, prediction_id, started_at, state)
+            VALUES ('run_explore_legacy', NULL, '2026-01-01T00:00:00+00:00', 'registered')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO run_bindings (
+                run_id, idempotency_key, request_hash, registration_status,
+                strategy_id, dataset_version, envelope_json, envelope_hash, bound_at
+            ) VALUES (
+                'run_explore_legacy', 'legacy-key', 'sha256:request', 'exploratory',
+                'legacy-strategy', 'sha256:dataset', '{}', 'sha256:envelope',
+                '2026-01-01T00:00:00+00:00'
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?, '2026-01-01')",
+            [(1,), (2,), (3,)],
+        )
+        connection.execute("PRAGMA user_version = 3")
+        connection.commit()
+    finally:
+        connection.close()
+
+    registry = LedgerRegistry(db_path)
+    row = registry.get_run("run_explore_legacy")
+
+    assert row is not None
+    assert row["registration_status"] == "exploratory"
+    assert row["idempotency_key"] == "legacy-key"
 
 
 def test_registry_rejects_updates_to_write_once_columns(vault: Path, draft) -> None:
