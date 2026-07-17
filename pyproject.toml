@@ -13,6 +13,7 @@ dependencies = [
   "jsonschema[format]>=4.22,<5",
   "pydantic>=2.7,<3",
   "PyYAML>=6.0,<7",
+  "watchdog>=6.0,<7",
 ]
 
 [project.scripts]

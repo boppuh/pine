@@ -35,6 +35,15 @@ from ledger.run import (
 )
 from ledger.schema_registry import SchemaRegistry
 from ledger.snapshot import PendingPrediction, SnapshotProvider
+from ledger.watcher import (
+    FileChangeKind,
+    LedgerRecordEvent,
+    ManagedPathViolation,
+    ManagedViolationReason,
+    ManagedViolationReporter,
+    ReindexTrigger,
+    VaultWatcher,
+)
 from ledger.writer import LedgerWriter, StagedWrite, WriteResult
 
 __all__ = [
@@ -48,18 +57,24 @@ __all__ = [
     "ForecastValidationError",
     "ExploratoryRunRequest",
     "FreshWindowError",
+    "FileChangeKind",
     "IdempotencyConflictError",
     "IntegrityError",
     "LedgerRegistry",
+    "LedgerRecordEvent",
     "LedgerWriter",
     "MSMSnapshotProvider",
     "MSMSnapshotSource",
+    "ManagedPathViolation",
+    "ManagedViolationReason",
+    "ManagedViolationReporter",
     "PendingPrediction",
     "PredictionDraft",
     "PredictionStatus",
     "PreregisteredCaptureRequest",
     "PreregisteredRunRequest",
     "RegistrationStatus",
+    "ReindexTrigger",
     "RunResult",
     "RunService",
     "RunState",
@@ -71,4 +86,5 @@ __all__ = [
     "StrategySnapshot",
     "StagedWrite",
     "WriteResult",
+    "VaultWatcher",
 ]
