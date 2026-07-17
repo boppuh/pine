@@ -36,3 +36,7 @@ class IdempotencyConflictError(IntegrityError):
 
 class SnapshotCaptureError(IntegrityError):
     """Raised when a snapshot provider fails or returns invalid frozen state."""
+
+
+class RunStateError(IntegrityError):
+    """Raised when a run cannot make the requested lifecycle transition."""

@@ -16,7 +16,7 @@ from ledger.json_utils import canonical_json
 
 logger = logging.getLogger(__name__)
 
-_MIGRATION_VERSION = 2
+_MIGRATION_VERSION = 3
 
 _MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -127,7 +127,101 @@ CREATE INDEX IF NOT EXISTS idx_touched_windows_overlap
     ON touched_windows(family_id, window_start, window_end);
 """
 
-_MIGRATIONS = {1: _MIGRATION_1, 2: _MIGRATION_2}
+_MIGRATION_3 = """
+ALTER TABLE runs RENAME TO runs_v2;
+
+CREATE TABLE runs (
+    run_id TEXT PRIMARY KEY,
+    prediction_id TEXT UNIQUE,
+    started_at TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+        state IN ('registered', 'running', 'completed', 'failed')
+    ),
+    execution_started_at TEXT,
+    completed_at TEXT,
+    exit_code INTEGER,
+    failure_note TEXT,
+    FOREIGN KEY (prediction_id) REFERENCES predictions(prediction_id) ON DELETE RESTRICT
+);
+
+INSERT INTO runs (run_id, prediction_id, started_at, state)
+SELECT run_id, prediction_id, started_at, state FROM runs_v2;
+
+DROP TABLE runs_v2;
+
+CREATE INDEX idx_runs_prediction_id ON runs(prediction_id);
+
+CREATE TABLE run_bindings (
+    run_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    request_hash TEXT NOT NULL,
+    registration_status TEXT NOT NULL CHECK (
+        registration_status IN ('preregistered', 'exploratory')
+    ),
+    strategy_id TEXT NOT NULL,
+    dataset_version TEXT NOT NULL,
+    envelope_json TEXT NOT NULL,
+    envelope_hash TEXT NOT NULL,
+    bound_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
+);
+
+CREATE TRIGGER runs_identity_write_once_update
+BEFORE UPDATE OF run_id, prediction_id, started_at ON runs
+BEGIN
+    SELECT RAISE(ABORT, 'run identity is write-once');
+END;
+
+CREATE TRIGGER runs_lifecycle_transitions
+BEFORE UPDATE ON runs
+WHEN NOT (
+    (
+        OLD.state = 'registered'
+        AND NEW.state = 'running'
+        AND OLD.execution_started_at IS NULL
+        AND NEW.execution_started_at IS NOT NULL
+        AND NEW.completed_at IS NULL
+        AND NEW.exit_code IS NULL
+        AND NEW.failure_note IS NULL
+    )
+    OR
+    (
+        OLD.state = 'running'
+        AND NEW.state IN ('completed', 'failed')
+        AND NEW.execution_started_at = OLD.execution_started_at
+        AND NEW.completed_at IS NOT NULL
+        AND NEW.exit_code IS NOT NULL
+        AND (
+            (NEW.state = 'completed' AND NEW.exit_code = 0 AND NEW.failure_note IS NULL)
+            OR
+            (NEW.state = 'failed' AND (NEW.exit_code != 0 OR NEW.failure_note IS NOT NULL))
+        )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid run lifecycle transition');
+END;
+
+CREATE TRIGGER runs_permanent_delete
+BEFORE DELETE ON runs
+BEGIN
+    SELECT RAISE(ABORT, 'run identity is permanent');
+END;
+
+CREATE TRIGGER run_bindings_write_once_update
+BEFORE UPDATE ON run_bindings
+BEGIN
+    SELECT RAISE(ABORT, 'run binding is write-once');
+END;
+
+CREATE TRIGGER run_bindings_permanent_delete
+BEFORE DELETE ON run_bindings
+BEGIN
+    SELECT RAISE(ABORT, 'run binding is permanent');
+END;
+"""
+
+_MIGRATIONS = {1: _MIGRATION_1, 2: _MIGRATION_2, 3: _MIGRATION_3}
 
 
 class LedgerRegistry:
@@ -203,6 +297,81 @@ class LedgerRegistry:
                 FROM capture_requests
                 JOIN predictions USING (prediction_id)
                 WHERE capture_requests.idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+        finally:
+            if owns_connection:
+                active.close()
+
+    def get_run(
+        self,
+        run_id: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> sqlite3.Row | None:
+        """Return one run joined to its immutable execution binding, if present."""
+
+        owns_connection = connection is None
+        active = connection or self.connect()
+        try:
+            return active.execute(
+                """
+                SELECT runs.*, run_bindings.idempotency_key,
+                       run_bindings.request_hash, run_bindings.registration_status,
+                       run_bindings.strategy_id, run_bindings.dataset_version,
+                       run_bindings.envelope_json, run_bindings.envelope_hash,
+                       run_bindings.bound_at
+                FROM runs
+                LEFT JOIN run_bindings USING (run_id)
+                WHERE runs.run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        finally:
+            if owns_connection:
+                active.close()
+
+    def get_run_by_prediction_id(
+        self,
+        prediction_id: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> sqlite3.Row | None:
+        """Return the preallocated run for a prediction."""
+
+        owns_connection = connection is None
+        active = connection or self.connect()
+        try:
+            return active.execute(
+                "SELECT * FROM runs WHERE prediction_id = ?",
+                (prediction_id,),
+            ).fetchone()
+        finally:
+            if owns_connection:
+                active.close()
+
+    def get_run_by_idempotency_key(
+        self,
+        idempotency_key: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> sqlite3.Row | None:
+        """Return a run and immutable binding assigned to an execution request."""
+
+        owns_connection = connection is None
+        active = connection or self.connect()
+        try:
+            return active.execute(
+                """
+                SELECT runs.*, run_bindings.idempotency_key,
+                       run_bindings.request_hash, run_bindings.registration_status,
+                       run_bindings.strategy_id, run_bindings.dataset_version,
+                       run_bindings.envelope_json, run_bindings.envelope_hash,
+                       run_bindings.bound_at
+                FROM run_bindings
+                JOIN runs USING (run_id)
+                WHERE run_bindings.idempotency_key = ?
                 """,
                 (idempotency_key,),
             ).fetchone()
@@ -291,6 +460,170 @@ class LedgerRegistry:
             ) VALUES (?, ?, ?, ?)
             """,
             (idempotency_key, request_hash, prediction_id, created_at.isoformat()),
+        )
+
+    def create_exploratory_run(
+        self,
+        *,
+        run_id: str,
+        started_at: datetime,
+        idempotency_key: str,
+        request_hash: str,
+        strategy_id: str,
+        dataset_version: str,
+        envelope_json: str,
+        envelope_hash: str,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Create an exploratory run and its permanent binding in one transaction."""
+
+        connection.execute(
+            """
+            INSERT INTO runs (run_id, prediction_id, started_at, state)
+            VALUES (?, NULL, ?, 'registered')
+            """,
+            (run_id, started_at.isoformat()),
+        )
+        self._bind_run(
+            run_id=run_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            registration_status="exploratory",
+            strategy_id=strategy_id,
+            dataset_version=dataset_version,
+            envelope_json=envelope_json,
+            envelope_hash=envelope_hash,
+            bound_at=started_at,
+            connection=connection,
+        )
+
+    def bind_preregistered_run(
+        self,
+        *,
+        run_id: str,
+        idempotency_key: str,
+        request_hash: str,
+        strategy_id: str,
+        dataset_version: str,
+        envelope_json: str,
+        envelope_hash: str,
+        bound_at: datetime,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Bind only the allocated run of a committed preregistered prediction."""
+
+        eligible = connection.execute(
+            """
+            SELECT 1
+            FROM runs
+            JOIN predictions USING (prediction_id)
+            WHERE runs.run_id = ?
+              AND runs.state = 'registered'
+              AND predictions.transaction_state = 'committed'
+              AND predictions.registration_status = 'preregistered'
+            """,
+            (run_id,),
+        ).fetchone()
+        if eligible is None:
+            raise IntegrityError(f"run is not allocated to a preregistered prediction: {run_id}")
+        self._bind_run(
+            run_id=run_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            registration_status="preregistered",
+            strategy_id=strategy_id,
+            dataset_version=dataset_version,
+            envelope_json=envelope_json,
+            envelope_hash=envelope_hash,
+            bound_at=bound_at,
+            connection=connection,
+        )
+
+    @staticmethod
+    def _bind_run(
+        *,
+        run_id: str,
+        idempotency_key: str,
+        request_hash: str,
+        registration_status: str,
+        strategy_id: str,
+        dataset_version: str,
+        envelope_json: str,
+        envelope_hash: str,
+        bound_at: datetime,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Insert the shared immutable binding after a typed public-path check."""
+
+        cursor = connection.execute(
+            """
+            INSERT INTO run_bindings (
+                run_id, idempotency_key, request_hash, registration_status,
+                strategy_id, dataset_version, envelope_json, envelope_hash, bound_at
+            )
+            SELECT run_id, ?, ?, ?, ?, ?, ?, ?, ?
+            FROM runs
+            WHERE run_id = ? AND state = 'registered'
+            """,
+            (
+                idempotency_key,
+                request_hash,
+                registration_status,
+                strategy_id,
+                dataset_version,
+                envelope_json,
+                envelope_hash,
+                bound_at.isoformat(),
+                run_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise IntegrityError(f"cannot bind unknown or started run: {run_id}")
+
+    def start_run(self, run_id: str, *, started_at: datetime) -> None:
+        """Atomically claim a bound run immediately before handing control to MSM."""
+
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE runs
+                SET state = 'running', execution_started_at = ?
+                WHERE run_id = ? AND state = 'registered'
+                  AND EXISTS (
+                      SELECT 1 FROM run_bindings WHERE run_bindings.run_id = runs.run_id
+                  )
+                """,
+                (started_at.isoformat(), run_id),
+            )
+            if cursor.rowcount != 1:
+                raise IntegrityError(f"run is not available to start: {run_id}")
+
+    def finish_run(
+        self,
+        run_id: str,
+        *,
+        completed_at: datetime,
+        exit_code: int,
+        failure_note: str | None = None,
+    ) -> None:
+        """Persist the terminal process state for a claimed run."""
+
+        state = "completed" if exit_code == 0 and failure_note is None else "failed"
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE runs
+                SET state = ?, completed_at = ?, exit_code = ?, failure_note = ?
+                WHERE run_id = ? AND state = 'running'
+                """,
+                (state, completed_at.isoformat(), exit_code, failure_note, run_id),
+            )
+            if cursor.rowcount != 1:
+                raise IntegrityError(f"run is not active: {run_id}")
+
+        logger.info(
+            "ledger_run_finished",
+            extra={"run_id": run_id, "state": state, "exit_code": exit_code},
         )
 
     def update_resolution(

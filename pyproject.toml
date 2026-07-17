@@ -15,6 +15,9 @@ dependencies = [
   "PyYAML>=6.0,<7",
 ]
 
+[project.scripts]
+msm-ledger = "ledger.cli:main"
+
 [project.optional-dependencies]
 dev = [
   "pyright>=1.1.411,<2",

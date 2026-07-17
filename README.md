@@ -9,7 +9,9 @@ publication, and registry commit.
 
 It intentionally contains no network, LLM, or Obsidian integration. MSM state enters
 through the local `SnapshotProvider` protocol; `MSMSnapshotProvider` is the strict
-adapter for MSM's point-in-time ClickHouse snapshot source.
+adapter for MSM's point-in-time ClickHouse snapshot source. The `msm-ledger run`
+wrapper is the local execution boundary: it persists an immutable pre-run envelope
+before it hands control to an MSM process.
 
 ## Development
 
@@ -56,6 +58,56 @@ table, and two identical reads of the ClickHouse part manifest. Pine independent
 validates the full response and binds its strategy, date windows, and data-as-of time
 to the pending prediction. Any mismatch aborts before artifacts or registry rows are
 published.
+
+## MSM run wrapper
+
+Install Pine and MSM in the same Python environment, then invoke the MSM command after
+`--`. Arguments are passed as an argv vector with `shell=False`; they are never parsed
+as a shell command.
+
+An exploratory run requires the strategy and both research windows. The wrapper asks
+MSM for a strict point-in-time snapshot and commits a permanent `exploratory` envelope
+to `.ledger/registry.db` before the subprocess can start:
+
+```bash
+msm-ledger run \
+  --vault-root /path/to/pine-vault \
+  --idempotency-key vwap-smoke-20260422 \
+  --strategy-id vwap_mr_v3.1 \
+  --in-sample-start 2026-04-22 \
+  --in-sample-end 2026-04-22 \
+  --out-of-sample-start 2026-04-22 \
+  --out-of-sample-end 2026-04-22 \
+  --working-directory /path/to/msm \
+  -- uv run python scripts/frozen/frozen_vwap_mr_v3_1.py \
+       --start-date 2026-04-22 --end-date 2026-04-22
+```
+
+A preregistered run instead names an existing committed prediction. Its frozen
+snapshot and Markdown integrity hash are revalidated before the allocated `run_id` is
+bound to the command:
+
+```bash
+msm-ledger run \
+  --vault-root /path/to/pine-vault \
+  --idempotency-key pred-abc-first-execution \
+  --prediction-id pred_abc \
+  --working-directory /path/to/msm \
+  -- uv run python scripts/frozen/frozen_vwap_mr_v3_1.py \
+       --start-date 2026-04-22 --end-date 2026-04-22
+```
+
+Retries must reuse the same idempotency key and exact request. A completed or failed
+retry is a no-op and returns the stored process exit code; changing the command under
+an existing key fails closed. If the executor cannot launch the command, the first call
+and every retry return the same failed JSON result and exit code. The child receives
+`LEDGER_RUN_ID`, `LEDGER_REGISTRATION_STATUS`, `LEDGER_DATASET_VERSION`, and
+`LEDGER_ENVELOPE_HASH`.
+Preregistered children also receive `LEDGER_PREDICTION_ID`. Immediately before process
+start, the wrapper verifies that `--working-directory` is a clean Git checkout at the
+exact commit frozen in the snapshot. A per-run process lock distinguishes a live
+execution from a wrapper that disappeared mid-run; the next retry permanently marks an
+orphaned `running` entry as failed and never launches a duplicate process.
 
 ## Atomicity boundary
 
