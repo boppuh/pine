@@ -16,7 +16,7 @@ from ledger.json_utils import canonical_json
 
 logger = logging.getLogger(__name__)
 
-_MIGRATION_VERSION = 4
+_MIGRATION_VERSION = 5
 
 _MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -305,11 +305,45 @@ BEGIN
 END;
 """
 
+_MIGRATION_5 = """
+CREATE TRIGGER predictions_quarantine_requires_evidence
+BEFORE UPDATE OF status ON predictions
+WHEN NEW.status = 'quarantined'
+  AND OLD.status != 'quarantined'
+  AND NOT EXISTS (
+      SELECT 1 FROM integrity_violations
+      WHERE prediction_id = OLD.prediction_id
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'quarantine requires integrity violation evidence');
+END;
+
+CREATE TRIGGER predictions_quarantine_terminal
+BEFORE UPDATE OF status ON predictions
+WHEN OLD.status = 'quarantined' AND NEW.status != 'quarantined'
+BEGIN
+    SELECT RAISE(ABORT, 'quarantined prediction status is terminal');
+END;
+
+CREATE TRIGGER integrity_violations_write_once_update
+BEFORE UPDATE ON integrity_violations
+BEGIN
+    SELECT RAISE(ABORT, 'integrity violation evidence is write-once');
+END;
+
+CREATE TRIGGER integrity_violations_permanent_delete
+BEFORE DELETE ON integrity_violations
+BEGIN
+    SELECT RAISE(ABORT, 'integrity violation evidence is permanent');
+END;
+"""
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
     3: _MIGRATION_3,
     4: _MIGRATION_4,
+    5: _MIGRATION_5,
 }
 
 
@@ -832,6 +866,11 @@ class LedgerRegistry:
     ) -> None:
         """Persist the only mutable record fields through the enforcement authority."""
 
+        if status is PredictionStatus.QUARANTINED:
+            raise IntegrityError(
+                "quarantine requires violation evidence; use quarantine_prediction"
+            )
+
         with self.transaction() as connection:
             cursor = connection.execute(
                 """
@@ -970,6 +1009,74 @@ class LedgerRegistry:
                 """,
                 (prediction_id, field, timestamp.isoformat(), note),
             )
+
+    def quarantine_prediction(
+        self,
+        prediction_id: str,
+        *,
+        violations: Mapping[str, str],
+        detected_at: datetime | None = None,
+    ) -> bool:
+        """Permanently quarantine a committed prediction and append new evidence.
+
+        Identical ``(prediction_id, field, note)`` evidence is recorded once so
+        duplicate filesystem notifications remain idempotent. The return value is
+        true when the status changed or at least one new violation was appended.
+        """
+
+        if not violations:
+            raise ValueError("violations must contain at least one field")
+        if any(not field or not note for field, note in violations.items()):
+            raise ValueError("violation fields and notes must be non-empty")
+        timestamp = detected_at or datetime.now(UTC)
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise ValueError("detected_at must be timezone-aware")
+        changed = False
+        with self.transaction() as connection:
+            row = self.get_prediction(prediction_id, connection=connection)
+            if row is None or row["transaction_state"] != "committed":
+                raise IntegrityError(
+                    f"cannot quarantine unknown or uncommitted prediction: {prediction_id}"
+                )
+            for field, note in violations.items():
+                cursor = connection.execute(
+                    """
+                    INSERT INTO integrity_violations (
+                        prediction_id, field, detected_at, note
+                    )
+                    SELECT ?, ?, ?, ?
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM integrity_violations
+                        WHERE prediction_id = ? AND field = ? AND note = ?
+                    )
+                    """,
+                    (
+                        prediction_id,
+                        field,
+                        timestamp.isoformat(),
+                        note,
+                        prediction_id,
+                        field,
+                        note,
+                    ),
+                )
+                changed = changed or cursor.rowcount == 1
+            if row["status"] != PredictionStatus.QUARANTINED.value:
+                connection.execute(
+                    "UPDATE predictions SET status = ? WHERE prediction_id = ?",
+                    (PredictionStatus.QUARANTINED.value, prediction_id),
+                )
+                changed = True
+
+        logger.warning(
+            "ledger_prediction_quarantined",
+            extra={
+                "prediction_id": prediction_id,
+                "fields": sorted(violations),
+                "changed": changed,
+            },
+        )
+        return changed
 
     def _migrate(self) -> None:
         connection = self.connect()

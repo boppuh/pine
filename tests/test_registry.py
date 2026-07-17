@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from ledger.errors import IntegrityError
 from ledger.integrity import PredictionStatus
 from ledger.registry import _MIGRATION_1, _MIGRATION_2, _MIGRATION_3, LedgerRegistry
 from ledger.writer import LedgerWriter
@@ -15,11 +16,11 @@ def test_registry_uses_wal_and_has_migration_stamp(vault: Path) -> None:
     connection = registry.connect()
     try:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-        assert [row[0] for row in versions] == [1, 2, 3, 4]
+        assert [row[0] for row in versions] == [1, 2, 3, 4, 5]
     finally:
         connection.close()
 
@@ -40,7 +41,7 @@ def test_existing_version_one_registry_migrates_forward(vault: Path) -> None:
     registry = LedgerRegistry(db_path)
     upgraded = registry.connect()
     try:
-        assert upgraded.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert upgraded.execute("PRAGMA user_version").fetchone()[0] == 5
         assert (
             upgraded.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'capture_requests'"
@@ -203,6 +204,98 @@ def test_lifecycle_fields_mutate_only_through_registry(vault: Path, draft) -> No
     assert row is not None
     assert row["status"] == "resolved"
     assert row["outcome_json"] == '{"sharpe":1.3}'
+
+
+def test_quarantine_is_atomic_deduplicated_and_terminal(vault: Path, draft) -> None:
+    writer = LedgerWriter(vault)
+    writer.write(draft)
+    registry = writer.registry
+    registry.update_resolution(
+        draft.prediction_id,
+        status=PredictionStatus.RESOLVED,
+        outcome={"sharpe": 1.3},
+        grade={"forecast_accuracy": 0.8},
+        resolution_metadata={"source": "test"},
+    )
+    with pytest.raises(IntegrityError, match="use quarantine_prediction"):
+        registry.update_resolution(
+            draft.prediction_id,
+            status=PredictionStatus.QUARANTINED,
+        )
+    connection = registry.connect()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="requires integrity violation"):
+            connection.execute(
+                "UPDATE predictions SET status = 'quarantined' WHERE prediction_id = ?",
+                (draft.prediction_id,),
+            )
+    finally:
+        connection.close()
+
+    first_changed = registry.quarantine_prediction(
+        draft.prediction_id,
+        violations={"registration_status": "frontmatter differs from registry"},
+    )
+    second_changed = registry.quarantine_prediction(
+        draft.prediction_id,
+        violations={"registration_status": "frontmatter differs from registry"},
+    )
+
+    assert first_changed is True
+    assert second_changed is False
+    row = registry.get_prediction(draft.prediction_id)
+    assert row is not None
+    assert row["status"] == PredictionStatus.QUARANTINED.value
+    assert row["outcome_json"] == '{"sharpe":1.3}'
+    assert row["grade_json"] == '{"forecast_accuracy":0.8}'
+    assert row["resolution_metadata_json"] == '{"source":"test"}'
+
+    connection = registry.connect()
+    try:
+        violations = connection.execute(
+            "SELECT field, note FROM integrity_violations WHERE prediction_id = ?",
+            (draft.prediction_id,),
+        ).fetchall()
+        assert [tuple(item) for item in violations] == [
+            ("registration_status", "frontmatter differs from registry")
+        ]
+        with pytest.raises(sqlite3.IntegrityError, match="status is terminal"):
+            connection.execute(
+                "UPDATE predictions SET status = 'resolved' WHERE prediction_id = ?",
+                (draft.prediction_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="evidence is write-once"):
+            connection.execute(
+                "UPDATE integrity_violations SET note = 'rewritten' WHERE prediction_id = ?",
+                (draft.prediction_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="evidence is permanent"):
+            connection.execute(
+                "DELETE FROM integrity_violations WHERE prediction_id = ?",
+                (draft.prediction_id,),
+            )
+    finally:
+        connection.close()
+
+    with pytest.raises(sqlite3.IntegrityError, match="status is terminal"):
+        registry.update_resolution(
+            draft.prediction_id,
+            status=PredictionStatus.OPEN,
+        )
+
+
+def test_quarantine_rejects_missing_or_empty_evidence(vault: Path) -> None:
+    registry = LedgerRegistry(vault / ".ledger" / "registry.db")
+
+    with pytest.raises(ValueError, match="at least one"):
+        registry.quarantine_prediction("pred_missing", violations={})
+    with pytest.raises(ValueError, match="non-empty"):
+        registry.quarantine_prediction("pred_missing", violations={"record": ""})
+    with pytest.raises(IntegrityError, match="unknown or uncommitted"):
+        registry.quarantine_prediction(
+            "pred_missing",
+            violations={"record": "missing"},
+        )
 
 
 @pytest.mark.parametrize(
