@@ -139,17 +139,31 @@ attestation.
 
 ## Vault observation
 
-`VaultWatcher` provides the read-only boundary for later registry revalidation and
-indexing. Callers supply a record callback and a managed-path violation reporter; the
-watcher never changes either records or managed state:
+`VaultWatcher` provides the read-only boundary for registry revalidation and later
+indexing. `RecordIntegrityChecker` is the registry-backed callback that quarantines
+semantic changes to committed immutable evidence. The watcher itself never changes
+records or managed state:
 
 ```python
-from ledger import VaultWatcher
+from ledger import RecordIntegrityChecker, VaultWatcher
+
+checker = RecordIntegrityChecker("/path/to/pine-vault")
+
+
+def handle_record(event):
+    result = checker.check_record(event)
+    if result.may_reindex:
+        reindex_queue.put(event)
+
+
+def handle_violation(violation):
+    checker.handle_managed_violation(violation)
+    integrity_queue.put(violation)
 
 watcher = VaultWatcher(
     "/path/to/pine-vault",
-    on_record=lambda event: reindex_queue.put(event),
-    on_violation=lambda violation: integrity_queue.put(violation),
+    on_record=handle_record,
+    on_violation=handle_violation,
 )
 watcher.start()
 try:
@@ -170,7 +184,15 @@ The managed-directory policy ignores expected SQLite/WAL/lock churn, accepts a n
 snapshot only when it belongs to a committed registry row, and reports snapshot
 rewrites/deletes, unregistered snapshots, schema changes, registry removal, and unknown
 managed files. The re-index and violation callbacks are intentionally integration
-stubs: embedding and note-to-registry quarantine remain later milestones.
+boundaries: the embedding index remains a later milestone.
+
+The checker reconstructs the canonical immutable payload from Markdown plus the
+registry-authoritative snapshot path and compares it with the committed hash. A
+malformed or missing committed record, an immutable frontmatter mismatch, or a managed
+snapshot rewrite/deletion atomically changes only registry status to `quarantined` and
+appends deduplicated integrity evidence. Quarantine is terminal at the SQLite layer.
+The checker never repairs or rewrites artifacts, and body or mutable projection edits
+cannot alter registry authority. Only a `clean` result may proceed to indexing.
 
 ## Atomicity boundary
 

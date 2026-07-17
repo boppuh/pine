@@ -25,6 +25,11 @@ from ledger.integrity import (
     RegistrationStatus,
 )
 from ledger.msm import MSMSnapshotProvider, MSMSnapshotSource, StrategySnapshot
+from ledger.record_integrity import (
+    IntegrityCheckResult,
+    IntegrityCheckState,
+    RecordIntegrityChecker,
+)
 from ledger.registry import LedgerRegistry
 from ledger.run import (
     ExploratoryRunRequest,
@@ -59,6 +64,8 @@ __all__ = [
     "FreshWindowError",
     "FileChangeKind",
     "IdempotencyConflictError",
+    "IntegrityCheckResult",
+    "IntegrityCheckState",
     "IntegrityError",
     "LedgerRegistry",
     "LedgerRecordEvent",
@@ -74,6 +81,7 @@ __all__ = [
     "PreregisteredCaptureRequest",
     "PreregisteredRunRequest",
     "RegistrationStatus",
+    "RecordIntegrityChecker",
     "ReindexTrigger",
     "RunResult",
     "RunService",
