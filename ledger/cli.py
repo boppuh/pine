@@ -164,5 +164,6 @@ def _result_payload(result: RunResult) -> dict[str, Any]:
         "envelope_hash": result.envelope_hash,
         "state": result.state.value,
         "exit_code": result.exit_code,
+        "failure_note": result.failure_note,
         "executed": result.executed,
     }

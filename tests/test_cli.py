@@ -11,7 +11,14 @@ from ledger.integrity import RegistrationStatus
 from ledger.run import RunResult, RunState
 
 
-def _result(*, prediction_id: str | None = None) -> RunResult:
+def _result(
+    *,
+    prediction_id: str | None = None,
+    state: RunState = RunState.COMPLETED,
+    exit_code: int = 0,
+    failure_note: str | None = None,
+    executed: bool = True,
+) -> RunResult:
     return RunResult(
         run_id="run_cli_01",
         prediction_id=prediction_id,
@@ -23,9 +30,10 @@ def _result(*, prediction_id: str | None = None) -> RunResult:
         strategy_id="msm-strat-orb-001",
         dataset_version=f"sha256:{'a' * 64}",
         envelope_hash=f"sha256:{'b' * 64}",
-        state=RunState.COMPLETED,
-        exit_code=0,
-        executed=True,
+        state=state,
+        exit_code=exit_code,
+        failure_note=failure_note,
+        executed=executed,
     )
 
 
@@ -150,3 +158,46 @@ def test_cli_rejects_exploratory_run_without_all_windows(vault: Path) -> None:
                 "msm",
             ]
         )
+
+
+def test_cli_returns_terminal_executor_failure_as_json(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FakeService:
+        def __init__(self, _vault_root: Path) -> None:
+            pass
+
+        def run_preregistered(self, _request: object) -> RunResult:
+            return _result(
+                prediction_id="pred_cli_failed",
+                state=RunState.FAILED,
+                exit_code=1,
+                failure_note="OSError: runner missing",
+                executed=False,
+            )
+
+    monkeypatch.setattr(cli, "RunService", FakeService)
+
+    exit_code = cli.run_cli(
+        [
+            "run",
+            "--vault",
+            str(vault),
+            "--idempotency-key",
+            "cli-failed-01",
+            "--prediction-id",
+            "pred_cli_failed",
+            "--",
+            "missing-runner",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.err == ""
+    output = json.loads(captured.out)
+    assert output["state"] == "failed"
+    assert output["failure_note"] == "OSError: runner missing"
+    assert output["executed"] is False

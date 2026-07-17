@@ -13,7 +13,6 @@ import pytest
 from ledger.errors import (
     IdempotencyConflictError,
     IntegrityError,
-    RunExecutionError,
     RunStateError,
     SnapshotCaptureError,
 )
@@ -368,7 +367,11 @@ def test_nonzero_exit_is_permanent_failed_run(vault: Path) -> None:
 
 
 def test_executor_exception_is_recorded_as_failed(vault: Path) -> None:
+    calls = 0
+
     def executor(*_args: Any) -> int:
+        nonlocal calls
+        calls += 1
         raise OSError("runner missing")
 
     service = RunService(
@@ -379,14 +382,22 @@ def test_executor_exception_is_recorded_as_failed(vault: Path) -> None:
         git_state_reader=_clean_git,
     )
 
-    with pytest.raises(RunExecutionError, match="could not execute MSM command"):
-        service.run_exploratory(_exploratory_request(vault))
+    request = _exploratory_request(vault)
+    first = service.run_exploratory(request)
+    retry = service.run_exploratory(request)
+
+    assert first.state is RunState.FAILED
+    assert first.exit_code == 1
+    assert first.failure_note == "OSError: runner missing"
+    assert first.executed is False
+    assert retry == first
+    assert calls == 1
 
     connection = service.registry.connect()
     try:
         row = connection.execute("SELECT * FROM runs").fetchone()
         assert row["state"] == RunState.FAILED.value
-        assert row["exit_code"] == -1
+        assert row["exit_code"] == 1
         assert row["failure_note"] == "OSError: runner missing"
     finally:
         connection.close()

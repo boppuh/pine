@@ -99,8 +99,10 @@ msm-ledger run \
 
 Retries must reuse the same idempotency key and exact request. A completed or failed
 retry is a no-op and returns the stored process exit code; changing the command under
-an existing key fails closed. The child receives `LEDGER_RUN_ID`,
-`LEDGER_REGISTRATION_STATUS`, `LEDGER_DATASET_VERSION`, and `LEDGER_ENVELOPE_HASH`.
+an existing key fails closed. If the executor cannot launch the command, the first call
+and every retry return the same failed JSON result and exit code. The child receives
+`LEDGER_RUN_ID`, `LEDGER_REGISTRATION_STATUS`, `LEDGER_DATASET_VERSION`, and
+`LEDGER_ENVELOPE_HASH`.
 Preregistered children also receive `LEDGER_PREDICTION_ID`. Immediately before process
 start, the wrapper verifies that `--working-directory` is a clean Git checkout at the
 exact commit frozen in the snapshot. A per-run process lock distinguishes a live

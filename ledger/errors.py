@@ -40,7 +40,3 @@ class SnapshotCaptureError(IntegrityError):
 
 class RunStateError(IntegrityError):
     """Raised when a run cannot make the requested lifecycle transition."""
-
-
-class RunExecutionError(IntegrityError):
-    """Raised when the configured process cannot be invoked safely."""

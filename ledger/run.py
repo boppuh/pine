@@ -22,7 +22,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from ledger.errors import (
     IdempotencyConflictError,
     IntegrityError,
-    RunExecutionError,
     RunStateError,
     SnapshotCaptureError,
 )
@@ -110,6 +109,7 @@ class RunResult:
     envelope_hash: str
     state: RunState
     exit_code: int | None
+    failure_note: str | None
     executed: bool
 
 
@@ -373,13 +373,18 @@ class RunService:
             )
             raise
         except Exception as exc:
+            failure_note = f"{type(exc).__name__}: {exc}"
             self.registry.finish_run(
                 run_id,
                 completed_at=self._clock_time(),
-                exit_code=-1,
-                failure_note=f"{type(exc).__name__}: {exc}",
+                exit_code=1,
+                failure_note=failure_note,
             )
-            raise RunExecutionError(f"could not execute MSM command for {run_id}") from exc
+            failed = self.registry.get_run(run_id)
+            if failed is None:  # pragma: no cover - permanent registry identity
+                raise IntegrityError(f"failed run disappeared: {run_id}") from exc
+            logger.exception("ledger_run_executor_failed", extra={"run_id": run_id})
+            return self._result(failed, executed=False)
 
         failure_note = None if exit_code == 0 else f"process exited with code {exit_code}"
         self.registry.finish_run(
@@ -565,6 +570,7 @@ class RunService:
             envelope_hash=row["envelope_hash"],
             state=state,
             exit_code=row["exit_code"],
+            failure_note=row["failure_note"],
             executed=executed,
         )
 
