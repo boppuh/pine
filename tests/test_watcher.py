@@ -220,3 +220,40 @@ def test_sqlite_runtime_churn_is_not_reported(vault: Path) -> None:
         _assert_no_event(violations)
 
     assert records.empty()
+
+
+def test_registry_recreation_after_settled_delete_is_reported(vault: Path) -> None:
+    records: queue.Queue[LedgerRecordEvent] = queue.Queue()
+    violations: queue.Queue[ManagedPathViolation] = queue.Queue()
+    registry = vault / ".ledger" / "registry.db"
+    registry.write_bytes(b"original registry")
+
+    with _watcher(vault, records, violations):
+        registry.unlink()
+        removed = _next_event(violations)
+        registry.write_bytes(b"replacement registry")
+        replaced = _next_event(violations)
+
+    assert isinstance(removed, ManagedPathViolation)
+    assert removed.path == registry
+    assert removed.reason is ManagedViolationReason.REGISTRY_REMOVED
+    assert removed.change is FileChangeKind.DELETED
+    assert isinstance(replaced, ManagedPathViolation)
+    assert replaced.path == registry
+    assert replaced.reason is ManagedViolationReason.REGISTRY_REPLACED
+    assert replaced.change is FileChangeKind.CREATED
+    assert records.empty()
+
+
+def test_scalar_record_root_is_treated_as_one_path(vault: Path) -> None:
+    records: queue.Queue[LedgerRecordEvent] = queue.Queue()
+    violations: queue.Queue[ManagedPathViolation] = queue.Queue()
+    watcher = VaultWatcher(
+        vault,
+        on_record=records.put,
+        on_violation=violations.put,
+        record_roots="research-records",
+    )
+
+    assert watcher.record_roots == ((vault / "research-records").resolve(),)
+    watcher.stop()

@@ -186,6 +186,8 @@ class _VaultEventHandler(FileSystemEventHandler):
         self.record_roots = record_roots
         self._known_lock = threading.Lock()
         self._known_files: dict[Path, tuple[int, int, int]] = {}
+        self._registry_state_lock = threading.Lock()
+        self._registry_was_removed = False
         self._debouncer = _Debouncer(
             debounce_seconds,
             self._dispatch,
@@ -352,10 +354,7 @@ class _VaultEventHandler(FileSystemEventHandler):
             return
         if len(relative.parts) == 1 and top_level in _RUNTIME_LEDGER_FILES:
             if top_level == "registry.db":
-                if pending.change is FileChangeKind.DELETED:
-                    self._report_violation(pending, ManagedViolationReason.REGISTRY_REMOVED)
-                elif pending.change is FileChangeKind.REPLACED:
-                    self._report_violation(pending, ManagedViolationReason.REGISTRY_REPLACED)
+                self._dispatch_registry(pending)
             return
         if top_level == "schemas":
             self._report_violation(pending, ManagedViolationReason.SCHEMA_CHANGED)
@@ -364,6 +363,21 @@ class _VaultEventHandler(FileSystemEventHandler):
             self._dispatch_snapshot(pending)
             return
         self._report_violation(pending, ManagedViolationReason.UNMANAGED_LEDGER_PATH)
+
+    def _dispatch_registry(self, pending: _PendingPathEvent) -> None:
+        reason: ManagedViolationReason | None = None
+        with self._registry_state_lock:
+            if pending.change is FileChangeKind.DELETED:
+                self._registry_was_removed = True
+                reason = ManagedViolationReason.REGISTRY_REMOVED
+            elif pending.change is FileChangeKind.REPLACED:
+                self._registry_was_removed = False
+                reason = ManagedViolationReason.REGISTRY_REPLACED
+            elif pending.change is FileChangeKind.CREATED and self._registry_was_removed:
+                self._registry_was_removed = False
+                reason = ManagedViolationReason.REGISTRY_REPLACED
+        if reason is not None:
+            self._report_violation(pending, reason)
 
     def _dispatch_snapshot(self, pending: _PendingPathEvent) -> None:
         if pending.change is FileChangeKind.DELETED:
@@ -474,7 +488,7 @@ class VaultWatcher:
         on_violation: ManagedViolationReporter,
         debounce_seconds: float = 0.25,
         reconcile_interval: float = 0.5,
-        record_roots: Sequence[str | Path] | None = None,
+        record_roots: str | Path | Sequence[str | Path] | None = None,
         clock: Callable[[], datetime] | None = None,
         observer: BaseObserver | None = None,
     ) -> None:
@@ -485,7 +499,12 @@ class VaultWatcher:
             raise ValueError("reconcile_interval must be positive")
         self.clock = clock or (lambda: datetime.now(UTC))
         self.reconcile_interval = reconcile_interval
-        roots = (Path("predictions"),) if record_roots is None else record_roots
+        if record_roots is None:
+            roots: Sequence[str | Path] = (Path("predictions"),)
+        elif isinstance(record_roots, (str, Path)):
+            roots = (record_roots,)
+        else:
+            roots = record_roots
         resolved_roots = tuple(
             (Path(root) if Path(root).is_absolute() else self.vault_root / root).resolve()
             for root in roots
@@ -498,13 +517,14 @@ class VaultWatcher:
             for root in resolved_roots
         ):
             raise ValueError("record_roots must live inside the vault and outside .ledger")
+        self.record_roots = resolved_roots
         self._handler = _VaultEventHandler(
             self.vault_root,
             on_record=on_record,
             on_violation=on_violation,
             debounce_seconds=debounce_seconds,
             clock=self.clock,
-            record_roots=resolved_roots,
+            record_roots=self.record_roots,
         )
         self._observer = observer or Observer()
         self._reconcile_stop = threading.Event()
