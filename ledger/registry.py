@@ -17,7 +17,7 @@ from ledger.json_utils import canonical_json, sha256_json
 
 logger = logging.getLogger(__name__)
 
-_MIGRATION_VERSION = 6
+_MIGRATION_VERSION = 7
 
 _MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -409,6 +409,47 @@ BEGIN
 END;
 """
 
+_MIGRATION_7 = """
+CREATE TABLE run_results (
+    run_id TEXT PRIMARY KEY,
+    evidence_hash TEXT NOT NULL UNIQUE,
+    evidence_json TEXT NOT NULL CHECK (json_valid(evidence_json)),
+    source_timestamp TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE RESTRICT
+);
+
+CREATE TRIGGER run_results_require_successful_bound_run
+BEFORE INSERT ON run_results
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM runs
+    JOIN run_bindings USING (run_id)
+    WHERE runs.run_id = NEW.run_id
+      AND runs.state = 'completed'
+      AND runs.exit_code = 0
+      AND runs.failure_note IS NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'result evidence requires a successful bound run');
+END;
+
+CREATE TRIGGER run_results_write_once_update
+BEFORE UPDATE ON run_results
+BEGIN
+    SELECT RAISE(ABORT, 'run result evidence is write-once');
+END;
+
+CREATE TRIGGER run_results_permanent_delete
+BEFORE DELETE ON run_results
+BEGIN
+    SELECT RAISE(ABORT, 'run result evidence is permanent');
+END;
+
+CREATE INDEX idx_run_results_source_timestamp
+    ON run_results(source_timestamp);
+"""
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
@@ -416,6 +457,7 @@ _MIGRATIONS = {
     4: _MIGRATION_4,
     5: _MIGRATION_5,
     6: _MIGRATION_6,
+    7: _MIGRATION_7,
 }
 
 
@@ -603,6 +645,25 @@ class LedgerRegistry:
                   AND external_run_imports.source_run_id = ?
                 """,
                 (source_system, source_run_id),
+            ).fetchone()
+        finally:
+            if owns_connection:
+                active.close()
+
+    def get_run_result(
+        self,
+        run_id: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> sqlite3.Row | None:
+        """Return immutable result evidence previously ingested for one run."""
+
+        owns_connection = connection is None
+        active = connection or self.connect()
+        try:
+            return active.execute(
+                "SELECT * FROM run_results WHERE run_id = ?",
+                (run_id,),
             ).fetchone()
         finally:
             if owns_connection:
@@ -805,6 +866,46 @@ class LedgerRegistry:
                 ingested_at.isoformat(),
             ),
         )
+
+    def create_run_result(
+        self,
+        *,
+        run_id: str,
+        evidence_hash: str,
+        evidence_json: str,
+        source_timestamp: datetime,
+        ingested_at: datetime,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Bind immutable result evidence to one successful terminal run."""
+
+        cursor = connection.execute(
+            """
+            INSERT INTO run_results (
+                run_id, evidence_hash, evidence_json, source_timestamp, ingested_at
+            )
+            SELECT ?, ?, ?, ?, ?
+            WHERE EXISTS (
+                SELECT 1
+                FROM runs
+                JOIN run_bindings USING (run_id)
+                WHERE runs.run_id = ?
+                  AND runs.state = 'completed'
+                  AND runs.exit_code = 0
+                  AND runs.failure_note IS NULL
+            )
+            """,
+            (
+                run_id,
+                evidence_hash,
+                evidence_json,
+                source_timestamp.isoformat(),
+                ingested_at.isoformat(),
+                run_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise IntegrityError(f"result evidence requires a successful bound run: {run_id}")
 
     def bind_preregistered_run(
         self,
