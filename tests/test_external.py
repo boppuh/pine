@@ -148,6 +148,14 @@ def test_direct_run_is_ingested_as_permanent_low_integrity(vault: Path) -> None:
         assert row["source_system"] == "msm"
         assert row["source_run_id"] == "msm-direct-20260717-01"
         assert row["evidence_hash"] == result.evidence_hash
+        touched = connection.execute("SELECT * FROM touched_windows").fetchone()
+        assert touched is not None
+        assert dict(touched) == {
+            "family_id": "vwap_mr_v3.1",
+            "window_start": "2026-04-22",
+            "window_end": "2026-04-22",
+            "touched_at": STARTED_AT.isoformat(),
+        }
     finally:
         connection.close()
 
@@ -169,6 +177,7 @@ def test_exact_external_evidence_retry_is_a_noop(vault: Path) -> None:
         assert connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM run_bindings").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM external_run_imports").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM touched_windows").fetchone()[0] == 1
     finally:
         connection.close()
 
@@ -187,6 +196,11 @@ def test_failed_direct_run_is_preserved_as_terminal_failed(vault: Path) -> None:
     row = service.registry.get_run(result.run_id)
     assert row is not None
     assert row["state"] == "failed"
+    assert service.registry.is_window_touched(
+        "vwap_mr_v3.1",
+        "2026-04-22",
+        "2026-04-22",
+    )
 
 
 def test_changed_evidence_for_same_source_run_fails_closed(vault: Path) -> None:
