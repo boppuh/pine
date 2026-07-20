@@ -7,6 +7,8 @@ __pycache__/
 htmlcov/
 dist/
 build/
+.env
+.env.*
 
 # Runtime ledger state is local and never version-controlled.
 .ledger/registry.db
