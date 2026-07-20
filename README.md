@@ -68,7 +68,8 @@ Both protected endpoints require `Authorization: Bearer <token>`. Capture reques
 still have no `registration_status` input, and extractor output cannot assign one; a
 ready draft is preregistered by construction. Stable error envelopes distinguish
 authentication, request validation, schema, fresh-window, idempotency, snapshot, and
-integrity failures. The Obsidian client remains a separate milestone.
+integrity failures. The Obsidian client described below consumes only these public
+loopback contracts.
 
 ### OpenAI hypothesis extraction
 
@@ -105,6 +106,34 @@ The normal test suite is fully offline. To run the opt-in live smoke:
 PINE_RUN_OPENAI_SMOKE=1 uv run pytest -m live_openai \
   tests/test_openai_extractor_live.py
 ```
+
+## Obsidian capture plugin
+
+The desktop-only plugin under `obsidian-plugin/` is a thin UI client. Its **Log strategy
+hypothesis** command reads the active Markdown note, discovers the running backend from
+`.ledger/backend.json`, reads the referenced local token, and requests a side-effect-free
+draft. A confirmation modal renders every forecast field for editing and displays the
+draft fresh-window advisory before it calls the atomic capture endpoint.
+
+The plugin hard-requires the backend descriptor to name `127.0.0.1`, API `v1`, and the
+fixed `.ledger/backend.token` reference. It never stores the token in plugin settings,
+writes ledger files, captures snapshots, or invokes MSM. One idempotency key is allocated
+when the modal opens; the first valid confirmation freezes the full request, and every
+retry reuses both that request and its key.
+
+Build and test the plugin:
+
+```bash
+cd obsidian-plugin
+npm ci
+npm run check
+```
+
+For a local manual installation, copy the generated `main.js`, `manifest.json`, and
+`styles.css` into `<vault>/.obsidian/plugins/decision-edge-ledger/`, reload Obsidian,
+and enable **Decision Edge Ledger** under Community plugins. The Python backend must be
+running for the same vault before invoking the command. Build output and dependencies
+are ignored; source, manifest, styles, and the lockfile are version-controlled.
 
 ## Structured capture
 
