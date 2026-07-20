@@ -354,7 +354,11 @@ class RunService:
         command = tuple(str(value) for value in envelope["command"]["argv"])
         working_directory = Path(str(envelope["command"]["working_directory"]))
         self._verify_command_checkout(envelope, working_directory)
-        self.registry.start_run(run_id, started_at=self._clock_time())
+        started_at = self._clock_time()
+        self.registry.start_run(
+            run_id,
+            started_at=started_at,
+        )
         environment = self._execution_environment(envelope, row["envelope_hash"])
         logger.info(
             "ledger_run_started",

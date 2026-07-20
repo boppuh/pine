@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from ledger.errors import IntegrityError
 from ledger.integrity import PredictionStatus
-from ledger.registry import _MIGRATION_1, _MIGRATION_2, _MIGRATION_3, LedgerRegistry
+from ledger.registry import (
+    _MIGRATION_1,
+    _MIGRATION_2,
+    _MIGRATION_3,
+    _MIGRATION_4,
+    _MIGRATION_5,
+    LedgerRegistry,
+)
 from ledger.writer import LedgerWriter
 
 
@@ -16,11 +25,11 @@ def test_registry_uses_wal_and_has_migration_stamp(vault: Path) -> None:
     connection = registry.connect()
     try:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-        assert [row[0] for row in versions] == [1, 2, 3, 4, 5]
+        assert [row[0] for row in versions] == [1, 2, 3, 4, 5, 6]
     finally:
         connection.close()
 
@@ -41,7 +50,7 @@ def test_existing_version_one_registry_migrates_forward(vault: Path) -> None:
     registry = LedgerRegistry(db_path)
     upgraded = registry.connect()
     try:
-        assert upgraded.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert upgraded.execute("PRAGMA user_version").fetchone()[0] == 6
         assert (
             upgraded.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'capture_requests'"
@@ -151,6 +160,98 @@ def test_version_three_migration_preserves_existing_run_binding(vault: Path) -> 
     assert row is not None
     assert row["registration_status"] == "exploratory"
     assert row["idempotency_key"] == "legacy-key"
+
+
+def test_version_six_backfills_started_preregistered_run_window(vault: Path) -> None:
+    db_path = vault / ".ledger" / "registry.db"
+    connection = sqlite3.connect(db_path)
+    envelope = json.dumps(
+        {
+            "snapshot": {
+                "out_of_sample_window": {
+                    "start": "2026-04-22",
+                    "end": "2026-04-22",
+                }
+            }
+        }
+    )
+    execution_started_at = "2026-07-17T19:30:11+00:00"
+    try:
+        for migration in (
+            _MIGRATION_1,
+            _MIGRATION_2,
+            _MIGRATION_3,
+            _MIGRATION_4,
+            _MIGRATION_5,
+        ):
+            connection.executescript(migration)
+        connection.execute(
+            """
+            INSERT INTO predictions (
+                prediction_id, run_id, schema_id, schema_hash, registration_status,
+                snapshot_ref, lineage_json, status, transaction_state, immutable_hash,
+                created_at, committed_at
+            ) VALUES (
+                'pred_started', 'run_started', 'finance/strategy-edge:1',
+                'sha256:schema', 'preregistered',
+                '.ledger/snapshots/pred_started.json', ?, 'open', 'committed',
+                'sha256:immutable', '2026-07-17T19:00:00+00:00',
+                '2026-07-17T19:00:01+00:00'
+            )
+            """,
+            (json.dumps({"family_id": "fam_started"}),),
+        )
+        connection.execute(
+            """
+            INSERT INTO runs (run_id, prediction_id, started_at, state)
+            VALUES ('run_started', 'pred_started', '2026-07-17T19:00:00+00:00',
+                    'registered')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO run_bindings (
+                run_id, idempotency_key, request_hash, registration_status,
+                strategy_id, dataset_version, envelope_json, envelope_hash, bound_at
+            ) VALUES (
+                'run_started', 'started-key', 'sha256:request', 'preregistered',
+                'vwap_mr_v3.1', 'sha256:dataset', ?, 'sha256:envelope',
+                '2026-07-17T19:00:00+00:00'
+            )
+            """,
+            (envelope,),
+        )
+        connection.execute(
+            """
+            UPDATE runs
+            SET state = 'running', execution_started_at = ?
+            WHERE run_id = 'run_started'
+            """,
+            (execution_started_at,),
+        )
+        connection.executemany(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?, '2026-01-01')",
+            [(1,), (2,), (3,), (4,), (5,)],
+        )
+        connection.execute("PRAGMA user_version = 5")
+        connection.commit()
+    finally:
+        connection.close()
+
+    registry = LedgerRegistry(db_path)
+    upgraded = registry.connect()
+    try:
+        row = upgraded.execute("SELECT * FROM touched_windows").fetchone()
+        assert row is not None
+        assert dict(row) == {
+            "family_id": "fam_started",
+            "window_start": "2026-04-22",
+            "window_end": "2026-04-22",
+            "touched_at": execution_started_at,
+        }
+        assert upgraded.execute("PRAGMA user_version").fetchone()[0] == 6
+    finally:
+        upgraded.close()
 
 
 def test_registry_rejects_updates_to_write_once_columns(vault: Path, draft) -> None:
@@ -319,3 +420,24 @@ def test_touched_window_overlap_is_inclusive(
 
     assert registry.window_overlaps_touched("fam_01", window_start, window_end) is expected
     assert registry.window_overlaps_touched("different-family", window_start, window_end) is False
+
+
+def test_touched_window_evidence_is_permanent(vault: Path) -> None:
+    registry = LedgerRegistry(vault / ".ledger" / "registry.db")
+    registry.mark_window_touched(
+        "  fam_01  ",
+        "2024-01-01",
+        "2025-01-01",
+        touched_at=datetime(2026, 7, 17, tzinfo=UTC),
+    )
+    assert registry.is_window_touched("fam_01", "2024-01-01", "2025-01-01")
+    assert registry.window_overlaps_touched("  fam_01  ", "2024-12-31", "2025-01-02")
+
+    connection = registry.connect()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="write-once"):
+            connection.execute("UPDATE touched_windows SET touched_at = '2027-01-01'")
+        with pytest.raises(sqlite3.IntegrityError, match="permanent"):
+            connection.execute("DELETE FROM touched_windows")
+    finally:
+        connection.close()

@@ -153,6 +153,11 @@ def test_exploratory_envelope_is_durable_before_executor_starts(vault: Path) -> 
         assert envelope["snapshot"]["dataset_version"] == environment["LEDGER_DATASET_VERSION"]
         assert environment["LEDGER_ENVELOPE_HASH"] == row["envelope_hash"]
         assert "LEDGER_PREDICTION_ID" not in environment
+        assert service.registry.is_window_touched(
+            "msm-strat-orb-001",
+            "2024-01-01",
+            "2025-12-31",
+        )
         observed.update(
             command=tuple(command),
             working_directory=working_directory,
@@ -175,6 +180,11 @@ def test_exploratory_envelope_is_durable_before_executor_starts(vault: Path) -> 
     assert observed["command"] == ("uv", "run", "msm", "orb")
     assert observed["working_directory"] == vault.resolve()
     assert len(source.calls) == 1
+    assert service.registry.window_overlaps_touched(
+        "msm-strat-orb-001",
+        "2025-01-01",
+        "2026-01-01",
+    )
 
 
 def test_exploratory_retry_does_not_recapture_or_reexecute(vault: Path) -> None:
@@ -196,12 +206,24 @@ def test_exploratory_retry_does_not_recapture_or_reexecute(vault: Path) -> None:
     request = _exploratory_request(vault)
 
     first = service.run_exploratory(request)
+    connection = service.registry.connect()
+    try:
+        touched_before = connection.execute("SELECT * FROM touched_windows").fetchall()
+    finally:
+        connection.close()
     second = service.run_exploratory(request)
+    connection = service.registry.connect()
+    try:
+        touched_after = connection.execute("SELECT * FROM touched_windows").fetchall()
+    finally:
+        connection.close()
 
     assert second.run_id == first.run_id
     assert second.executed is False
     assert calls == 1
     assert len(source.calls) == 1
+    assert [tuple(row) for row in touched_after] == [tuple(row) for row in touched_before]
+    assert len(touched_after) == 1
 
 
 def test_retry_reconciles_orphaned_running_run_without_reexecution(vault: Path) -> None:
@@ -222,7 +244,10 @@ def test_retry_reconciles_orphaned_running_run_without_reexecution(vault: Path) 
     )
     request = _exploratory_request(vault)
     prepared = service._prepare_exploratory(request)
-    service.registry.start_run(prepared.run_id, started_at=DECISION_AT)
+    service.registry.start_run(
+        prepared.run_id,
+        started_at=DECISION_AT,
+    )
 
     result = service.run_exploratory(request)
 
@@ -247,7 +272,10 @@ def test_retry_does_not_reconcile_running_run_while_owner_lock_is_live(vault: Pa
     )
     request = _exploratory_request(vault)
     prepared = service._prepare_exploratory(request)
-    service.registry.start_run(prepared.run_id, started_at=DECISION_AT)
+    service.registry.start_run(
+        prepared.run_id,
+        started_at=DECISION_AT,
+    )
 
     with run_execution_lock(service.writer.ledger_dir, prepared.run_id):
         with pytest.raises(RunStateError, match="currently executing"):
@@ -302,6 +330,57 @@ def test_snapshot_failure_creates_no_run_and_never_calls_executor(vault: Path) -
     finally:
         connection.close()
     assert executed is False
+    assert not service.registry.is_window_touched(
+        "msm-strat-orb-001",
+        "2024-01-01",
+        "2025-12-31",
+    )
+
+
+def test_run_start_rolls_back_if_window_touch_cannot_commit(vault: Path) -> None:
+    executed = False
+
+    def executor(*_args: Any) -> int:
+        nonlocal executed
+        executed = True
+        return 0
+
+    service = RunService(
+        vault,
+        FakeMSMSource(_snapshot()),
+        clock=lambda: DECISION_AT,
+        executor=executor,
+        git_state_reader=_clean_git,
+    )
+    prepared = service._prepare_exploratory(_exploratory_request(vault))
+    connection = service.registry.connect()
+    try:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_touched_window
+            BEFORE INSERT ON touched_windows
+            BEGIN
+                SELECT RAISE(ABORT, 'simulated touch failure');
+            END
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(sqlite3.IntegrityError, match="simulated touch failure"):
+        service._execute(prepared.run_id)
+
+    row = service.registry.get_run(prepared.run_id)
+    assert row is not None
+    assert row["state"] == RunState.REGISTERED.value
+    assert row["execution_started_at"] is None
+    assert executed is False
+    assert not service.registry.is_window_touched(
+        "msm-strat-orb-001",
+        "2024-01-01",
+        "2025-12-31",
+    )
 
 
 @pytest.mark.parametrize(
@@ -347,6 +426,11 @@ def test_command_checkout_must_match_snapshot_before_execution(
     finally:
         connection.close()
     assert executed is False
+    assert not service.registry.is_window_touched(
+        "msm-strat-orb-001",
+        "2024-01-01",
+        "2025-12-31",
+    )
 
 
 def test_nonzero_exit_is_permanent_failed_run(vault: Path) -> None:
@@ -364,6 +448,11 @@ def test_nonzero_exit_is_permanent_failed_run(vault: Path) -> None:
     assert result.state is RunState.FAILED
     assert result.exit_code == 17
     assert retry.executed is False
+    assert service.registry.is_window_touched(
+        "msm-strat-orb-001",
+        "2024-01-01",
+        "2025-12-31",
+    )
 
 
 def test_executor_exception_is_recorded_as_failed(vault: Path) -> None:
@@ -401,6 +490,11 @@ def test_executor_exception_is_recorded_as_failed(vault: Path) -> None:
         assert row["failure_note"] == "OSError: runner missing"
     finally:
         connection.close()
+    assert service.registry.is_window_touched(
+        "msm-strat-orb-001",
+        "2024-01-01",
+        "2025-12-31",
+    )
 
 
 def test_preregistered_run_uses_existing_prediction_and_snapshot(
@@ -429,6 +523,11 @@ def test_preregistered_run_uses_existing_prediction_and_snapshot(
         environment: Mapping[str, str],
     ) -> int:
         observed_environment.update(environment)
+        assert service.registry.is_window_touched(
+            "fam_strict_01",
+            "2024-01-01",
+            "2025-12-31",
+        )
         return 0
 
     service = RunService(
@@ -451,6 +550,11 @@ def test_preregistered_run_uses_existing_prediction_and_snapshot(
     assert result.prediction_id == prediction.prediction_id
     assert result.registration_status is RegistrationStatus.PREREGISTERED
     assert observed_environment["LEDGER_PREDICTION_ID"] == prediction.prediction_id
+    assert service.registry.window_overlaps_touched(
+        "fam_strict_01",
+        "2025-12-31",
+        "2026-01-01",
+    )
 
 
 def test_tampered_preregistered_snapshot_prevents_execution(
@@ -517,6 +621,10 @@ def test_run_binding_is_write_once_and_exploratory_cannot_be_promoted(vault: Pat
         "registration_status"
         not in inspect.signature(service.registry.create_exploratory_run).parameters
     )
+    start_parameters = inspect.signature(service.registry.start_run).parameters
+    assert "family_id" not in start_parameters
+    assert "window_start" not in start_parameters
+    assert "window_end" not in start_parameters
     assert not hasattr(service.registry, "bind_run")
 
     connection = service.registry.connect()

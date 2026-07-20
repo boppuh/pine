@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from collections.abc import Iterator, Mapping
@@ -12,11 +13,11 @@ from typing import Any
 
 from ledger.errors import IntegrityError
 from ledger.integrity import CommittedPrediction, PredictionStatus
-from ledger.json_utils import canonical_json
+from ledger.json_utils import canonical_json, sha256_json
 
 logger = logging.getLogger(__name__)
 
-_MIGRATION_VERSION = 5
+_MIGRATION_VERSION = 6
 
 _MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -338,12 +339,62 @@ BEGIN
 END;
 """
 
+_MIGRATION_6 = """
+INSERT OR IGNORE INTO touched_windows (
+    family_id, window_start, window_end, touched_at
+)
+SELECT
+    CASE
+        WHEN run_bindings.registration_status = 'preregistered'
+        THEN COALESCE(
+            NULLIF(TRIM(json_extract(predictions.lineage_json, '$.family_id')), ''),
+            TRIM(run_bindings.strategy_id)
+        )
+        ELSE TRIM(run_bindings.strategy_id)
+    END,
+    json_extract(
+        run_bindings.envelope_json,
+        '$.snapshot.out_of_sample_window.start'
+    ),
+    json_extract(
+        run_bindings.envelope_json,
+        '$.snapshot.out_of_sample_window.end'
+    ),
+    runs.execution_started_at
+FROM runs
+JOIN run_bindings USING (run_id)
+LEFT JOIN predictions USING (prediction_id)
+WHERE runs.execution_started_at IS NOT NULL
+  AND json_valid(run_bindings.envelope_json)
+  AND json_type(
+      run_bindings.envelope_json,
+      '$.snapshot.out_of_sample_window.start'
+  ) = 'text'
+  AND json_type(
+      run_bindings.envelope_json,
+      '$.snapshot.out_of_sample_window.end'
+  ) = 'text';
+
+CREATE TRIGGER touched_windows_write_once_update
+BEFORE UPDATE ON touched_windows
+BEGIN
+    SELECT RAISE(ABORT, 'touched window evidence is write-once');
+END;
+
+CREATE TRIGGER touched_windows_permanent_delete
+BEFORE DELETE ON touched_windows
+BEGIN
+    SELECT RAISE(ABORT, 'touched window evidence is permanent');
+END;
+"""
+
 _MIGRATIONS = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
     3: _MIGRATION_3,
     4: _MIGRATION_4,
     5: _MIGRATION_5,
+    6: _MIGRATION_6,
 }
 
 
@@ -695,6 +746,7 @@ class LedgerRegistry:
             bound_at=ingested_at,
             connection=connection,
         )
+        family, start, end = self._touch_identity_for_run(connection, run_id)
         connection.execute(
             """
             UPDATE runs
@@ -702,6 +754,13 @@ class LedgerRegistry:
             WHERE run_id = ? AND state = 'registered'
             """,
             (started_at.isoformat(), run_id),
+        )
+        self._insert_touched_window(
+            connection,
+            family_id=family,
+            window_start=start,
+            window_end=end,
+            touched_at=started_at,
         )
         connection.execute(
             """
@@ -809,10 +868,19 @@ class LedgerRegistry:
         if cursor.rowcount != 1:
             raise IntegrityError(f"cannot bind unknown or started run: {run_id}")
 
-    def start_run(self, run_id: str, *, started_at: datetime) -> None:
-        """Atomically claim a bound run immediately before handing control to MSM."""
+    def start_run(
+        self,
+        run_id: str,
+        *,
+        started_at: datetime,
+    ) -> None:
+        """Atomically claim a run and permanently touch its observed OOS window."""
+
+        if started_at.tzinfo is None or started_at.utcoffset() is None:
+            raise ValueError("started_at must be timezone-aware")
 
         with self.transaction() as connection:
+            family, start, end = self._touch_identity_for_run(connection, run_id)
             cursor = connection.execute(
                 """
                 UPDATE runs
@@ -826,6 +894,71 @@ class LedgerRegistry:
             )
             if cursor.rowcount != 1:
                 raise IntegrityError(f"run is not available to start: {run_id}")
+            self._insert_touched_window(
+                connection,
+                family_id=family,
+                window_start=start,
+                window_end=end,
+                touched_at=started_at,
+            )
+
+    @staticmethod
+    def _touch_identity_for_run(
+        connection: sqlite3.Connection,
+        run_id: str,
+    ) -> tuple[str, str, str]:
+        """Derive touched evidence from one immutable run binding."""
+
+        row = connection.execute(
+            """
+            SELECT runs.prediction_id, run_bindings.registration_status,
+                   run_bindings.strategy_id, run_bindings.envelope_json,
+                   run_bindings.envelope_hash, predictions.lineage_json,
+                   predictions.transaction_state
+            FROM runs
+            JOIN run_bindings USING (run_id)
+            LEFT JOIN predictions USING (prediction_id)
+            WHERE runs.run_id = ? AND runs.state = 'registered'
+            """,
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise IntegrityError(f"run has no registered immutable binding: {run_id}")
+
+        try:
+            envelope = json.loads(row["envelope_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise IntegrityError("run binding envelope is not valid JSON") from exc
+        if not isinstance(envelope, dict) or sha256_json(envelope) != row["envelope_hash"]:
+            raise IntegrityError("run binding envelope does not match its immutable hash")
+        if envelope.get("registration_status") != row["registration_status"]:
+            raise IntegrityError("run binding registration status does not match its envelope")
+        if envelope.get("strategy_id") != row["strategy_id"]:
+            raise IntegrityError("run binding strategy does not match its envelope")
+
+        snapshot = envelope.get("snapshot")
+        window = snapshot.get("out_of_sample_window") if isinstance(snapshot, dict) else None
+        if not isinstance(window, dict):
+            raise IntegrityError("run binding is missing its out-of-sample window")
+        try:
+            start, end = _normalize_window(window["start"], window["end"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise IntegrityError("run binding has an invalid out-of-sample window") from exc
+
+        family_id: object = row["strategy_id"]
+        if row["registration_status"] == "preregistered":
+            if row["prediction_id"] is None or row["transaction_state"] != "committed":
+                raise IntegrityError("preregistered run is missing its committed prediction")
+            try:
+                lineage = json.loads(row["lineage_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise IntegrityError("preregistered run lineage is not valid JSON") from exc
+            family_id = lineage.get("family_id") if isinstance(lineage, dict) else None
+        try:
+            family = _normalize_family_id(family_id)
+        except (TypeError, ValueError) as exc:
+            raise IntegrityError("run binding has an invalid strategy family") from exc
+        return family, start, end
 
     def finish_run(
         self,
@@ -906,17 +1039,37 @@ class LedgerRegistry:
     ) -> None:
         """Record an observed research window without overwriting its first touch."""
 
+        family = _normalize_family_id(family_id)
         start, end = _normalize_window(window_start, window_end)
         timestamp = touched_at or datetime.now(UTC)
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise ValueError("touched_at must be timezone-aware")
         with self.transaction() as connection:
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO touched_windows (
-                    family_id, window_start, window_end, touched_at
-                ) VALUES (?, ?, ?, ?)
-                """,
-                (family_id, start, end, timestamp.isoformat()),
+            self._insert_touched_window(
+                connection,
+                family_id=family,
+                window_start=start,
+                window_end=end,
+                touched_at=timestamp,
             )
+
+    @staticmethod
+    def _insert_touched_window(
+        connection: sqlite3.Connection,
+        *,
+        family_id: str,
+        window_start: str,
+        window_end: str,
+        touched_at: datetime,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO touched_windows (
+                family_id, window_start, window_end, touched_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (family_id, window_start, window_end, touched_at.isoformat()),
+        )
 
     def is_window_touched(
         self,
@@ -926,6 +1079,7 @@ class LedgerRegistry:
     ) -> bool:
         """Return whether a family has already observed the exact data window."""
 
+        family = _normalize_family_id(family_id)
         start, end = _normalize_window(window_start, window_end)
         connection = self.connect()
         try:
@@ -934,7 +1088,7 @@ class LedgerRegistry:
                 SELECT 1 FROM touched_windows
                 WHERE family_id = ? AND window_start = ? AND window_end = ?
                 """,
-                (family_id, start, end),
+                (family, start, end),
             ).fetchone()
             return row is not None
         finally:
@@ -950,6 +1104,7 @@ class LedgerRegistry:
     ) -> sqlite3.Row | None:
         """Return the first inclusive overlap for a strategy family's data window."""
 
+        family = _normalize_family_id(family_id)
         start, end = _normalize_window(window_start, window_end)
         owns_connection = connection is None
         active = connection or self.connect()
@@ -964,7 +1119,7 @@ class LedgerRegistry:
                 ORDER BY touched_at, window_start, window_end
                 LIMIT 1
                 """,
-                (family_id, end, start),
+                (family, end, start),
             ).fetchone()
         finally:
             if owns_connection:
@@ -1119,6 +1274,15 @@ class LedgerRegistry:
 
 def _optional_json(value: Mapping[str, Any] | None) -> str | None:
     return None if value is None else canonical_json(dict(value))
+
+
+def _normalize_family_id(family_id: object) -> str:
+    if not isinstance(family_id, str):
+        raise TypeError("family_id must be a string")
+    normalized = family_id.strip()
+    if not normalized or len(normalized) > 256 or "\x00" in normalized:
+        raise ValueError("family_id must be 1 to 256 non-NUL characters")
+    return normalized
 
 
 def _normalize_window(window_start: date | str, window_end: date | str) -> tuple[str, str]:

@@ -216,9 +216,14 @@ and every retry return the same failed JSON result and exit code. The child rece
 `LEDGER_ENVELOPE_HASH`.
 Preregistered children also receive `LEDGER_PREDICTION_ID`. Immediately before process
 start, the wrapper verifies that `--working-directory` is a clean Git checkout at the
-exact commit frozen in the snapshot. A per-run process lock distinguishes a live
-execution from a wrapper that disappeared mid-run; the next retry permanently marks an
-orphaned `running` entry as failed and never launches a duplicate process.
+exact commit frozen in the snapshot. The transition to `running` atomically records
+the frozen out-of-sample window as permanently touched before the child receives
+control. Preregistered runs use the prediction's lineage family; exploratory runs use
+the strategy ID. The evidence remains touched even when launch or execution fails,
+and registry migration backfills previously started runs. A per-run process lock
+distinguishes a live execution from a wrapper that disappeared mid-run; the next retry
+permanently marks an orphaned `running` entry as failed and never launches a duplicate
+process.
 
 ## External-run audit recovery
 
@@ -244,9 +249,10 @@ already-terminal run binding with permanent registration status
 evidence embedded in its hashed envelope. An exact retry of the same
 `(source_system, source_run_id)` is a no-op (`created: false`); changed evidence for that
 identity fails closed. Registry triggers prohibit rewriting or deleting the evidence
-and status, and there is no promotion API. Because the evidence is retrospective, its
-content hashes are preserved as claims rather than treated as preregistration-grade
-attestation.
+and status, and there is no promotion API. The imported snapshot's out-of-sample
+window is permanently marked touched under its strategy ID in the same transaction.
+Because the evidence is retrospective, its content hashes are preserved as claims
+rather than treated as preregistration-grade attestation.
 
 ## Vault observation
 
