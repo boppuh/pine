@@ -1,0 +1,39 @@
+.decision-edge-modal {
+  min-width: min(46rem, 90vw);
+}
+
+.decision-edge-modal h3 {
+  margin-top: var(--size-4-5);
+}
+
+.decision-edge-modal .decision-edge-summary {
+  color: var(--text-muted);
+  margin-bottom: var(--size-4-4);
+}
+
+.decision-edge-modal .decision-edge-warning {
+  background: var(--background-modifier-error);
+  border: 1px solid var(--color-orange);
+  border-radius: var(--radius-s);
+  color: var(--text-normal);
+  margin-bottom: var(--size-4-4);
+  padding: var(--size-4-3);
+}
+
+.decision-edge-modal .decision-edge-error {
+  color: var(--text-error);
+  margin-top: var(--size-4-3);
+  white-space: pre-wrap;
+}
+
+.decision-edge-modal .decision-edge-actions {
+  border-top: 1px solid var(--background-modifier-border);
+  margin-top: var(--size-4-5);
+  padding-top: var(--size-4-3);
+}
+
+.decision-edge-modal input[type="number"],
+.decision-edge-modal input[type="date"],
+.decision-edge-modal textarea {
+  width: 100%;
+}

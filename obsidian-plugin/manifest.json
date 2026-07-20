@@ -1,0 +1,9 @@
+{
+  "id": "decision-edge-ledger",
+  "name": "Decision Edge Ledger",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Propose and confirm auditable strategy hypotheses through the local Decision Edge backend.",
+  "author": "Ryan Mathews",
+  "isDesktopOnly": true
+}
