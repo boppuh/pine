@@ -19,6 +19,12 @@ from ledger.external import (
     ExternalRunIngestRequest,
 )
 from ledger.msm import SnapshotDateWindow
+from ledger.results import (
+    MSMResultIngestor,
+    MSMResultIngestRequest,
+    MSMResultIngestResult,
+    MSMRunResultEvidence,
+)
 from ledger.run import (
     ExploratoryRunRequest,
     PreregisteredRunRequest,
@@ -90,6 +96,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="JSON evidence document for one completed direct MSM run",
     )
+    ingest_result = subparsers.add_parser(
+        "ingest-result",
+        help="attach immutable canonical result evidence to a successful bound MSM run",
+    )
+    ingest_result.add_argument(
+        "--vault-root",
+        "--vault",
+        dest="vault_root",
+        type=Path,
+        default=Path.cwd(),
+        help="vault containing .ledger/ (default: current directory)",
+    )
+    ingest_result.add_argument(
+        "--evidence",
+        required=True,
+        type=Path,
+        help="canonical JSON result evidence for one successful bound run",
+    )
     return parser
 
 
@@ -100,6 +124,8 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     if arguments.subcommand == "ingest-external":
         return _ingest_external_cli(arguments.vault_root, arguments.evidence)
+    if arguments.subcommand == "ingest-result":
+        return _ingest_result_cli(arguments.vault_root, arguments.evidence)
     if arguments.subcommand != "run":  # pragma: no cover - argparse enforces this
         parser.error("a subcommand is required")
 
@@ -224,5 +250,36 @@ def _external_result_payload(result: ExternalRunImportResult) -> dict[str, Any]:
         "state": result.state.value,
         "exit_code": result.exit_code,
         "failure_note": result.failure_note,
+        "created": result.created,
+    }
+
+
+def _ingest_result_cli(vault_root: Path, evidence_path: Path) -> int:
+    try:
+        raw = json.loads(evidence_path.read_text(encoding="utf-8"))
+        evidence = MSMRunResultEvidence.model_validate(raw)
+        result = MSMResultIngestor(vault_root).ingest(MSMResultIngestRequest(evidence=evidence))
+    except LedgerError as exc:
+        print(f"msm-ledger: {exc}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as exc:
+        print(f"msm-ledger: invalid result evidence: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(_ingested_result_payload(result), sort_keys=True))
+    return 0
+
+
+def _ingested_result_payload(result: MSMResultIngestResult) -> dict[str, Any]:
+    return {
+        "run_id": result.run_id,
+        "prediction_id": result.prediction_id,
+        "registration_status": result.registration_status.value,
+        "strategy_id": result.strategy_id,
+        "dataset_version": result.dataset_version,
+        "envelope_hash": result.envelope_hash,
+        "evidence_hash": result.evidence_hash,
+        "source_timestamp": result.source_timestamp.isoformat(),
+        "ingested_at": result.ingested_at.isoformat(),
         "created": result.created,
     }

@@ -49,6 +49,15 @@ from ledger.record_integrity import (
     RecordIntegrityChecker,
 )
 from ledger.registry import LedgerRegistry
+from ledger.results import (
+    MSMRegimeResult,
+    MSMResultArtifactEvidence,
+    MSMResultIngestor,
+    MSMResultIngestRequest,
+    MSMResultIngestResult,
+    MSMResultMetrics,
+    MSMRunResultEvidence,
+)
 from ledger.run import (
     ExploratoryRunRequest,
     PreregisteredRunRequest,
@@ -105,6 +114,13 @@ __all__ = [
     "LedgerWriter",
     "MSMSnapshotProvider",
     "MSMSnapshotSource",
+    "MSMRegimeResult",
+    "MSMResultArtifactEvidence",
+    "MSMResultIngestRequest",
+    "MSMResultIngestResult",
+    "MSMResultIngestor",
+    "MSMResultMetrics",
+    "MSMRunResultEvidence",
     "ManagedPathViolation",
     "ManagedViolationReason",
     "ManagedViolationReporter",

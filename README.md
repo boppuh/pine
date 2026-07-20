@@ -12,7 +12,9 @@ contracts. Its first production frontier-model adapter uses OpenAI structured ou
 while MSM state enters through the local `SnapshotProvider` protocol;
 `MSMSnapshotProvider` is the strict adapter for MSM's point-in-time ClickHouse snapshot
 source. The `msm-ledger run` wrapper is the local execution boundary: it persists an
-immutable pre-run envelope before it hands control to an MSM process.
+immutable pre-run envelope before it hands control to an MSM process. Successful runs
+can then receive one permanent, versioned MSM result-evidence document without
+resolving or grading a prediction.
 
 ## Development
 
@@ -224,6 +226,39 @@ and registry migration backfills previously started runs. A per-run process lock
 distinguishes a live execution from a wrapper that disappeared mid-run; the next retry
 permanently marks an orphaned `running` entry as failed and never launches a duplicate
 process.
+
+## MSM result evidence
+
+After a bound run completes successfully, attach its canonical result document with:
+
+```bash
+msm-ledger ingest-result \
+  --vault-root /path/to/pine-vault \
+  --evidence /path/to/msm-result.json
+```
+
+`MSMRunResultEvidence` version 1 requires the run and envelope identities,
+registration status, strategy, dataset version, MSM Git commit, metric-definition
+version, source timestamp, and the exact IS/OOS windows frozen before execution. It
+contains separate `in_sample_metrics` and `out_of_sample_metrics` blocks; a single
+`full_period` row is deliberately insufficient because the ledger will not infer which
+sample produced a metric. Each block contains Sharpe, win rate, maximum drawdown,
+expectancy, total return, and trade count. `metric_units` must be
+`finance/strategy-edge:decimal-v1`: Sharpe is unitless, while rates, returns,
+drawdown magnitude, and expectancy are decimal values (`0.12`, not `12` or 1200 bps).
+
+The document also carries a non-empty, path-sorted artifact manifest with byte sizes
+and `sha256:...` content identities. Optional regime metrics must identify their IS/OOS
+sample and be sorted by `(sample, regime_id)`. The ingestor re-hashes and validates the
+original durable envelope and `StrategySnapshot`, then checks every copied provenance
+field before inserting `run_results`. Only a bound run with state `completed`, exit code
+zero, and no failure note is eligible.
+
+There is exactly one result document per `run_id`. An exact retry returns
+`created: false`; changed evidence fails closed. SQLite triggers prohibit update and
+deletion. Result ingestion records evidence only—it does not change prediction
+`status`, `outcome`, `grade`, or resolution metadata. Those decisions remain a later,
+explicit grading and resolution step.
 
 ## External-run audit recovery
 

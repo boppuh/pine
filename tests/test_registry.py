@@ -15,6 +15,7 @@ from ledger.registry import (
     _MIGRATION_3,
     _MIGRATION_4,
     _MIGRATION_5,
+    _MIGRATION_6,
     LedgerRegistry,
 )
 from ledger.writer import LedgerWriter
@@ -25,11 +26,11 @@ def test_registry_uses_wal_and_has_migration_stamp(vault: Path) -> None:
     connection = registry.connect()
     try:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-        assert [row[0] for row in versions] == [1, 2, 3, 4, 5, 6]
+        assert [row[0] for row in versions] == [1, 2, 3, 4, 5, 6, 7]
     finally:
         connection.close()
 
@@ -50,7 +51,7 @@ def test_existing_version_one_registry_migrates_forward(vault: Path) -> None:
     registry = LedgerRegistry(db_path)
     upgraded = registry.connect()
     try:
-        assert upgraded.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert upgraded.execute("PRAGMA user_version").fetchone()[0] == 7
         assert (
             upgraded.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'capture_requests'"
@@ -69,6 +70,12 @@ def test_existing_version_one_registry_migrates_forward(vault: Path) -> None:
                 SELECT name FROM sqlite_master
                 WHERE type = 'table' AND name = 'external_run_imports'
                 """
+            ).fetchone()
+            is not None
+        )
+        assert (
+            upgraded.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_results'"
             ).fetchone()
             is not None
         )
@@ -261,7 +268,7 @@ def test_version_six_backfills_started_preregistered_run_window(vault: Path) -> 
             "window_end": "2026-04-22",
             "touched_at": execution_started_at,
         }
-        assert upgraded.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert upgraded.execute("PRAGMA user_version").fetchone()[0] == 7
     finally:
         upgraded.close()
 
@@ -285,6 +292,50 @@ def test_version_six_rejects_started_preregistered_run_without_family(
         assert [row[0] for row in versions] == [1, 2, 3, 4, 5]
     finally:
         connection.close()
+
+
+def test_version_seven_adds_permanent_run_result_evidence(vault: Path) -> None:
+    db_path = vault / ".ledger" / "registry.db"
+    connection = sqlite3.connect(db_path)
+    try:
+        for migration in (
+            _MIGRATION_1,
+            _MIGRATION_2,
+            _MIGRATION_3,
+            _MIGRATION_4,
+            _MIGRATION_5,
+            _MIGRATION_6,
+        ):
+            connection.executescript(migration)
+        connection.executemany(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?, '2026-01-01')",
+            [(1,), (2,), (3,), (4,), (5,), (6,)],
+        )
+        connection.execute("PRAGMA user_version = 6")
+        connection.commit()
+    finally:
+        connection.close()
+
+    registry = LedgerRegistry(db_path)
+    upgraded = registry.connect()
+    try:
+        assert upgraded.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert (
+            upgraded.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_results'"
+            ).fetchone()
+            is not None
+        )
+        triggers = upgraded.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'run_results_%'"
+        ).fetchall()
+        assert {row[0] for row in triggers} == {
+            "run_results_permanent_delete",
+            "run_results_require_successful_bound_run",
+            "run_results_write_once_update",
+        }
+    finally:
+        upgraded.close()
 
 
 def test_registry_rejects_updates_to_write_once_columns(vault: Path, draft) -> None:
