@@ -162,8 +162,11 @@ def test_version_three_migration_preserves_existing_run_binding(vault: Path) -> 
     assert row["idempotency_key"] == "legacy-key"
 
 
-def test_version_six_backfills_started_preregistered_run_window(vault: Path) -> None:
-    db_path = vault / ".ledger" / "registry.db"
+def _create_version_five_started_preregistered_registry(
+    db_path: Path,
+    *,
+    lineage: dict[str, object],
+) -> str:
     connection = sqlite3.connect(db_path)
     envelope = json.dumps(
         {
@@ -199,7 +202,7 @@ def test_version_six_backfills_started_preregistered_run_window(vault: Path) -> 
                 '2026-07-17T19:00:01+00:00'
             )
             """,
-            (json.dumps({"family_id": "fam_started"}),),
+            (json.dumps(lineage),),
         )
         connection.execute(
             """
@@ -237,6 +240,15 @@ def test_version_six_backfills_started_preregistered_run_window(vault: Path) -> 
         connection.commit()
     finally:
         connection.close()
+    return execution_started_at
+
+
+def test_version_six_backfills_started_preregistered_run_window(vault: Path) -> None:
+    db_path = vault / ".ledger" / "registry.db"
+    execution_started_at = _create_version_five_started_preregistered_registry(
+        db_path,
+        lineage={"family_id": "fam_started"},
+    )
 
     registry = LedgerRegistry(db_path)
     upgraded = registry.connect()
@@ -252,6 +264,27 @@ def test_version_six_backfills_started_preregistered_run_window(vault: Path) -> 
         assert upgraded.execute("PRAGMA user_version").fetchone()[0] == 6
     finally:
         upgraded.close()
+
+
+def test_version_six_rejects_started_preregistered_run_without_family(
+    vault: Path,
+) -> None:
+    db_path = vault / ".ledger" / "registry.db"
+    _create_version_five_started_preregistered_registry(db_path, lineage={})
+
+    with pytest.raises(sqlite3.IntegrityError, match="migration_6_preregistered_guard"):
+        LedgerRegistry(db_path)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("SELECT COUNT(*) FROM touched_windows").fetchone()[0] == 0
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        assert [row[0] for row in versions] == [1, 2, 3, 4, 5]
+    finally:
+        connection.close()
 
 
 def test_registry_rejects_updates_to_write_once_columns(vault: Path, draft) -> None:

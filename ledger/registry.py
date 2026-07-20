@@ -340,16 +340,37 @@ END;
 """
 
 _MIGRATION_6 = """
+CREATE TEMP TABLE migration_6_preregistered_guard (
+    transaction_state TEXT NOT NULL CHECK (transaction_state = 'committed'),
+    family_type TEXT NOT NULL CHECK (family_type = 'text'),
+    family_id TEXT NOT NULL CHECK (
+        LENGTH(TRIM(family_id)) BETWEEN 1 AND 256
+        AND INSTR(family_id, CHAR(0)) = 0
+    )
+);
+
+INSERT INTO migration_6_preregistered_guard (
+    transaction_state, family_type, family_id
+)
+SELECT
+    predictions.transaction_state,
+    json_type(predictions.lineage_json, '$.family_id'),
+    json_extract(predictions.lineage_json, '$.family_id')
+FROM runs
+JOIN run_bindings USING (run_id)
+LEFT JOIN predictions USING (prediction_id)
+WHERE runs.execution_started_at IS NOT NULL
+  AND run_bindings.registration_status = 'preregistered';
+
+DROP TABLE migration_6_preregistered_guard;
+
 INSERT OR IGNORE INTO touched_windows (
     family_id, window_start, window_end, touched_at
 )
 SELECT
     CASE
         WHEN run_bindings.registration_status = 'preregistered'
-        THEN COALESCE(
-            NULLIF(TRIM(json_extract(predictions.lineage_json, '$.family_id')), ''),
-            TRIM(run_bindings.strategy_id)
-        )
+        THEN TRIM(json_extract(predictions.lineage_json, '$.family_id'))
         ELSE TRIM(run_bindings.strategy_id)
     END,
     json_extract(
