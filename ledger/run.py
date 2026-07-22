@@ -74,12 +74,20 @@ class _RunRequest(BaseModel):
     idempotency_key: str = Field(min_length=1, max_length=256)
     command: tuple[str, ...] = Field(min_length=1)
     working_directory: Path | None = None
+    result_evidence_path: Path | None = None
 
     @field_validator("command")
     @classmethod
     def command_is_safe_argv(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if any(not argument or "\x00" in argument for argument in value):
             raise ValueError("command arguments must be non-empty and contain no NUL bytes")
+        return value
+
+    @field_validator("result_evidence_path")
+    @classmethod
+    def result_evidence_path_is_absolute(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
+            raise ValueError("result evidence path must be absolute")
         return value
 
 
@@ -155,14 +163,15 @@ class RunService:
 
     def _prepare_preregistered(self, request: PreregisteredRunRequest) -> _PreparedRun:
         working_directory = _working_directory(request.working_directory)
-        request_hash = sha256_json(
-            {
-                "mode": RegistrationStatus.PREREGISTERED.value,
-                "prediction_id": request.prediction_id,
-                "command": list(request.command),
-                "working_directory": str(working_directory),
-            }
-        )
+        request_identity = {
+            "mode": RegistrationStatus.PREREGISTERED.value,
+            "prediction_id": request.prediction_id,
+            "command": list(request.command),
+            "working_directory": str(working_directory),
+        }
+        if request.result_evidence_path is not None:
+            request_identity["result_evidence_path"] = str(request.result_evidence_path)
+        request_hash = sha256_json(request_identity)
         with ledger_lock(self.writer.ledger_dir, timeout=self.writer.lock_timeout):
             connection = self.registry.connect()
             try:
@@ -207,6 +216,7 @@ class RunService:
                     strategy_id=forecast.strategy_id,
                     command=request.command,
                     working_directory=working_directory,
+                    result_evidence_path=request.result_evidence_path,
                     snapshot=snapshot,
                     bound_at=bound_at,
                     prediction_immutable_hash=prediction["immutable_hash"],
@@ -243,16 +253,17 @@ class RunService:
 
     def _prepare_exploratory(self, request: ExploratoryRunRequest) -> _PreparedRun:
         working_directory = _working_directory(request.working_directory)
-        request_hash = sha256_json(
-            {
-                "mode": RegistrationStatus.EXPLORATORY.value,
-                "strategy_id": request.strategy_id,
-                "in_sample_window": request.in_sample_window.model_dump(mode="json"),
-                "out_of_sample_window": request.out_of_sample_window.model_dump(mode="json"),
-                "command": list(request.command),
-                "working_directory": str(working_directory),
-            }
-        )
+        request_identity = {
+            "mode": RegistrationStatus.EXPLORATORY.value,
+            "strategy_id": request.strategy_id,
+            "in_sample_window": request.in_sample_window.model_dump(mode="json"),
+            "out_of_sample_window": request.out_of_sample_window.model_dump(mode="json"),
+            "command": list(request.command),
+            "working_directory": str(working_directory),
+        }
+        if request.result_evidence_path is not None:
+            request_identity["result_evidence_path"] = str(request.result_evidence_path)
+        request_hash = sha256_json(request_identity)
         with ledger_lock(self.writer.ledger_dir, timeout=self.writer.lock_timeout):
             connection = self.registry.connect()
             try:
@@ -276,6 +287,7 @@ class RunService:
                     strategy_id=request.strategy_id,
                     command=request.command,
                     working_directory=working_directory,
+                    result_evidence_path=request.result_evidence_path,
                     snapshot=snapshot,
                     bound_at=bound_at,
                     prediction_immutable_hash=None,
@@ -597,6 +609,11 @@ class RunService:
             environment["LEDGER_PREDICTION_ID"] = str(prediction_id)
         else:
             environment.pop("LEDGER_PREDICTION_ID", None)
+        result_evidence_path = envelope["command"].get("result_evidence_path")
+        if result_evidence_path is not None:
+            environment["LEDGER_RESULT_EVIDENCE_PATH"] = str(result_evidence_path)
+        else:
+            environment.pop("LEDGER_RESULT_EVIDENCE_PATH", None)
         return environment
 
 
@@ -615,10 +632,17 @@ def _envelope(
     strategy_id: str,
     command: Sequence[str],
     working_directory: Path,
+    result_evidence_path: Path | None,
     snapshot: StrategySnapshot,
     bound_at: datetime,
     prediction_immutable_hash: str | None,
 ) -> dict[str, Any]:
+    command_payload = {
+        "argv": list(command),
+        "working_directory": str(working_directory),
+    }
+    if result_evidence_path is not None:
+        command_payload["result_evidence_path"] = str(result_evidence_path)
     return {
         "envelope_format_version": 1,
         "run_id": run_id,
@@ -627,10 +651,7 @@ def _envelope(
         "strategy_id": strategy_id,
         "bound_at": bound_at.isoformat(),
         "prediction_immutable_hash": prediction_immutable_hash,
-        "command": {
-            "argv": list(command),
-            "working_directory": str(working_directory),
-        },
+        "command": command_payload,
         "snapshot": snapshot.model_dump(mode="json"),
     }
 
