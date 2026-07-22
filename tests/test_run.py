@@ -123,6 +123,7 @@ def _exploratory_request(
     *,
     idempotency_key: str = "explore-01",
     command: tuple[str, ...] = ("uv", "run", "msm", "orb"),
+    result_evidence_path: Path | None = None,
 ) -> ExploratoryRunRequest:
     return ExploratoryRunRequest(
         idempotency_key=idempotency_key,
@@ -131,6 +132,7 @@ def _exploratory_request(
         out_of_sample_window=SnapshotDateWindow(start="2024-01-01", end="2025-12-31"),
         command=command,
         working_directory=vault,
+        result_evidence_path=result_evidence_path,
     )
 
 
@@ -185,6 +187,79 @@ def test_exploratory_envelope_is_durable_before_executor_starts(vault: Path) -> 
         "2025-01-01",
         "2026-01-01",
     )
+
+
+def test_result_evidence_path_is_immutable_and_injected_into_child(
+    vault: Path,
+) -> None:
+    evidence_path = (vault / "outputs/result.json").resolve()
+    observed: dict[str, Any] = {}
+
+    def executor(
+        command: Sequence[str],
+        working_directory: Path,
+        environment: Mapping[str, str],
+    ) -> int:
+        del command, working_directory
+        observed.update(environment)
+        return 0
+
+    def git_state_reader(working_directory: Path) -> tuple[str, bool]:
+        return _clean_git(working_directory)
+
+    service = RunService(
+        vault,
+        FakeMSMSource(_snapshot()),
+        clock=lambda: DECISION_AT,
+        executor=executor,
+        git_state_reader=git_state_reader,
+    )
+    request = _exploratory_request(vault, result_evidence_path=evidence_path)
+
+    result = service.run_exploratory(request)
+
+    assert observed["LEDGER_RESULT_EVIDENCE_PATH"] == str(evidence_path)
+    row = service.registry.get_run(result.run_id)
+    assert row is not None
+    envelope = json.loads(row["envelope_json"])
+    assert envelope["command"]["result_evidence_path"] == str(evidence_path)
+
+    with pytest.raises(IdempotencyConflictError, match="different run request"):
+        service.run_exploratory(
+            _exploratory_request(
+                vault,
+                result_evidence_path=(vault / "outputs/changed.json").resolve(),
+            )
+        )
+
+
+def test_ambient_result_evidence_path_is_not_forwarded(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LEDGER_RESULT_EVIDENCE_PATH", "/tmp/ambient-result.json")
+
+    def executor(
+        command: Sequence[str],
+        working_directory: Path,
+        environment: Mapping[str, str],
+    ) -> int:
+        del command, working_directory
+        assert "LEDGER_RESULT_EVIDENCE_PATH" not in environment
+        return 0
+
+    def git_state_reader(working_directory: Path) -> tuple[str, bool]:
+        return _clean_git(working_directory)
+
+    service = RunService(
+        vault,
+        FakeMSMSource(_snapshot()),
+        clock=lambda: DECISION_AT,
+        executor=executor,
+        git_state_reader=git_state_reader,
+    )
+
+    service.run_exploratory(_exploratory_request(vault))
 
 
 def test_exploratory_retry_does_not_recapture_or_reexecute(vault: Path) -> None:

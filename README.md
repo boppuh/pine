@@ -174,9 +174,21 @@ published.
 
 ## MSM run wrapper
 
-Install Pine and MSM in the same Python environment, then invoke the MSM command after
-`--`. Arguments are passed as an argv vector with `shell=False`; they are never parsed
-as a shell command.
+Install Pine and MSM into one environment outside both checkouts. This avoids relying
+on `PYTHONPATH` or whichever repository-local virtual environment happens to be active:
+
+```bash
+MSM_PINE_RUNTIME=/path/to/msm-pine-runtime
+uv venv "$MSM_PINE_RUNTIME" --python 3.11
+uv pip install --python "$MSM_PINE_RUNTIME/bin/python" \
+  -e /path/to/pine -e /path/to/msm
+"$MSM_PINE_RUNTIME/bin/msm-ledger-result" runtime-check
+```
+
+The check prints `ready: true`, the shared interpreter, both imported module paths,
+and integration/result-format versions. Invoke the MSM command after `--`. Arguments
+are passed as an argv vector with `shell=False`; they are never parsed as a shell
+command.
 
 An exploratory run requires the strategy and both research windows. The wrapper asks
 MSM for a strict point-in-time snapshot and commits a permanent `exploratory` envelope
@@ -215,21 +227,56 @@ retry is a no-op and returns the stored process exit code; changing the command 
 an existing key fails closed. If the executor cannot launch the command, the first call
 and every retry return the same failed JSON result and exit code. The child receives
 `LEDGER_RUN_ID`, `LEDGER_REGISTRATION_STATUS`, `LEDGER_DATASET_VERSION`, and
-`LEDGER_ENVELOPE_HASH`.
-Preregistered children also receive `LEDGER_PREDICTION_ID`. Immediately before process
-start, the wrapper verifies that `--working-directory` is a clean Git checkout at the
-exact commit frozen in the snapshot. The transition to `running` atomically records
-the frozen out-of-sample window as permanently touched before the child receives
-control. Preregistered runs use the prediction's lineage family; exploratory runs use
-the strategy ID. The evidence remains touched even when launch or execution fails,
-and registry migration backfills previously started runs. A per-run process lock
-distinguishes a live execution from a wrapper that disappeared mid-run; the next retry
-permanently marks an orphaned `running` entry as failed and never launches a duplicate
-process.
+`LEDGER_ENVELOPE_HASH`. Preregistered children also receive `LEDGER_PREDICTION_ID`.
+When `--result-evidence` is present, Pine resolves it against `--working-directory`,
+records the absolute path in the immutable request, and exposes it as
+`LEDGER_RESULT_EVIDENCE_PATH`. Immediately before process start, the wrapper verifies
+that `--working-directory` is a clean Git checkout at the exact commit frozen in the
+snapshot. The transition to `running` atomically records the frozen out-of-sample
+window as permanently touched before the child receives control. Preregistered runs
+use the prediction's lineage family; exploratory runs use the strategy ID. The
+evidence remains touched even when launch or execution fails, and registry migration
+backfills previously started runs. A per-run process lock distinguishes a live
+execution from a wrapper that disappeared mid-run; the next retry permanently marks
+an orphaned `running` entry as failed and never launches a duplicate process.
 
 ## MSM result evidence
 
-After a bound run completes successfully, attach its canonical result document with:
+MSM can emit and Pine can ingest canonical result evidence in the same wrapper
+invocation. The result emitter defaults `--evidence-output` from the path Pine injects,
+so the path is specified only once:
+
+```bash
+MSM_PINE_RUNTIME=/path/to/msm-pine-runtime
+"$MSM_PINE_RUNTIME/bin/msm-ledger" run \
+  --vault-root /path/to/pine-vault \
+  --idempotency-key vwap-result-20260422 \
+  --strategy-id vwap_mr_v3.1 \
+  --in-sample-start 2026-04-01 \
+  --in-sample-end 2026-04-21 \
+  --out-of-sample-start 2026-04-22 \
+  --out-of-sample-end 2026-04-22 \
+  --working-directory /path/to/msm \
+  --result-evidence out/ledger/vwap-result-20260422.json \
+  -- "$MSM_PINE_RUNTIME/bin/msm-ledger-result" run \
+       --strategy-id vwap_mr_v3.1 \
+       --in-sample-start 2026-04-01 \
+       --in-sample-end 2026-04-21 \
+       --out-of-sample-start 2026-04-22 \
+       --out-of-sample-end 2026-04-22 \
+       --metric-definition-version msm.strategy-edge-metrics:v1 \
+       --msm-output-root out/ledger/vwap-result-20260422 \
+       --runner scripts/frozen/frozen_vwap_mr_v3_1.py
+```
+
+On success, the wrapper JSON includes `result_ingestion`; `created` is `true` on the
+first ingestion and `false` on an exact retry. A failed MSM child is never ingested. If
+the child succeeds but evidence validation or ingestion fails, the run stays completed
+and the wrapper returns 2. Repeating the exact command and idempotency key does not
+rerun MSM; it retries ingestion from the already emitted document.
+
+For recovery of a result produced by an older wrapper invocation, attach the canonical
+document separately with:
 
 ```bash
 msm-ledger ingest-result \

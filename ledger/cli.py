@@ -30,7 +30,10 @@ from ledger.run import (
     PreregisteredRunRequest,
     RunResult,
     RunService,
+    RunState,
 )
+
+MSM_RESULT_INTEGRATION_VERSION = 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -72,6 +75,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--working-directory",
         type=Path,
         help="directory in which MSM is invoked (default: current directory)",
+    )
+    run.add_argument(
+        "--result-evidence",
+        type=Path,
+        help=(
+            "path the child will receive as LEDGER_RESULT_EVIDENCE_PATH; "
+            "ingest it automatically after a successful run"
+        ),
     )
     run.add_argument(
         "command",
@@ -135,13 +146,20 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     if not command:
         parser.error("run requires an MSM command after --")
 
+    working_directory = _working_directory(arguments.working_directory)
+    result_evidence_path = _result_evidence_path(
+        arguments.result_evidence,
+        working_directory=working_directory,
+    )
+
     try:
         if arguments.prediction_id is not None:
             request = PreregisteredRunRequest(
                 idempotency_key=arguments.idempotency_key,
                 prediction_id=arguments.prediction_id,
                 command=command,
-                working_directory=arguments.working_directory,
+                working_directory=working_directory,
+                result_evidence_path=result_evidence_path,
             )
             service = RunService(arguments.vault_root)
             result = service.run_preregistered(request)
@@ -170,7 +188,8 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
                     end=arguments.out_of_sample_end,
                 ),
                 command=command,
-                working_directory=arguments.working_directory,
+                working_directory=working_directory,
+                result_evidence_path=result_evidence_path,
             )
             service = RunService(arguments.vault_root, _local_msm_snapshot_source())
             result = service.run_exploratory(request)
@@ -181,7 +200,24 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
         print(f"msm-ledger: {exc}", file=sys.stderr)
         return 2
 
-    print(json.dumps(_result_payload(result), sort_keys=True))
+    ingested_result = None
+    if result_evidence_path is not None and _is_successful_run(result):
+        try:
+            ingested_result = _ingest_result(arguments.vault_root, result_evidence_path)
+        except LedgerError as exc:
+            print(
+                f"msm-ledger: run {result.run_id} completed but result ingestion failed: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+        except (OSError, ValueError) as exc:
+            print(
+                f"msm-ledger: run {result.run_id} completed but result evidence is invalid: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+
+    print(json.dumps(_result_payload(result, ingested_result), sort_keys=True))
     if result.exit_code is None:
         return 0
     if result.exit_code < 0:
@@ -206,8 +242,11 @@ def _local_msm_snapshot_source() -> Any:
     return snapshot_module.LedgerSnapshotSource(client_module.get_client())
 
 
-def _result_payload(result: RunResult) -> dict[str, Any]:
-    return {
+def _result_payload(
+    result: RunResult,
+    ingested_result: MSMResultIngestResult | None = None,
+) -> dict[str, Any]:
+    payload = {
         "run_id": result.run_id,
         "prediction_id": result.prediction_id,
         "registration_status": result.registration_status.value,
@@ -219,6 +258,28 @@ def _result_payload(result: RunResult) -> dict[str, Any]:
         "failure_note": result.failure_note,
         "executed": result.executed,
     }
+    if ingested_result is not None:
+        payload["result_ingestion"] = _ingested_result_payload(ingested_result)
+    return payload
+
+
+def _working_directory(value: Path | None) -> Path:
+    return (value or Path.cwd()).expanduser().resolve()
+
+
+def _result_evidence_path(value: Path | None, *, working_directory: Path) -> Path | None:
+    if value is None:
+        return None
+    expanded = value.expanduser()
+    if not expanded.is_absolute():
+        expanded = working_directory / expanded
+    return expanded.resolve()
+
+
+def _is_successful_run(result: RunResult) -> bool:
+    return (
+        result.state is RunState.COMPLETED and result.exit_code == 0 and result.failure_note is None
+    )
 
 
 def _ingest_external_cli(vault_root: Path, evidence_path: Path) -> int:
@@ -256,9 +317,7 @@ def _external_result_payload(result: ExternalRunImportResult) -> dict[str, Any]:
 
 def _ingest_result_cli(vault_root: Path, evidence_path: Path) -> int:
     try:
-        raw = json.loads(evidence_path.read_text(encoding="utf-8"))
-        evidence = MSMRunResultEvidence.model_validate(raw)
-        result = MSMResultIngestor(vault_root).ingest(MSMResultIngestRequest(evidence=evidence))
+        result = _ingest_result(vault_root, evidence_path)
     except LedgerError as exc:
         print(f"msm-ledger: {exc}", file=sys.stderr)
         return 2
@@ -268,6 +327,12 @@ def _ingest_result_cli(vault_root: Path, evidence_path: Path) -> int:
 
     print(json.dumps(_ingested_result_payload(result), sort_keys=True))
     return 0
+
+
+def _ingest_result(vault_root: Path, evidence_path: Path) -> MSMResultIngestResult:
+    raw = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence = MSMRunResultEvidence.model_validate(raw)
+    return MSMResultIngestor(vault_root).ingest(MSMResultIngestRequest(evidence=evidence))
 
 
 def _ingested_result_payload(result: MSMResultIngestResult) -> dict[str, Any]:
