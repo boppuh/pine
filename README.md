@@ -23,6 +23,15 @@ uv sync --extra dev
 uv run pytest
 ```
 
+## Durable deployment
+
+The supported durable model keeps the authoritative Pine vault, loopback backend, MSM
+release, and ClickHouse access co-located on the execution host. Obsidian remains a
+desktop client and connects through the authenticated `pine-obsidian-bridge` SSH
+tunnel; Pine is never exposed on a public listener. See
+[`docs/durable-deployment.md`](docs/durable-deployment.md) for the release layout,
+systemd services, backups, desktop plugin installation, and upgrade procedure.
+
 The first forecast shape is `finance/strategy-edge:1`, stored at
 `.ledger/schemas/finance/strategy-edge.1.json`. Runtime database, lock, and snapshot
 files are ignored by git.

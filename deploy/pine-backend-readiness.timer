@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic Pine Decision Edge backend readiness check
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Unit=pine-backend-readiness.service
+
+[Install]
+WantedBy=timers.target
