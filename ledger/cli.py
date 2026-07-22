@@ -278,9 +278,7 @@ def _result_evidence_path(value: Path | None, *, working_directory: Path) -> Pat
 
 def _is_successful_run(result: RunResult) -> bool:
     return (
-        result.state is RunState.COMPLETED
-        and result.exit_code == 0
-        and result.failure_note is None
+        result.state is RunState.COMPLETED and result.exit_code == 0 and result.failure_note is None
     )
 
 
