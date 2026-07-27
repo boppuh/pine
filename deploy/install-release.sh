@@ -101,7 +101,7 @@ echo "release=$release_root"
 echo "pine_commit=$pine_commit"
 echo "msm_commit=$msm_commit"
 echo "runtime_ready=true"
-if grep -Eq '^OPENAI_API_KEY=.+$' /etc/pine/backend.env; then
+if grep -Eq '^OPENAI_API_KEY=[^[:space:]]+$' /etc/pine/backend.env; then
     systemctl enable pine-backend.service pine-backend-readiness.timer pine-backup.timer
     systemctl restart pine-backend.service
     systemctl start pine-backend-readiness.timer pine-backup.timer

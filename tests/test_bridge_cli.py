@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import stat
 import subprocess
 from datetime import UTC, datetime
@@ -7,8 +8,14 @@ from pathlib import Path
 
 import pytest
 
-from ledger.backend import BackendDescriptor
-from ledger.bridge_cli import _validate_remote, fetch_remote_runtime, install_token
+import ledger.bridge_cli as bridge_cli
+from ledger.backend import BackendDescriptor, BackendRuntimeFiles
+from ledger.bridge_cli import (
+    _publish_runtime,
+    _validate_remote,
+    fetch_remote_runtime,
+    install_token,
+)
 from ledger.errors import IntegrityError
 
 
@@ -37,6 +44,81 @@ def test_install_token_is_atomic_private_and_rejects_symlink(tmp_path: Path) -> 
     token_path.symlink_to(tmp_path / "elsewhere")
     with pytest.raises(IntegrityError, match="path is unsafe"):
         install_token(token_path, first)
+
+
+def test_install_token_closes_temporary_before_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token_path = tmp_path / ".ledger" / "backend.token"
+    handles: list[object] = []
+    real_fdopen = os.fdopen
+    real_replace = os.replace
+
+    def tracked_fdopen(*args: object, **kwargs: object) -> object:
+        handle = real_fdopen(*args, **kwargs)
+        handles.append(handle)
+        return handle
+
+    def require_closed_handle(source: Path, destination: Path) -> None:
+        assert handles
+        assert handles[-1].closed is True  # type: ignore[attr-defined]
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "fdopen", tracked_fdopen)
+    monkeypatch.setattr(os, "replace", require_closed_handle)
+
+    install_token(token_path, "a" * 48)
+
+    assert token_path.read_text(encoding="utf-8") == "a" * 48
+
+
+def test_install_token_restores_previous_token_when_fsync_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token_path = tmp_path / ".ledger" / "backend.token"
+    install_token(token_path, "a" * 48)
+    real_fsync_directory = bridge_cli._fsync_directory
+    fsync_count = 0
+
+    def fail_first_fsync(path: Path) -> None:
+        nonlocal fsync_count
+        fsync_count += 1
+        if fsync_count == 1:
+            raise OSError("forced directory fsync failure")
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(bridge_cli, "_fsync_directory", fail_first_fsync)
+
+    with pytest.raises(OSError, match="forced directory fsync failure"):
+        install_token(token_path, "b" * 48)
+
+    assert token_path.read_text(encoding="utf-8") == "a" * 48
+    assert stat.S_IMODE(token_path.stat().st_mode) == 0o600
+
+
+def test_publish_runtime_restores_previous_token_when_descriptor_publish_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault = tmp_path / "vault"
+    runtime = BackendRuntimeFiles(vault)
+    install_token(runtime.token_path, "a" * 48)
+    descriptor = BackendDescriptor(
+        port=18765,
+        pid=123,
+        instance_id="bridge-test",
+        started_at=datetime(2026, 7, 27, tzinfo=UTC),
+    )
+
+    def fail_publish(_descriptor: BackendDescriptor) -> None:
+        raise OSError("forced descriptor publish failure")
+
+    monkeypatch.setattr(runtime, "publish", fail_publish)
+
+    with pytest.raises(OSError, match="forced descriptor publish failure"):
+        _publish_runtime(runtime, descriptor, "b" * 48)
+
+    assert runtime.token_path.read_text(encoding="utf-8") == "a" * 48
+    assert not runtime.discovery_path.exists()
 
 
 def test_fetch_remote_runtime_validates_without_printing_token(

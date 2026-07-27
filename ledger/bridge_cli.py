@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -128,7 +129,7 @@ def run_bridge(
             instance_id=instance_id,
             started_at=datetime.now(UTC),
         )
-        runtime.publish(descriptor)
+        _publish_runtime(runtime, descriptor, token)
         print(
             json.dumps(
                 {
@@ -194,25 +195,77 @@ def fetch_remote_runtime(
     return descriptor, token
 
 
-def install_token(path: Path, token: str) -> None:
-    """Atomically install a private token for the unmodified Obsidian plugin."""
+def install_token(path: Path, token: str) -> bytes | None:
+    """Atomically install a private token and return its prior state."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_symlink() or (path.exists() and not path.is_file()):
         raise IntegrityError("desktop backend token path is unsafe")
+    previous = _read_token_state(path)
+    try:
+        _write_private_token(path, token.encode("utf-8"))
+    except BaseException:
+        _restore_token(path, previous)
+        raise
+    return previous
+
+
+def _publish_runtime(
+    runtime: BackendRuntimeFiles,
+    descriptor: BackendDescriptor,
+    token: str,
+) -> None:
+    previous_token = install_token(runtime.token_path, token)
+    try:
+        runtime.publish(descriptor)
+    except BaseException:
+        _restore_token(runtime.token_path, previous_token)
+        raise
+
+
+def _read_token_state(path: Path) -> bytes | None:
+    if not os.path.lexists(path):
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise IntegrityError("desktop backend token must be a regular file")
+        handle = os.fdopen(descriptor, "rb")
+        descriptor = -1
+        with handle:
+            return handle.read()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _write_private_token(path: Path, content: bytes) -> None:
     temporary = path.parent / f".backend-token-{uuid.uuid4().hex}.tmp"
     descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", closefd=False) as handle:
-            handle.write(token)
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        with handle:
+            handle.write(content)
             handle.flush()
-            os.fsync(descriptor)
+            os.fsync(handle.fileno())
         os.replace(temporary, path)
         os.chmod(path, 0o600)
         _fsync_directory(path.parent)
     finally:
-        os.close(descriptor)
+        if descriptor >= 0:
+            os.close(descriptor)
         temporary.unlink(missing_ok=True)
+
+
+def _restore_token(path: Path, previous: bytes | None) -> None:
+    if previous is None:
+        path.unlink(missing_ok=True)
+        _fsync_directory(path.parent)
+        return
+    _write_private_token(path, previous)
 
 
 def _wait_for_tunnel(
