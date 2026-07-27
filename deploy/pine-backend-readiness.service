@@ -1,0 +1,22 @@
+[Unit]
+Description=Verify Pine Decision Edge backend readiness
+After=pine-backend.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+Environment="PATH=/opt/decision-edge/current/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/opt/decision-edge/current/venv/bin/pine-ledger-backend health --vault-root /var/lib/pine/vault --timeout-seconds 3
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/pine/vault
+RestrictAddressFamilies=AF_UNIX AF_INET
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+StandardOutput=journal
+StandardError=journal

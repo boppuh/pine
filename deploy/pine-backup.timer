@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly Pine Decision Edge vault backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 UTC
+Persistent=true
+RandomizedDelaySec=10min
+Unit=pine-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -21,6 +21,9 @@ dependencies = [
 
 [project.scripts]
 msm-ledger = "ledger.cli:main"
+pine-ledger-backend = "ledger.backend_cli:main"
+pine-ledger-backup = "ledger.backup_cli:main"
+pine-obsidian-bridge = "ledger.bridge_cli:main"
 
 [project.optional-dependencies]
 dev = [

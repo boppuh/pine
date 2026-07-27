@@ -1,0 +1,45 @@
+[Unit]
+Description=Pine Decision Edge loopback backend
+After=network-online.target clickhouse-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/decision-edge/current/pine
+EnvironmentFile=/etc/pine/backend.env
+EnvironmentFile=-/etc/msm/msm-dashboard.env
+Environment="PATH=/opt/decision-edge/current/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStartPre=/opt/decision-edge/current/venv/bin/pine-ledger-backend check --vault-root /var/lib/pine/vault --msm-repo-root /opt/decision-edge/current/msm --schema-source /opt/decision-edge/current/pine/.ledger/schemas --port 8765
+ExecStart=/opt/decision-edge/current/venv/bin/pine-ledger-backend serve --vault-root /var/lib/pine/vault --msm-repo-root /opt/decision-edge/current/msm --schema-source /opt/decision-edge/current/pine/.ledger/schemas --port 8765 --log-level info
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0077
+StateDirectory=pine
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/pine
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

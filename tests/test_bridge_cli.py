@@ -1,0 +1,228 @@
+from __future__ import annotations
+
+import os
+import stat
+import subprocess
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+import ledger.bridge_cli as bridge_cli
+from ledger.backend import BackendDescriptor, BackendRuntimeFiles
+from ledger.bridge_cli import (
+    _publish_runtime,
+    _validate_remote,
+    fetch_remote_runtime,
+    install_token,
+)
+from ledger.errors import IntegrityError
+
+
+def test_validate_remote_accepts_narrow_ssh_and_absolute_path() -> None:
+    _validate_remote("ubuntu@example-host", "/var/lib/pine/vault")
+
+    for destination in ("ubuntu@example;host", "ubuntu@example host", "-oProxyCommand=bad"):
+        with pytest.raises(ValueError, match="SSH destination"):
+            _validate_remote(destination, "/var/lib/pine/vault")
+    for path in ("relative/path", "/var/lib/../secret", "/var//lib/pine", "/var/lib/pine/"):
+        with pytest.raises(ValueError, match="remote vault root"):
+            _validate_remote("ubuntu@example-host", path)
+
+
+def test_install_token_is_atomic_private_and_rejects_symlink(tmp_path: Path) -> None:
+    token_path = tmp_path / ".ledger" / "backend.token"
+    first = "a" * 48
+    second = "b" * 48
+
+    install_token(token_path, first)
+    install_token(token_path, second)
+
+    assert token_path.read_text(encoding="utf-8") == second
+    assert stat.S_IMODE(token_path.stat().st_mode) == 0o600
+    token_path.unlink()
+    token_path.symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(IntegrityError, match="path is unsafe"):
+        install_token(token_path, first)
+
+
+def test_install_token_closes_temporary_before_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token_path = tmp_path / ".ledger" / "backend.token"
+    handles: list[object] = []
+    real_fdopen = os.fdopen
+    real_replace = os.replace
+
+    def tracked_fdopen(*args: object, **kwargs: object) -> object:
+        handle = real_fdopen(*args, **kwargs)
+        handles.append(handle)
+        return handle
+
+    def require_closed_handle(source: Path, destination: Path) -> None:
+        assert handles
+        assert handles[-1].closed is True  # type: ignore[attr-defined]
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "fdopen", tracked_fdopen)
+    monkeypatch.setattr(os, "replace", require_closed_handle)
+
+    install_token(token_path, "a" * 48)
+
+    assert token_path.read_text(encoding="utf-8") == "a" * 48
+
+
+def test_install_token_restores_previous_token_when_fsync_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token_path = tmp_path / ".ledger" / "backend.token"
+    install_token(token_path, "a" * 48)
+    real_fsync_directory = bridge_cli._fsync_directory
+    fsync_count = 0
+
+    def fail_first_fsync(path: Path) -> None:
+        nonlocal fsync_count
+        fsync_count += 1
+        if fsync_count == 1:
+            raise OSError("forced directory fsync failure")
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(bridge_cli, "_fsync_directory", fail_first_fsync)
+
+    with pytest.raises(OSError, match="forced directory fsync failure"):
+        install_token(token_path, "b" * 48)
+
+    assert token_path.read_text(encoding="utf-8") == "a" * 48
+    assert stat.S_IMODE(token_path.stat().st_mode) == 0o600
+
+
+def test_publish_runtime_restores_previous_token_when_descriptor_publish_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault = tmp_path / "vault"
+    runtime = BackendRuntimeFiles(vault)
+    install_token(runtime.token_path, "a" * 48)
+    descriptor = BackendDescriptor(
+        port=18765,
+        pid=123,
+        instance_id="bridge-test",
+        started_at=datetime(2026, 7, 27, tzinfo=UTC),
+    )
+
+    def fail_publish(_descriptor: BackendDescriptor) -> None:
+        raise OSError("forced descriptor publish failure")
+
+    monkeypatch.setattr(runtime, "publish", fail_publish)
+
+    with pytest.raises(OSError, match="forced descriptor publish failure"):
+        _publish_runtime(runtime, descriptor, "b" * 48)
+
+    assert runtime.token_path.read_text(encoding="utf-8") == "a" * 48
+    assert not runtime.discovery_path.exists()
+
+
+def test_run_bridge_installs_remote_token_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    token = "remote-token-" + "x" * 40
+    remote_descriptor = BackendDescriptor(
+        port=8765,
+        pid=456,
+        instance_id="remote-instance",
+        started_at=datetime(2026, 7, 27, tzinfo=UTC),
+    )
+    install_count = 0
+    real_install_token = bridge_cli.install_token
+
+    class FinishedTunnel:
+        def poll(self) -> int:
+            return 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+    def counted_install_token(path: Path, value: str) -> bytes | None:
+        nonlocal install_count
+        install_count += 1
+        return real_install_token(path, value)
+
+    monkeypatch.setattr(bridge_cli, "_find_executable", lambda value: value)
+    monkeypatch.setattr(
+        bridge_cli,
+        "fetch_remote_runtime",
+        lambda **_kwargs: (remote_descriptor, token),
+    )
+    monkeypatch.setattr(bridge_cli.subprocess, "Popen", lambda *_args, **_kwargs: FinishedTunnel())
+    monkeypatch.setattr(bridge_cli, "_wait_for_tunnel", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bridge_cli, "install_token", counted_install_token)
+
+    bridge_cli.run_bridge(
+        vault_root=vault,
+        ssh_destination="ubuntu@example-host",
+        remote_vault_root="/var/lib/pine/vault",
+    )
+
+    assert install_count == 1
+    assert (vault / ".ledger" / "backend.token").read_text(encoding="utf-8") == token
+    assert not (vault / ".ledger" / "backend.json").exists()
+
+
+def test_fetch_remote_runtime_validates_without_printing_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = BackendDescriptor(
+        port=8765,
+        pid=123,
+        instance_id="remote-instance",
+        started_at=datetime(2026, 7, 22, tzinfo=UTC),
+    )
+    token = "secret-token-" + "x" * 40
+
+    def fake_run(arguments: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        remote = arguments[-2]
+        local = Path(arguments[-1])
+        if remote.endswith("backend.json"):
+            local.write_text(descriptor.model_dump_json(), encoding="utf-8")
+        else:
+            local.write_text(token, encoding="utf-8")
+        return subprocess.CompletedProcess(arguments, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    actual_descriptor, actual_token = fetch_remote_runtime(
+        ssh_destination="ubuntu@example-host",
+        remote_vault_root="/var/lib/pine/vault",
+        scp_executable="/usr/bin/scp",
+    )
+
+    assert actual_descriptor == descriptor
+    assert actual_token == token
+
+
+def test_fetch_remote_runtime_rejects_short_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    descriptor = BackendDescriptor(
+        port=8765,
+        pid=123,
+        instance_id="remote-instance",
+        started_at=datetime(2026, 7, 22, tzinfo=UTC),
+    )
+
+    def fake_run(arguments: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        remote = arguments[-2]
+        local = Path(arguments[-1])
+        local.write_text(
+            descriptor.model_dump_json() if remote.endswith("backend.json") else "short",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(arguments, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(IntegrityError, match="token is malformed"):
+        fetch_remote_runtime(
+            ssh_destination="ubuntu@example-host",
+            remote_vault_root="/var/lib/pine/vault",
+            scp_executable="/usr/bin/scp",
+        )
