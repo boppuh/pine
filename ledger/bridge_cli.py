@@ -122,7 +122,6 @@ def run_bridge(
             stdin=subprocess.DEVNULL,
         )
         _wait_for_tunnel(tunnel, local_port, connect_timeout_seconds)
-        install_token(runtime.token_path, token)
         descriptor = BackendDescriptor(
             port=local_port,
             pid=os.getpid(),

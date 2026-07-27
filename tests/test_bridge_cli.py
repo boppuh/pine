@@ -121,6 +121,54 @@ def test_publish_runtime_restores_previous_token_when_descriptor_publish_fails(
     assert not runtime.discovery_path.exists()
 
 
+def test_run_bridge_installs_remote_token_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    token = "remote-token-" + "x" * 40
+    remote_descriptor = BackendDescriptor(
+        port=8765,
+        pid=456,
+        instance_id="remote-instance",
+        started_at=datetime(2026, 7, 27, tzinfo=UTC),
+    )
+    install_count = 0
+    real_install_token = bridge_cli.install_token
+
+    class FinishedTunnel:
+        def poll(self) -> int:
+            return 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+    def counted_install_token(path: Path, value: str) -> bytes | None:
+        nonlocal install_count
+        install_count += 1
+        return real_install_token(path, value)
+
+    monkeypatch.setattr(bridge_cli, "_find_executable", lambda value: value)
+    monkeypatch.setattr(
+        bridge_cli,
+        "fetch_remote_runtime",
+        lambda **_kwargs: (remote_descriptor, token),
+    )
+    monkeypatch.setattr(bridge_cli.subprocess, "Popen", lambda *_args, **_kwargs: FinishedTunnel())
+    monkeypatch.setattr(bridge_cli, "_wait_for_tunnel", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bridge_cli, "install_token", counted_install_token)
+
+    bridge_cli.run_bridge(
+        vault_root=vault,
+        ssh_destination="ubuntu@example-host",
+        remote_vault_root="/var/lib/pine/vault",
+    )
+
+    assert install_count == 1
+    assert (vault / ".ledger" / "backend.token").read_text(encoding="utf-8") == token
+    assert not (vault / ".ledger" / "backend.json").exists()
+
+
 def test_fetch_remote_runtime_validates_without_printing_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
