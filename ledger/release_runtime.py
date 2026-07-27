@@ -20,7 +20,7 @@ def validate_release_runtime(status: Mapping[str, Any], release_root: str | Path
         raise IntegrityError("shared runtime did not report ready")
     for field in ("integration_version", "result_format_version"):
         value = status.get(field)
-        if isinstance(value, bool) or value != 1:
+        if not isinstance(value, int) or isinstance(value, bool) or value != 1:
             raise IntegrityError(f"shared runtime {field} is unsupported")
 
     _require_release_module(status, "pine_module", root / "pine")

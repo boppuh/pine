@@ -34,6 +34,15 @@ def test_validate_release_runtime_accepts_pinned_editable_modules(tmp_path: Path
     validate_release_runtime(status, release)
 
 
+@pytest.mark.parametrize("field", ["integration_version", "result_format_version"])
+def test_validate_release_runtime_rejects_float_version(tmp_path: Path, field: str) -> None:
+    release, status = _release(tmp_path)
+    status[field] = 1.0
+
+    with pytest.raises(IntegrityError, match=rf"{field} is unsupported"):
+        validate_release_runtime(status, release)
+
+
 def test_validate_release_runtime_rejects_site_packages_module(tmp_path: Path) -> None:
     release, status = _release(tmp_path)
     installed_module = release / "venv" / "lib" / "python3.11" / "site-packages" / "msm"
