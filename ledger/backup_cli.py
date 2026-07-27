@@ -76,6 +76,7 @@ def create_backup(vault_root: str | Path, backup_root: str | Path) -> dict[str, 
     nonce = uuid.uuid4().hex
     temporary = destination / f".backup-{nonce}.tmp"
     temporary.mkdir(mode=0o700)
+    published: Path | None = None
     try:
         with ledger_lock(vault / ".ledger", timeout=30.0):
             registry = LedgerRegistry(database)
@@ -123,8 +124,9 @@ def create_backup(vault_root: str | Path, backup_root: str | Path) -> dict[str, 
         verify_backup(temporary)
 
         name = created_at.strftime("pine-%Y%m%dT%H%M%SZ-") + nonce[:12]
-        published = destination / name
-        os.replace(temporary, published)
+        published_path = destination / name
+        os.replace(temporary, published_path)
+        published = published_path
         _fsync_directory(destination)
         verified = verify_backup(published)
         return {
@@ -134,6 +136,9 @@ def create_backup(vault_root: str | Path, backup_root: str | Path) -> dict[str, 
         }
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
+        if published is not None and os.path.lexists(published):
+            shutil.rmtree(published)
+            _fsync_directory(destination)
         raise
 
 

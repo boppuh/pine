@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import ledger.backup_cli as backup_cli
 from ledger.backup_cli import create_backup, verify_backup
 from ledger.errors import IntegrityError
 from ledger.registry import LedgerRegistry
@@ -94,3 +95,27 @@ def test_create_refuses_while_run_is_active(tmp_path: Path) -> None:
 
     with pytest.raises(IntegrityError, match="while an MSM run is active"):
         create_backup(vault, tmp_path / "backups")
+
+
+def test_create_removes_published_backup_when_final_verification_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault = _vault(tmp_path)
+    backup_root = tmp_path / "backups"
+    real_verify_backup = backup_cli.verify_backup
+    verification_count = 0
+
+    def fail_final_verification(backup: str | Path) -> dict[str, object]:
+        nonlocal verification_count
+        verification_count += 1
+        if verification_count == 2:
+            raise IntegrityError("forced final verification failure")
+        return real_verify_backup(backup)
+
+    monkeypatch.setattr(backup_cli, "verify_backup", fail_final_verification)
+
+    with pytest.raises(IntegrityError, match="forced final verification failure"):
+        backup_cli.create_backup(vault, backup_root)
+
+    assert verification_count == 2
+    assert list(backup_root.iterdir()) == []
