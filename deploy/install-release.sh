@@ -68,11 +68,16 @@ cleanup_release="$release_root"
 runuser -u "$service_user" -- /home/ubuntu/.local/bin/uv venv --python 3.11 "$release_root/venv"
 runuser -u "$service_user" -- /home/ubuntu/.local/bin/uv pip install \
     --python "$release_root/venv/bin/python" \
-    "$release_root/pine" \
-    "$release_root/msm"
+    --editable "$release_root/pine" \
+    --editable "$release_root/msm"
 
-runtime_check=$(cd "$release_root/pine" && "$release_root/venv/bin/msm-ledger-result" runtime-check)
-if ! grep -q '"ready": true' <<<"$runtime_check"; then
+runtime_check=$(
+    runuser -u "$service_user" -- \
+        "$release_root/venv/bin/msm-ledger-result" runtime-check
+)
+if ! runuser -u "$service_user" -- \
+    "$release_root/venv/bin/python" -m ledger.release_runtime \
+    --release-root "$release_root" <<<"$runtime_check"; then
     echo "shared runtime check failed" >&2
     exit 2
 fi
