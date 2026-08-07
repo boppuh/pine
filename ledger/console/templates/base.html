@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>{{ page_title }} | Pine</title>
+    <link rel="stylesheet" href="/assets/console.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <header class="site-header">
+      <div class="header-inner">
+        <a class="brand" href="/" aria-label="Pine Research Console home">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span>Pine</span>
+        </a>
+        <nav class="primary-nav" aria-label="Primary navigation">
+          <a href="/"{% if active_page == 'home' %} aria-current="page"{% endif %}>Home</a>
+          <span aria-disabled="true">Capture</span>
+          <span aria-disabled="true">Predictions</span>
+          <a href="/status"{% if active_page == 'status' %} aria-current="page"{% endif %}>Status</a>
+        </nav>
+        {% if csrf_token is defined %}
+        <form class="session-form" method="post" action="/session/logout">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="quiet-button" type="submit">End session</button>
+        </form>
+        {% endif %}
+      </div>
+    </header>
+    <main id="main-content" tabindex="-1">
+      {% block content %}{% endblock %}
+    </main>
+    <footer class="site-footer">
+      <p>Private research infrastructure. The ledger remains the authority.</p>
+    </footer>
+  </body>
+</html>

@@ -29,6 +29,7 @@ def _config(tmp_path: Path) -> ConsoleConfig:
         state_path=tmp_path / "console.db",
         backend_credential_path=tmp_path / "backend-token",
         allowed_host="pine.example.ts.net",
+        allowed_identities=("user@example.com",),
     )
 
 
@@ -377,6 +378,7 @@ def test_config_loads_private_credential_and_rejects_unsafe_networks(
     os.chmod(credential, 0o600)
     environment = {
         "PINE_CONSOLE_ALLOWED_HOST": "pine.example.ts.net",
+        "PINE_CONSOLE_ALLOWED_IDENTITIES": "user@example.com",
         "PINE_CONSOLE_SOCKET_PATH": str(tmp_path / "console.sock"),
         "PINE_CONSOLE_STATE_PATH": str(tmp_path / "console.db"),
         "PINE_CONSOLE_BACKEND_CREDENTIAL_PATH": str(credential),
@@ -386,6 +388,18 @@ def test_config_loads_private_credential_and_rejects_unsafe_networks(
 
     assert config.read_backend_token() == TOKEN
     assert config.backend_url == "http://127.0.0.1:8765"
+    assert config.allowed_identities == ("user@example.com",)
+    without_identities = {
+        key: value for key, value in environment.items() if key != "PINE_CONSOLE_ALLOWED_IDENTITIES"
+    }
+    with pytest.raises(ConsoleConfigError, match="ALLOWED_IDENTITIES"):
+        ConsoleConfig.from_env(without_identities)
+    duplicates = dict(
+        environment,
+        PINE_CONSOLE_ALLOWED_IDENTITIES="User@Example.com,user@example.com",
+    )
+    with pytest.raises(ConsoleConfigError, match="invalid"):
+        ConsoleConfig.from_env(duplicates)
     unsafe = dict(environment, PINE_CONSOLE_BACKEND_URL="https://public.example.com")
     with pytest.raises(ConsoleConfigError, match="invalid"):
         ConsoleConfig.from_env(unsafe)

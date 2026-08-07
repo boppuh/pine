@@ -11,7 +11,7 @@ from typing import Protocol
 
 import uvicorn
 
-from ledger.console.app import create_core_app
+from ledger.console.app import create_console_app
 from ledger.console.backend_client import ConsoleBackend, ConsoleBackendClient
 from ledger.console.config import ConsoleConfig
 from ledger.console.errors import BackendError, ConsoleError
@@ -104,9 +104,9 @@ def run_console_app(
     store: ConsoleStateStore,
     backend: ConsoleBackend,
 ) -> None:
-    """Serve the health-only PR 2 core through the configured Unix socket."""
+    """Serve the authenticated console exclusively through its Unix socket."""
 
-    app = create_core_app(store, backend)
+    app = create_console_app(config, store, backend)
     uvicorn.run(
         app,
         uds=str(config.socket_path),

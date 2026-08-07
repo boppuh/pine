@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ledger.console.auth import normalize_user_identity
 from ledger.console.errors import ConsoleConfigError
 
 
@@ -25,6 +26,7 @@ class ConsoleConfig(BaseModel):
     backend_url: str = "http://127.0.0.1:8765"
     backend_credential_path: Path = Path("/run/credentials/pine-console.service/backend-token")
     allowed_host: str
+    allowed_identities: tuple[str, ...]
     connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
     health_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
     extraction_timeout_seconds: float = Field(default=90.0, gt=0, le=300)
@@ -33,6 +35,12 @@ class ConsoleConfig(BaseModel):
     receipt_retention_hours: int = Field(default=24, ge=1, le=24 * 30)
     session_absolute_minutes: int = Field(default=8 * 60, ge=5, le=24 * 60)
     session_idle_minutes: int = Field(default=30, ge=1, le=8 * 60)
+    max_request_bytes: int = Field(default=1024 * 1024, ge=1024, le=1024 * 1024)
+    session_attempt_limit: int = Field(default=20, ge=1, le=1000)
+    extraction_attempt_limit: int = Field(default=10, ge=1, le=1000)
+    confirmation_attempt_limit: int = Field(default=5, ge=1, le=1000)
+    retry_attempt_limit: int = Field(default=10, ge=1, le=1000)
+    rate_limit_window_seconds: int = Field(default=10 * 60, ge=60, le=24 * 60 * 60)
     log_level: str = "info"
 
     @field_validator("socket_path", "state_path", "backend_credential_path")
@@ -62,6 +70,16 @@ class ConsoleConfig(BaseModel):
             or ".." in normalized
         ):
             raise ValueError("allowed_host must be one normalized DNS hostname")
+        return normalized
+
+    @field_validator("allowed_identities")
+    @classmethod
+    def allowed_identities_are_exact(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(normalize_user_identity(value) for value in values)
+        if not normalized or len(normalized) > 32:
+            raise ValueError("allowed_identities must contain between one and 32 identities")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("allowed_identities must not contain duplicates")
         return normalized
 
     @field_validator("log_level")
@@ -115,7 +133,16 @@ class ConsoleConfig(BaseModel):
         allowed_host = values.get("PINE_CONSOLE_ALLOWED_HOST")
         if allowed_host is None:
             raise ConsoleConfigError("PINE_CONSOLE_ALLOWED_HOST is required")
-        raw: dict[str, object] = {"allowed_host": allowed_host}
+        allowed_identities = values.get("PINE_CONSOLE_ALLOWED_IDENTITIES")
+        if allowed_identities is None:
+            raise ConsoleConfigError("PINE_CONSOLE_ALLOWED_IDENTITIES is required")
+        raw_identities = tuple(item.strip() for item in allowed_identities.split(","))
+        if any(not item for item in raw_identities):
+            raise ConsoleConfigError("console environment configuration is invalid")
+        raw: dict[str, object] = {
+            "allowed_host": allowed_host,
+            "allowed_identities": raw_identities,
+        }
         mappings: dict[str, tuple[str, type[str] | type[int] | type[float] | type[Path]]] = {
             "PINE_CONSOLE_SOCKET_PATH": ("socket_path", Path),
             "PINE_CONSOLE_STATE_PATH": ("state_path", Path),
@@ -132,6 +159,18 @@ class ConsoleConfig(BaseModel):
             "PINE_CONSOLE_RECEIPT_RETENTION_HOURS": ("receipt_retention_hours", int),
             "PINE_CONSOLE_SESSION_ABSOLUTE_MINUTES": ("session_absolute_minutes", int),
             "PINE_CONSOLE_SESSION_IDLE_MINUTES": ("session_idle_minutes", int),
+            "PINE_CONSOLE_MAX_REQUEST_BYTES": ("max_request_bytes", int),
+            "PINE_CONSOLE_SESSION_ATTEMPT_LIMIT": ("session_attempt_limit", int),
+            "PINE_CONSOLE_EXTRACTION_ATTEMPT_LIMIT": ("extraction_attempt_limit", int),
+            "PINE_CONSOLE_CONFIRMATION_ATTEMPT_LIMIT": (
+                "confirmation_attempt_limit",
+                int,
+            ),
+            "PINE_CONSOLE_RETRY_ATTEMPT_LIMIT": ("retry_attempt_limit", int),
+            "PINE_CONSOLE_RATE_LIMIT_WINDOW_SECONDS": (
+                "rate_limit_window_seconds",
+                int,
+            ),
             "PINE_CONSOLE_LOG_LEVEL": ("log_level", str),
         }
         try:
@@ -149,6 +188,14 @@ class ConsoleConfig(BaseModel):
     @property
     def receipt_retention(self) -> timedelta:
         return timedelta(hours=self.receipt_retention_hours)
+
+    @property
+    def session_absolute_lifetime(self) -> timedelta:
+        return timedelta(minutes=self.session_absolute_minutes)
+
+    @property
+    def session_idle_lifetime(self) -> timedelta:
+        return timedelta(minutes=self.session_idle_minutes)
 
     def read_backend_token(self) -> str:
         """Read a bounded systemd credential without exposing its value."""

@@ -1,0 +1,408 @@
+"""ASGI security boundary for the browser-facing console."""
+
+from __future__ import annotations
+
+import json
+import logging
+import secrets
+import time
+from collections.abc import Callable
+from http import HTTPStatus
+from typing import Any
+from urllib.parse import parse_qs
+
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+from ledger.console.auth import authenticate_tailscale_identity, single_header
+from ledger.console.config import ConsoleConfig
+from ledger.console.errors import ConsoleError, RateLimitExceeded
+from ledger.console.rate_limit import ConsoleAbuseControls
+from ledger.console.sessions import (
+    SESSION_COOKIE_NAME,
+    ConsoleSession,
+    ConsoleSessionStore,
+    SessionLookupStatus,
+    hash_user_identity,
+)
+
+LOGGER = logging.getLogger("ledger.console.http")
+PUBLIC_HEALTH_PATHS = frozenset({"/healthz", "/livez", "/readyz"})
+CONTENT_SECURITY_POLICY = (
+    "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
+    "form-action 'self'; object-src 'none'; script-src 'self'; "
+    "style-src 'self'; img-src 'self' data:; connect-src 'self';"
+)
+SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+    (b"content-security-policy", CONTENT_SECURITY_POLICY.encode("ascii")),
+    (b"x-content-type-options", b"nosniff"),
+    (b"x-frame-options", b"DENY"),
+    (b"referrer-policy", b"no-referrer"),
+    (
+        b"permissions-policy",
+        b"camera=(), microphone=(), geolocation=(), payment=(), usb=(), "
+        b"accelerometer=(), gyroscope=(), magnetometer=()",
+    ),
+    (b"cross-origin-opener-policy", b"same-origin"),
+    (b"cross-origin-resource-policy", b"same-origin"),
+    (b"strict-transport-security", b"max-age=31536000"),
+    (b"cache-control", b"no-store"),
+)
+
+
+class _RequestDisconnected(Exception):
+    """Stop a state-changing request whose body never arrived completely."""
+
+
+class ConsoleSecurityMiddleware:
+    """Authenticate, constrain, and instrument every HTTP request fail closed."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        config: ConsoleConfig,
+        sessions: ConsoleSessionStore,
+        abuse_controls: ConsoleAbuseControls,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.app = app
+        self.config = config
+        self.sessions = sessions
+        self.abuse_controls = abuse_controls
+        self.monotonic_clock = monotonic_clock
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request_id = secrets.token_hex(16)
+        started = self.monotonic_clock()
+        status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+        identity_hash: str | None = None
+        new_cookie: str | None = None
+        clear_cookie = False
+
+        async def secured_send(message: Message) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = int(message["status"])
+                headers = _replace_security_headers(list(message.get("headers", [])))
+                headers.append((b"x-request-id", request_id.encode("ascii")))
+                should_clear = clear_cookie or bool(
+                    _request_state(scope).get("pine.clear_session_cookie")
+                )
+                if should_clear:
+                    headers.append((b"set-cookie", _expired_cookie()))
+                elif new_cookie is not None:
+                    headers.append(
+                        (
+                            b"set-cookie",
+                            _session_cookie(
+                                new_cookie,
+                                max_age_seconds=self.config.session_idle_minutes * 60,
+                            ),
+                        )
+                    )
+                message["headers"] = headers
+            await send(message)
+
+        try:
+            path = str(scope.get("path", ""))
+            if path in PUBLIC_HEALTH_PATHS:
+                await self.app(scope, receive, secured_send)
+                return
+
+            identity = authenticate_tailscale_identity(
+                scope,
+                socket_path=self.config.socket_path,
+                allowed_identities=self.config.allowed_identities,
+            )
+            if identity is None:
+                await _send_plain(secured_send, HTTPStatus.FORBIDDEN, "Forbidden")
+                return
+            identity_hash = hash_user_identity(identity.user_id)
+
+            if not _valid_host(scope, self.config.allowed_host):
+                await _send_plain(secured_send, HTTPStatus.BAD_REQUEST, "Bad Request")
+                return
+
+            cookie_value = _session_cookie_value(scope)
+            lookup = self.sessions.lookup(cookie_value, identity.user_id)
+            if lookup.status is SessionLookupStatus.IDENTITY_MISMATCH:
+                clear_cookie = True
+                await _send_plain(secured_send, HTTPStatus.FORBIDDEN, "Forbidden")
+                return
+            if lookup.status is SessionLookupStatus.VALID:
+                session = lookup.session
+                if session is None:
+                    raise RuntimeError("valid console session lookup lacked state")
+            else:
+                self.abuse_controls.session_establishment(identity_hash)
+                created = self.sessions.create(identity.user_id)
+                session = created.session
+                new_cookie = created.cookie_value
+
+            state = _request_state(scope)
+            state["pine.identity"] = identity.user_id
+            state["pine.identity_hash"] = identity_hash
+            state["pine.session"] = session
+
+            content_length = _content_length(scope)
+            if content_length is not None and content_length > self.config.max_request_bytes:
+                await _send_plain(secured_send, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Too Large")
+                return
+
+            method = str(scope.get("method", "GET")).upper()
+            csrf_header = single_header(scope, "x-pine-csrf-token")
+            if method not in {"GET", "HEAD", "OPTIONS"}:
+                if not _valid_origin(scope, self.config.allowed_host):
+                    await _send_plain(secured_send, HTTPStatus.FORBIDDEN, "Forbidden")
+                    return
+                if csrf_header is not None and not session.validates_csrf(
+                    csrf_header, method, path
+                ):
+                    await _send_plain(secured_send, HTTPStatus.FORBIDDEN, "Forbidden")
+                    return
+                if csrf_header is None and not _is_urlencoded(scope):
+                    await _send_plain(secured_send, HTTPStatus.FORBIDDEN, "Forbidden")
+                    return
+
+            body = await _read_bounded_body(receive, self.config.max_request_bytes)
+            if body is None:
+                await _send_plain(secured_send, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Too Large")
+                return
+
+            if method not in {"GET", "HEAD", "OPTIONS"} and csrf_header is None:
+                form_token, form_field_names = _form_csrf(body)
+                if form_token is None or not session.validates_csrf(form_token, method, path):
+                    await _send_plain(secured_send, HTTPStatus.FORBIDDEN, "Forbidden")
+                    return
+                state["pine.form_field_names"] = form_field_names
+
+            await self.app(scope, _replay_body(body), secured_send)
+        except _RequestDisconnected:
+            status_code = 499
+        except RateLimitExceeded as exc:
+            await _send_plain(
+                secured_send,
+                HTTPStatus.TOO_MANY_REQUESTS,
+                "Too Many Requests",
+                extra_headers=((b"retry-after", str(exc.retry_after_seconds).encode("ascii")),),
+            )
+        except ConsoleError:
+            LOGGER.error(
+                _log_event(
+                    "console_request_failed_closed",
+                    request_id=request_id,
+                    route=str(scope.get("path", "")),
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                    identity_hash=identity_hash,
+                )
+            )
+            await _send_plain(secured_send, HTTPStatus.SERVICE_UNAVAILABLE, "Unavailable")
+        except Exception:
+            LOGGER.error(
+                _log_event(
+                    "console_request_error",
+                    request_id=request_id,
+                    route=str(scope.get("path", "")),
+                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    identity_hash=identity_hash,
+                )
+            )
+            await _send_plain(secured_send, HTTPStatus.INTERNAL_SERVER_ERROR, "Error")
+        finally:
+            duration_ms = max(0, round((self.monotonic_clock() - started) * 1000))
+            LOGGER.info(
+                _log_event(
+                    "console_http_request",
+                    request_id=request_id,
+                    route=str(scope.get("path", "")),
+                    status=int(status_code),
+                    identity_hash=identity_hash,
+                    duration_ms=duration_ms,
+                )
+            )
+
+
+def require_session(scope: Scope) -> ConsoleSession:
+    """Return middleware-authenticated session state to route handlers."""
+
+    session = _request_state(scope).get("pine.session")
+    if not isinstance(session, ConsoleSession):
+        raise RuntimeError("authenticated console session is unavailable")
+    return session
+
+
+def require_identity(scope: Scope) -> str:
+    """Return the normalized owner for user-scoped workflow calls."""
+
+    identity = _request_state(scope).get("pine.identity")
+    if not isinstance(identity, str):
+        raise RuntimeError("authenticated console identity is unavailable")
+    return identity
+
+
+def _request_state(scope: Scope) -> dict[str, Any]:
+    state = scope.setdefault("state", {})
+    if not isinstance(state, dict):
+        raise RuntimeError("ASGI request state is invalid")
+    return state
+
+
+def _valid_host(scope: Scope, allowed_host: str) -> bool:
+    value = single_header(scope, "host")
+    return value is not None and secrets.compare_digest(value.lower(), allowed_host)
+
+
+def _valid_origin(scope: Scope, allowed_host: str) -> bool:
+    value = single_header(scope, "origin")
+    expected = f"https://{allowed_host}"
+    return value is not None and secrets.compare_digest(value, expected)
+
+
+def _session_cookie_value(scope: Scope) -> str | None:
+    headers = scope.get("headers", [])
+    raw_values = [value for name, value in headers if name.lower() == b"cookie"]
+    if not raw_values:
+        return None
+    try:
+        combined = b";".join(raw_values).decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    matches: list[str] = []
+    for item in combined.split(";"):
+        name, separator, value = item.strip().partition("=")
+        if separator and name == SESSION_COOKIE_NAME:
+            matches.append(value)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _content_length(scope: Scope) -> int | None:
+    value = single_header(scope, "content-length")
+    if value is None:
+        return None
+    try:
+        parsed = int(value, 10)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _is_urlencoded(scope: Scope) -> bool:
+    content_type = single_header(scope, "content-type")
+    if content_type is None:
+        return False
+    return content_type.partition(";")[0].strip().lower() == "application/x-www-form-urlencoded"
+
+
+def _form_csrf(body: bytes) -> tuple[str | None, frozenset[str]]:
+    try:
+        parsed = parse_qs(
+            body.decode("utf-8"),
+            keep_blank_values=True,
+            strict_parsing=False,
+            max_num_fields=64,
+        )
+    except (UnicodeDecodeError, ValueError):
+        return None, frozenset()
+    values = parsed.get("csrf_token")
+    token = values[0] if values is not None and len(values) == 1 else None
+    return token, frozenset(parsed)
+
+
+async def _read_bounded_body(receive: Receive, limit: int) -> bytes | None:
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            raise _RequestDisconnected
+        if message["type"] != "http.request":
+            continue
+        chunk = message.get("body", b"")
+        size += len(chunk)
+        if size > limit:
+            return None
+        chunks.append(chunk)
+        if not message.get("more_body", False):
+            return b"".join(chunks)
+
+
+def _replay_body(body: bytes) -> Receive:
+    sent = False
+
+    async def receive() -> Message:
+        nonlocal sent
+        if sent:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        sent = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return receive
+
+
+async def _send_plain(
+    send: Send,
+    status: int,
+    message: str,
+    *,
+    extra_headers: tuple[tuple[bytes, bytes], ...] = (),
+) -> None:
+    body = message.encode("ascii")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": int(status),
+            "headers": [
+                (b"content-type", b"text/plain; charset=utf-8"),
+                (b"content-length", str(len(body)).encode("ascii")),
+                *extra_headers,
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
+
+
+def _replace_security_headers(headers: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
+    locked = {name for name, _value in SECURITY_HEADERS}
+    filtered = [(name, value) for name, value in headers if name.lower() not in locked]
+    filtered.extend(SECURITY_HEADERS)
+    return filtered
+
+
+def _session_cookie(value: str, *, max_age_seconds: int) -> bytes:
+    return (
+        f"{SESSION_COOKIE_NAME}={value}; Path=/; Max-Age={max_age_seconds}; "
+        "Secure; HttpOnly; SameSite=Strict"
+    ).encode("ascii")
+
+
+def _expired_cookie() -> bytes:
+    return (
+        f"{SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; "
+        "Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; HttpOnly; SameSite=Strict"
+    ).encode("ascii")
+
+
+def _log_event(
+    event: str,
+    *,
+    request_id: str,
+    route: str,
+    status: int,
+    identity_hash: str | None,
+    duration_ms: int | None = None,
+) -> str:
+    fields: dict[str, str | int] = {
+        "event": event,
+        "request_id": request_id,
+        "route": route,
+        "status": int(status),
+    }
+    if identity_hash is not None:
+        fields["identity_hash"] = identity_hash
+    if duration_ms is not None:
+        fields["duration_ms"] = duration_ms
+    return json.dumps(fields, sort_keys=True, separators=(",", ":"))

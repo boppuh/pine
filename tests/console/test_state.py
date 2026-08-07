@@ -11,7 +11,11 @@ import pytest
 
 from ledger.api import CaptureResponse
 from ledger.console.errors import ConsoleStateError, WorkflowConflictError, WorkflowNotFoundError
-from ledger.console.migrations import CONSOLE_SCHEMA_VERSION
+from ledger.console.migrations import (
+    _MIGRATION_1,
+    CONSOLE_SCHEMA_VERSION,
+    _migration_statements,
+)
 from ledger.console.models import CaptureInput, WorkflowState
 from ledger.console.state import ConsoleStateStore
 from ledger.extraction import DraftProposal, ExtractionResult, ExtractionStatus
@@ -63,7 +67,9 @@ def test_unversioned_or_newer_database_fails_closed(tmp_path: Path) -> None:
     current = tmp_path / "current.db"
     store = ConsoleStateStore(current)
     connection = store.connect()
-    connection.execute("UPDATE console_schema_migrations SET version = 99")
+    connection.execute(
+        "INSERT INTO console_schema_migrations(version, applied_at) VALUES (99, 'now')"
+    )
     connection.execute("PRAGMA user_version = 99")
     connection.close()
     with pytest.raises(ConsoleStateError, match="newer"):
@@ -94,6 +100,35 @@ def test_concurrent_initialization_serializes_migration(tmp_path: Path) -> None:
     failures = [result for result in results if isinstance(result, BaseException)]
     assert failures == []
     assert ConsoleStateStore(path).get_status() == {"schema_version": CONSOLE_SCHEMA_VERSION}
+
+
+def test_released_v1_database_migrates_sessions_without_reinitialization(tmp_path: Path) -> None:
+    path = tmp_path / "v1" / "console.db"
+    path.parent.mkdir(mode=0o700)
+    connection = sqlite3.connect(path)
+    for statement in _migration_statements(_MIGRATION_1):
+        connection.execute(statement)
+    connection.execute(
+        "INSERT INTO console_schema_migrations(version, applied_at) VALUES (1, 'v1')"
+    )
+    connection.execute("PRAGMA user_version = 1")
+    connection.commit()
+    connection.close()
+    path.chmod(0o600)
+
+    store = ConsoleStateStore(path)
+    migrated = store.connect()
+    try:
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert (
+            migrated.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'console_sessions'"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        migrated.close()
 
 
 def test_state_path_rejects_ledger_symlink_and_permissive_parent(tmp_path: Path) -> None:
