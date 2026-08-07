@@ -27,7 +27,6 @@ from ledger.msm import SnapshotDateWindow, StrategySnapshot
 from ledger.read_models import (
     IntegrityReason,
     IntegrityState,
-    IntegrityViolationProjection,
     LedgerStatus,
     PredictionDetail,
     PredictionPage,
@@ -38,7 +37,11 @@ from ledger.read_models import (
     RunProjection,
     SnapshotProvenance,
 )
-from ledger.record_integrity import ImmutableEvidenceVerifier, VerifiedRecordEvidence
+from ledger.record_integrity import (
+    ImmutableEvidenceVerifier,
+    SnapshotReadLimitError,
+    VerifiedRecordEvidence,
+)
 from ledger.registry import LedgerRegistry
 from ledger.results import MSMResultIngestor, VerifiedStoredRunResult
 from ledger.run import RunState
@@ -84,15 +87,17 @@ class PredictionListFilters:
 
 @dataclass(frozen=True, slots=True)
 class _VerifiedBundle:
+    prediction: sqlite3.Row
     evidence: VerifiedRecordEvidence
     snapshot: StrategySnapshot
     run: RunProjection
     result: VerifiedStoredRunResult | None
 
 
-@dataclass(frozen=True, slots=True)
 class _ProjectionFailure(Exception):
-    reason: IntegrityReason
+    def __init__(self, reason: IntegrityReason) -> None:
+        super().__init__(reason.value)
+        self.reason = reason
 
 
 class _CursorCodec:
@@ -173,6 +178,7 @@ class LedgerReadService:
         vault_root: str | Path,
         *,
         cursor_secret: str | bytes,
+        records_dir: str | Path | None = None,
         registry: LedgerRegistry | None = None,
         schema_registry: SchemaRegistry | None = None,
     ) -> None:
@@ -180,7 +186,15 @@ class LedgerReadService:
         if not self.vault_root.is_dir():
             raise ValueError(f"vault root does not exist: {self.vault_root}")
         self.ledger_dir = self.vault_root / ".ledger"
-        self.records_dir = self.vault_root / "predictions"
+        self.records_dir = (
+            Path(records_dir).resolve()
+            if records_dir is not None
+            else self.vault_root / "predictions"
+        )
+        if not self.records_dir.is_relative_to(self.vault_root) or self.records_dir.is_relative_to(
+            self.ledger_dir
+        ):
+            raise ValueError("records_dir must live inside the vault outside .ledger")
         self.registry = registry or LedgerRegistry(self.ledger_dir / "registry.db")
         if self.registry.db_path.resolve() != (self.ledger_dir / "registry.db").resolve():
             raise ValueError("registry and read service must use the same vault root")
@@ -236,11 +250,17 @@ class LedgerReadService:
                     active_filters.strategy_id is None
                     or summary.strategy_id == active_filters.strategy_id
                 ):
-                    matched.append((summary, str(row["committed_at"]), str(row["prediction_id"])))
+                    matched.append(
+                        (
+                            summary,
+                            str(row["committed_sort_key"]),
+                            str(row["prediction_id"]),
+                        )
+                    )
                     if len(matched) > limit:
                         break
             last = rows[-1]
-            after_committed_at = str(last["committed_at"])
+            after_committed_at = str(last["committed_sort_key"])
             after_prediction_id = str(last["prediction_id"])
             exhausted = len(rows) < batch_size
 
@@ -266,6 +286,7 @@ class LedgerReadService:
             raise PredictionNotFoundError("committed prediction was not found")
         try:
             bundle = self._verify_bundle(row)
+            row = bundle.prediction
             created_at = _parse_time(row["created_at"], "prediction created_at")
             committed_at = _parse_time(row["committed_at"], "prediction committed_at")
             outcome = _optional_json_object(row["outcome_json"], "prediction outcome")
@@ -274,16 +295,6 @@ class LedgerReadService:
                 row["resolution_metadata_json"],
                 "prediction resolution metadata",
             )
-            violations = tuple(
-                IntegrityViolationProjection(
-                    field=item["field"],
-                    detected_at=_parse_time(item["detected_at"], "violation detected_at"),
-                    note=item["note"],
-                )
-                for item in self.registry.list_integrity_violations(prediction_id)
-            )
-            if violations:
-                raise _ProjectionFailure(IntegrityReason.QUARANTINED)
         except _ProjectionFailure as exc:
             logger.warning(
                 "ledger_prediction_detail_unverified",
@@ -348,6 +359,7 @@ class LedgerReadService:
                 extra={"prediction_id": row["prediction_id"]},
             )
             return self._failed_summary(row, IntegrityReason.REGISTRY_UNVERIFIED)
+        row = bundle.prediction
         return PredictionSummary(
             prediction_id=row["prediction_id"],
             run_id=row["run_id"],
@@ -405,14 +417,34 @@ class LedgerReadService:
         )
 
     def _verify_bundle(self, row: sqlite3.Row) -> _VerifiedBundle:
+        with self.registry.read_transaction() as connection:
+            prediction = self.registry.get_prediction(
+                row["prediction_id"],
+                connection=connection,
+            )
+            if prediction is None or prediction["transaction_state"] != "committed":
+                raise _ProjectionFailure(IntegrityReason.REGISTRY_UNVERIFIED)
+            return self._verify_bundle_in_snapshot(prediction, connection=connection)
+
+    def _verify_bundle_in_snapshot(
+        self,
+        row: sqlite3.Row,
+        *,
+        connection: sqlite3.Connection,
+    ) -> _VerifiedBundle:
         if row["status"] == PredictionStatus.QUARANTINED.value:
             raise _ProjectionFailure(IntegrityReason.QUARANTINED)
-        if self.registry.list_integrity_violations(row["prediction_id"]):
+        if self.registry.list_integrity_violations(
+            row["prediction_id"],
+            connection=connection,
+        ):
             raise _ProjectionFailure(IntegrityReason.QUARANTINED)
 
         record_path = self.records_dir / f"{row['prediction_id']}.md"
         try:
             verification = self.verifier.verify(record_path, row)
+        except SnapshotReadLimitError:
+            raise _ProjectionFailure(IntegrityReason.SNAPSHOT_UNVERIFIED) from None
         except (OSError, TypeError, ValueError):
             raise _ProjectionFailure(IntegrityReason.RECORD_UNVERIFIED) from None
         if not verification.verified or verification.evidence is None:
@@ -434,7 +466,8 @@ class LedgerReadService:
 
         try:
             snapshot = StrategySnapshot.model_validate(evidence.snapshot)
-        except ValidationError:
+            decision_at = _parse_time(row["created_at"], "prediction created_at")
+        except (IntegrityError, ValidationError):
             raise _ProjectionFailure(IntegrityReason.SNAPSHOT_UNVERIFIED) from None
         expected_is = SnapshotDateWindow(
             start=evidence.forecast.in_sample_window.start,
@@ -448,16 +481,17 @@ class LedgerReadService:
             snapshot.strategy_id != evidence.forecast.strategy_id
             or snapshot.in_sample_window != expected_is
             or snapshot.out_of_sample_window != expected_oos
+            or snapshot.data_as_of_version.astimezone(UTC) != decision_at
         ):
             raise _ProjectionFailure(IntegrityReason.SNAPSHOT_UNVERIFIED)
 
-        run_row = self.registry.get_run(row["run_id"])
+        run_row = self.registry.get_run(row["run_id"], connection=connection)
         try:
             run = _verify_run(row, run_row, snapshot)
         except (IntegrityError, KeyError, TypeError, ValueError, ValidationError):
             raise _ProjectionFailure(IntegrityReason.RUN_UNVERIFIED) from None
 
-        result_row = self.registry.get_run_result(row["run_id"])
+        result_row = self.registry.get_run_result(row["run_id"], connection=connection)
         result = None
         if result_row is not None:
             try:
@@ -471,7 +505,13 @@ class LedgerReadService:
                     raise IntegrityError("result snapshot differs from prediction snapshot")
             except IntegrityError:
                 raise _ProjectionFailure(IntegrityReason.RESULT_UNVERIFIED) from None
-        return _VerifiedBundle(evidence=evidence, snapshot=snapshot, run=run, result=result)
+        return _VerifiedBundle(
+            prediction=row,
+            evidence=evidence,
+            snapshot=snapshot,
+            run=run,
+            result=result,
+        )
 
 
 def _verify_run(
@@ -487,8 +527,11 @@ def _verify_run(
         raise IntegrityError("prediction is missing its allocated run")
     state = RunState(run["state"])
     started_at = _parse_time(run["started_at"], "run started_at")
-    execution_started_at = _optional_time(run["execution_started_at"])
-    completed_at = _optional_time(run["completed_at"])
+    execution_started_at = _parse_optional_time(
+        run["execution_started_at"],
+        "run execution_started_at",
+    )
+    completed_at = _parse_optional_time(run["completed_at"], "run completed_at")
 
     binding_fields = (
         "idempotency_key",
@@ -642,6 +685,12 @@ def _optional_time(value: object) -> datetime | None:
         return _parse_time(value, "timestamp")
     except IntegrityError:
         return None
+
+
+def _parse_optional_time(value: object, name: str) -> datetime | None:
+    if value is None:
+        return None
+    return _parse_time(value, name)
 
 
 def _urlsafe_encode(value: bytes) -> str:

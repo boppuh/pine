@@ -108,11 +108,14 @@ def create_app(
     reads = read_service or LedgerReadService(
         capture_service.writer.vault_root,
         cursor_secret=token,
+        records_dir=capture_service.writer.records_dir,
         registry=capture_service.registry,
         schema_registry=capture_service.schema_registry,
     )
     if reads.vault_root != capture_service.writer.vault_root:
         raise ValueError("read and capture services must use the same vault root")
+    if reads.records_dir != capture_service.writer.records_dir:
+        raise ValueError("read and capture services must use the same record directory")
     app = FastAPI(
         title="Decision Edge Ledger",
         version=API_VERSION,

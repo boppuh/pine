@@ -3,8 +3,9 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import sqlite3
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ import yaml
 from fastapi.testclient import TestClient
 from pydantic import JsonValue
 
+import ledger.record_integrity as record_integrity
 from ledger.api import create_app
 from ledger.capture import CaptureService
 from ledger.errors import IntegrityError, ReadCursorError
@@ -23,7 +25,7 @@ from ledger.read_models import IntegrityReason, IntegrityState, ResultState
 from ledger.read_service import LedgerReadService, PredictionListFilters
 from ledger.record_integrity import ImmutableEvidenceVerifier
 from ledger.results import MSMResultIngestor
-from ledger.run import PreregisteredRunRequest, RunService
+from ledger.run import PreregisteredRunRequest, RunService, RunState
 from ledger.snapshot import PendingPrediction
 from ledger.writer import LedgerWriter
 
@@ -110,6 +112,31 @@ def _draft(
             "created_at": DECISION_AT.isoformat(),
         }
     )
+
+
+def _write_at(
+    writer: LedgerWriter,
+    draft: PredictionDraft,
+    committed_at: datetime,
+) -> None:
+    connection = writer.registry.connect()
+    staged = None
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        staged = writer.stage_in_transaction(
+            draft,
+            connection=connection,
+            committed_at=committed_at,
+        )
+        connection.commit()
+        staged.finalize()
+    except BaseException:
+        connection.rollback()
+        if staged is not None:
+            staged.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def _registry_state(registry) -> dict[str, list[tuple[Any, ...]] | int]:
@@ -241,6 +268,48 @@ def test_tampered_evidence_fails_closed_without_quarantine_side_effect(
     assert _registry_state(writer.registry) == before
 
 
+def test_snapshot_read_limit_fails_closed_without_quarantine(
+    vault: Path,
+    valid_forecast: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = LedgerWriter(vault)
+    draft = _draft(valid_forecast, "pred_snapshot_limit")
+    writer.write(draft)
+    before = _registry_state(writer.registry)
+    monkeypatch.setattr(record_integrity, "_MAX_SNAPSHOT_BYTES", 1)
+    service = LedgerReadService(vault, cursor_secret=TOKEN, registry=writer.registry)
+
+    page = service.list_predictions()
+
+    assert page.items[0].integrity_state is IntegrityState.FAILED
+    assert page.items[0].integrity_reason is IntegrityReason.SNAPSHOT_UNVERIFIED
+    with pytest.raises(IntegrityError, match="snapshot_unverified"):
+        service.get_prediction(draft.prediction_id)
+    assert _registry_state(writer.registry) == before
+
+
+def test_snapshot_decision_time_mismatch_fails_verification(
+    vault: Path,
+    valid_forecast: dict[str, object],
+) -> None:
+    writer = LedgerWriter(vault)
+    payload = _draft(valid_forecast, "pred_decision_time").model_dump(mode="json")
+    snapshot = payload["snapshot"]
+    assert isinstance(snapshot, dict)
+    snapshot["data_as_of_version"] = (DECISION_AT - timedelta(seconds=1)).isoformat()
+    draft = PredictionDraft.model_validate(payload)
+    writer.write(draft)
+    service = LedgerReadService(vault, cursor_secret=TOKEN, registry=writer.registry)
+
+    page = service.list_predictions()
+
+    assert page.items[0].integrity_state is IntegrityState.FAILED
+    assert page.items[0].integrity_reason is IntegrityReason.SNAPSHOT_UNVERIFIED
+    with pytest.raises(IntegrityError, match="snapshot_unverified"):
+        service.get_prediction(draft.prediction_id)
+
+
 def test_pure_artifact_verifier_reports_damage_without_writing_registry(
     vault: Path,
     valid_forecast: dict[str, object],
@@ -338,6 +407,35 @@ def test_cursor_pagination_and_filters_are_stable_and_bound(
         service.list_predictions(limit=1, cursor=first.next_cursor[:-1] + replacement)
 
 
+def test_cursor_orders_offset_timestamps_by_utc_instant(
+    vault: Path,
+    valid_forecast: dict[str, object],
+) -> None:
+    writer = LedgerWriter(vault)
+    older = _draft(valid_forecast, "pred_offset_older")
+    newer = _draft(valid_forecast, "pred_offset_newer")
+    _write_at(
+        writer,
+        older,
+        datetime(2026, 7, 17, 16, 0, tzinfo=UTC).astimezone(timezone(timedelta(hours=2))),
+    )
+    _write_at(
+        writer,
+        newer,
+        datetime(2026, 7, 17, 17, 0, tzinfo=UTC).astimezone(timezone(timedelta(hours=-5))),
+    )
+    service = LedgerReadService(vault, cursor_secret=TOKEN, registry=writer.registry)
+
+    first = service.list_predictions(limit=1)
+    assert first.next_cursor is not None
+    second = service.list_predictions(limit=1, cursor=first.next_cursor)
+
+    assert [first.items[0].prediction_id, second.items[0].prediction_id] == [
+        newer.prediction_id,
+        older.prediction_id,
+    ]
+
+
 def test_quarantined_predictions_require_explicit_filter_and_remain_untrusted(
     vault: Path,
     valid_forecast: dict[str, object],
@@ -364,6 +462,106 @@ def test_quarantined_predictions_require_explicit_filter_and_remain_untrusted(
     assert item.strategy_id is None
     with pytest.raises(IntegrityError, match="quarantined"):
         service.get_prediction(draft.prediction_id)
+
+
+@pytest.mark.parametrize("field", ["execution_started_at", "completed_at"])
+def test_malformed_optional_run_timestamp_fails_verification(
+    vault: Path,
+    valid_forecast: dict[str, object],
+    field: str,
+) -> None:
+    writer = LedgerWriter(vault)
+    draft = _draft(valid_forecast, f"pred_bad_{field}")
+    writer.write(draft)
+    connection = writer.registry.connect()
+    try:
+        connection.execute("DROP TRIGGER runs_lifecycle_transitions")
+        connection.execute(
+            f"UPDATE runs SET {field} = ? WHERE run_id = ?",
+            ("not-a-timestamp", draft.run_id),
+        )
+    finally:
+        connection.close()
+    service = LedgerReadService(vault, cursor_secret=TOKEN, registry=writer.registry)
+
+    page = service.list_predictions()
+
+    assert page.items[0].integrity_state is IntegrityState.FAILED
+    assert page.items[0].integrity_reason is IntegrityReason.RUN_UNVERIFIED
+    with pytest.raises(IntegrityError, match="run_unverified"):
+        service.get_prediction(draft.prediction_id)
+
+
+def test_run_and_result_are_read_from_one_registry_snapshot(
+    vault: Path,
+    valid_forecast: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = LedgerWriter(vault)
+    draft = _draft(valid_forecast, "pred_consistent_snapshot")
+    writer.write(draft)
+    setup = writer.registry.connect()
+    try:
+        setup.execute("DROP TRIGGER runs_lifecycle_transitions")
+        setup.execute("DROP TRIGGER run_results_require_successful_bound_run")
+    finally:
+        setup.close()
+    original_get_run = writer.registry.get_run
+    mutated = False
+
+    def get_run_then_complete(
+        run_id: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> sqlite3.Row | None:
+        nonlocal mutated
+        run = original_get_run(run_id, connection=connection)
+        if not mutated:
+            mutated = True
+            writer_connection = writer.registry.connect()
+            try:
+                writer_connection.execute("BEGIN IMMEDIATE")
+                writer_connection.execute(
+                    """
+                    UPDATE runs
+                    SET state = 'completed', execution_started_at = ?, completed_at = ?,
+                        exit_code = 0, failure_note = NULL
+                    WHERE run_id = ?
+                    """,
+                    (
+                        (DECISION_AT + timedelta(seconds=1)).isoformat(),
+                        (DECISION_AT + timedelta(seconds=2)).isoformat(),
+                        run_id,
+                    ),
+                )
+                writer_connection.execute(
+                    """
+                    INSERT INTO run_results (
+                        run_id, evidence_hash, evidence_json, source_timestamp, ingested_at
+                    ) VALUES (?, ?, '{}', ?, ?)
+                    """,
+                    (
+                        run_id,
+                        f"sha256:{'f' * 64}",
+                        (DECISION_AT + timedelta(seconds=3)).isoformat(),
+                        (DECISION_AT + timedelta(seconds=4)).isoformat(),
+                    ),
+                )
+                writer_connection.commit()
+            finally:
+                writer_connection.close()
+        return run
+
+    monkeypatch.setattr(writer.registry, "get_run", get_run_then_complete)
+    service = LedgerReadService(vault, cursor_secret=TOKEN, registry=writer.registry)
+
+    page = service.list_predictions()
+
+    assert mutated is True
+    assert page.items[0].integrity_state is IntegrityState.VERIFIED
+    assert page.items[0].run_state is RunState.REGISTERED
+    assert page.items[0].result_state is ResultState.ABSENT
+    assert writer.registry.get_run_result(draft.run_id) is not None
 
 
 def _clean_git(_working_directory: Path) -> tuple[str, bool]:
@@ -570,6 +768,39 @@ def test_authenticated_read_api_exposes_list_detail_status_and_stable_errors(
     assert missing.json()["error"]["code"] == "prediction_not_found"
     assert invalid_cursor.status_code == 422
     assert invalid_cursor.json()["error"]["code"] == "invalid_cursor"
+
+
+def test_default_read_api_uses_capture_writer_record_directory(
+    vault: Path,
+    valid_forecast: dict[str, object],
+) -> None:
+    writer = LedgerWriter(vault, records_dir=vault / "research-records")
+    capture = CaptureService(vault, _FakeSnapshotProvider(), writer=writer)
+    extraction = ExtractionService(
+        vault,
+        _FakeExtractor(),
+        schema_registry=capture.schema_registry,
+        registry=capture.registry,
+    )
+    draft = _draft(valid_forecast, "pred_custom_records")
+    writer.write(draft)
+    app = create_app(
+        extraction_service=extraction,
+        capture_service=capture,
+        token=TOKEN,
+    )
+
+    with TestClient(app) as client:
+        listed = client.get("/v1/predictions", headers=AUTHORIZATION)
+        detail = client.get(
+            f"/v1/predictions/{draft.prediction_id}",
+            headers=AUTHORIZATION,
+        )
+
+    assert listed.status_code == 200
+    assert listed.json()["items"][0]["integrity_state"] == "verified"
+    assert detail.status_code == 200
+    assert detail.json()["prediction_id"] == draft.prediction_id
 
 
 def test_invalid_registry_snapshot_path_fails_closed(

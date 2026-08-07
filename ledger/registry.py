@@ -19,6 +19,18 @@ logger = logging.getLogger(__name__)
 
 _MIGRATION_VERSION = 7
 
+
+def _canonical_utc_timestamp(value: object) -> str:
+    """Return an aware ISO timestamp as a fixed-width UTC key for SQLite."""
+
+    if not isinstance(value, str):
+        raise ValueError("registry timestamp is not text")
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("registry timestamp is not timezone-aware")
+    return parsed.astimezone(UTC).isoformat(timespec="microseconds")
+
+
 _MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -474,6 +486,12 @@ class LedgerRegistry:
 
         connection = sqlite3.connect(self.db_path, timeout=30.0, isolation_level=None)
         connection.row_factory = sqlite3.Row
+        connection.create_function(
+            "pine_utc_timestamp",
+            1,
+            _canonical_utc_timestamp,
+            deterministic=True,
+        )
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")
         connection.execute("PRAGMA synchronous = FULL")
@@ -490,6 +508,21 @@ class LedgerRegistry:
         connection = self.connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            yield connection
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @contextmanager
+    def read_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Expose one consistent read snapshot across related registry queries."""
+
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
             yield connection
             connection.commit()
         except BaseException:
@@ -551,8 +584,9 @@ class LedgerRegistry:
             clauses.append(f"run_results.run_id {operator}")
         if after_committed_at is not None and after_prediction_id is not None:
             clauses.append(
-                "(predictions.committed_at < ? OR "
-                "(predictions.committed_at = ? AND predictions.prediction_id < ?))"
+                "(pine_utc_timestamp(predictions.committed_at) < ? OR "
+                "(pine_utc_timestamp(predictions.committed_at) = ? "
+                "AND predictions.prediction_id < ?))"
             )
             parameters.extend((after_committed_at, after_committed_at, after_prediction_id))
         parameters.append(limit)
@@ -562,13 +596,15 @@ class LedgerRegistry:
         try:
             return active.execute(
                 f"""
-                SELECT predictions.*, runs.state AS run_state,
+                SELECT predictions.*,
+                       pine_utc_timestamp(predictions.committed_at) AS committed_sort_key,
+                       runs.state AS run_state,
                        CASE WHEN run_results.run_id IS NULL THEN 0 ELSE 1 END AS has_result
                 FROM predictions
                 LEFT JOIN runs ON runs.run_id = predictions.run_id
                 LEFT JOIN run_results ON run_results.run_id = predictions.run_id
                 WHERE {" AND ".join(clauses)}
-                ORDER BY predictions.committed_at DESC, predictions.prediction_id DESC
+                ORDER BY committed_sort_key DESC, predictions.prediction_id DESC
                 LIMIT ?
                 """,
                 parameters,

@@ -45,6 +45,10 @@ class IntegrityCheckState(StrEnum):
     ERROR = "error"
 
 
+class SnapshotReadLimitError(Exception):
+    """Signal that snapshot verification was bounded by read policy, not damage."""
+
+
 @dataclass(frozen=True, slots=True)
 class IntegrityCheckResult:
     """Structured result suitable for gating a later indexing callback."""
@@ -231,7 +235,7 @@ class ImmutableEvidenceVerifier:
         except FileNotFoundError:
             return None, "committed snapshot is missing"
         if len(raw) > _MAX_SNAPSHOT_BYTES:
-            return None, "committed snapshot exceeds the read limit"
+            raise SnapshotReadLimitError("committed snapshot exceeds the read limit")
         try:
             snapshot = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError):
