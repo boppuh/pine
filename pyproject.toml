@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.139,<1",
   "filelock>=3.15,<4",
+  "httpx>=0.28,<1",
   "jsonschema[format]>=4.22,<5",
   "openai>=2.46,<3",
   "pydantic>=2.7,<3",
@@ -24,6 +25,7 @@ msm-ledger = "ledger.cli:main"
 pine-ledger-backend = "ledger.backend_cli:main"
 pine-ledger-backup = "ledger.backup_cli:main"
 pine-obsidian-bridge = "ledger.bridge_cli:main"
+pine-research-console = "ledger.console_cli:main"
 
 [project.optional-dependencies]
 dev = [
