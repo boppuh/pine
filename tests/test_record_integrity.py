@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 import yaml
 
+import ledger.record_integrity as record_integrity
 from ledger.integrity import PredictionStatus
 from ledger.record_integrity import (
     IntegrityCheckState,
@@ -135,6 +136,10 @@ def test_body_and_mutable_projection_edits_do_not_quarantine(vault: Path, draft)
             lambda item: item.__setitem__("snapshot_ref", ".ledger/snapshots/other.json"),
             {"immutable_payload", "snapshot_ref"},
         ),
+        (
+            lambda item: item.__setitem__("created_at", "2020-01-01T00:00:00+00:00"),
+            {"created_at"},
+        ),
     ],
 )
 def test_immutable_frontmatter_edit_quarantines(
@@ -252,6 +257,26 @@ def test_checker_error_never_allows_reindex(vault: Path, draft, monkeypatch) -> 
 
     assert result.state is IntegrityCheckState.ERROR
     assert result.may_reindex is False
+
+
+def test_snapshot_read_limit_is_not_quarantined_as_damage(
+    vault: Path,
+    draft,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = LedgerWriter(vault)
+    written = writer.write(draft)
+    checker = RecordIntegrityChecker(vault, registry=writer.registry)
+    monkeypatch.setattr(record_integrity, "_MAX_SNAPSHOT_BYTES", 1)
+
+    result = checker.check_record(_record_event(written.record_path, draft.prediction_id))
+
+    assert result.state is IntegrityCheckState.ERROR
+    assert result.may_reindex is False
+    assert _violation_fields(writer, draft.prediction_id) == []
+    row = writer.registry.get_prediction(draft.prediction_id)
+    assert row is not None
+    assert row["status"] == PredictionStatus.OPEN.value
 
 
 def test_real_watcher_callback_quarantines_frontmatter_edit(vault: Path, draft) -> None:

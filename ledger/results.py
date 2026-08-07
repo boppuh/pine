@@ -156,6 +156,17 @@ class MSMResultIngestResult:
     created: bool
 
 
+@dataclass(frozen=True, slots=True)
+class VerifiedStoredRunResult:
+    """Typed result evidence verified against its hash, run, and snapshot."""
+
+    evidence: MSMRunResultEvidence
+    evidence_hash: str
+    source_timestamp: datetime
+    ingested_at: datetime
+    snapshot: StrategySnapshot
+
+
 class MSMResultIngestor:
     """Validate and permanently attach canonical result evidence to a successful run."""
 
@@ -325,6 +336,31 @@ class MSMResultIngestor:
         created: bool,
         snapshot: StrategySnapshot | None = None,
     ) -> MSMResultIngestResult:
+        verified = cls.verify_stored_result(row, run, snapshot=snapshot)
+        evidence = verified.evidence
+        return MSMResultIngestResult(
+            run_id=evidence.run_id,
+            prediction_id=evidence.prediction_id,
+            registration_status=evidence.registration_status,
+            strategy_id=evidence.strategy_id,
+            dataset_version=evidence.dataset_version,
+            envelope_hash=evidence.envelope_hash,
+            evidence_hash=verified.evidence_hash,
+            source_timestamp=verified.source_timestamp,
+            ingested_at=verified.ingested_at,
+            created=created,
+        )
+
+    @classmethod
+    def verify_stored_result(
+        cls,
+        row: sqlite3.Row,
+        run: sqlite3.Row | None,
+        *,
+        snapshot: StrategySnapshot | None = None,
+    ) -> VerifiedStoredRunResult:
+        """Verify stored result evidence without mutating registry or filesystem state."""
+
         try:
             payload = json.loads(row["evidence_json"])
         except (TypeError, json.JSONDecodeError) as exc:
@@ -350,15 +386,10 @@ class MSMResultIngestor:
         if source_timestamp.astimezone(UTC) != evidence.source_timestamp.astimezone(UTC):
             raise IntegrityError("stored result source timestamp does not match its evidence")
         cls._validate_times(evidence, run, ingested_at)
-        return MSMResultIngestResult(
-            run_id=evidence.run_id,
-            prediction_id=evidence.prediction_id,
-            registration_status=evidence.registration_status,
-            strategy_id=evidence.strategy_id,
-            dataset_version=evidence.dataset_version,
-            envelope_hash=evidence.envelope_hash,
+        return VerifiedStoredRunResult(
+            evidence=evidence,
             evidence_hash=row["evidence_hash"],
             source_timestamp=source_timestamp,
             ingested_at=ingested_at,
-            created=created,
+            snapshot=verified_snapshot,
         )
