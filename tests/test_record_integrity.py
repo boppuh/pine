@@ -135,6 +135,10 @@ def test_body_and_mutable_projection_edits_do_not_quarantine(vault: Path, draft)
             lambda item: item.__setitem__("snapshot_ref", ".ledger/snapshots/other.json"),
             {"immutable_payload", "snapshot_ref"},
         ),
+        (
+            lambda item: item.__setitem__("created_at", "2020-01-01T00:00:00+00:00"),
+            {"created_at"},
+        ),
     ],
 )
 def test_immutable_frontmatter_edit_quarantines(

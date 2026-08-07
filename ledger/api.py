@@ -5,9 +5,9 @@ from __future__ import annotations
 import logging
 import secrets
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
@@ -18,6 +18,8 @@ from ledger.errors import (
     FreshWindowError,
     IdempotencyConflictError,
     IntegrityError,
+    PredictionNotFoundError,
+    ReadCursorError,
     SchemaNotFoundError,
     SnapshotCaptureError,
 )
@@ -26,7 +28,13 @@ from ledger.extraction import (
     ExtractionService,
     HypothesisExtractionRequest,
 )
-from ledger.integrity import PreregisteredCaptureRequest
+from ledger.integrity import (
+    PredictionStatus,
+    PreregisteredCaptureRequest,
+    RegistrationStatus,
+)
+from ledger.read_models import LedgerStatus, PredictionDetail, PredictionPage, ResultState
+from ledger.read_service import LedgerReadService, PredictionListFilters
 from ledger.writer import WriteResult
 
 logger = logging.getLogger(__name__)
@@ -89,6 +97,7 @@ def create_app(
     extraction_service: ExtractionService,
     capture_service: CaptureService,
     token: str,
+    read_service: LedgerReadService | None = None,
 ) -> FastAPI:
     """Create the local ASGI application with closed-by-default write access."""
 
@@ -96,6 +105,14 @@ def create_app(
         raise ValueError("backend token must be at least 32 non-whitespace ASCII characters")
     if extraction_service.vault_root != capture_service.writer.vault_root:
         raise ValueError("extraction and capture services must use the same vault root")
+    reads = read_service or LedgerReadService(
+        capture_service.writer.vault_root,
+        cursor_secret=token,
+        registry=capture_service.registry,
+        schema_registry=capture_service.schema_registry,
+    )
+    if reads.vault_root != capture_service.writer.vault_root:
+        raise ValueError("read and capture services must use the same vault root")
     app = FastAPI(
         title="Decision Edge Ledger",
         version=API_VERSION,
@@ -166,6 +183,17 @@ def create_app(
     async def integrity_handler(_request: Request, exc: IntegrityError) -> JSONResponse:
         return _error_response(409, "integrity_error", str(exc))
 
+    @app.exception_handler(PredictionNotFoundError)
+    async def prediction_not_found_handler(
+        _request: Request,
+        exc: PredictionNotFoundError,
+    ) -> JSONResponse:
+        return _error_response(404, "prediction_not_found", str(exc))
+
+    @app.exception_handler(ReadCursorError)
+    async def read_cursor_handler(_request: Request, exc: ReadCursorError) -> JSONResponse:
+        return _error_response(422, "invalid_cursor", str(exc))
+
     @app.exception_handler(Exception)
     async def unexpected_handler(request: Request, exc: Exception) -> JSONResponse:
         logger.exception(
@@ -194,6 +222,51 @@ def create_app(
     def create_capture(request: PreregisteredCaptureRequest) -> CaptureResponse:
         result = capture_service.capture(request)
         return _capture_response(result, capture_service)
+
+    @app.get(
+        "/v1/predictions",
+        response_model=PredictionPage,
+        dependencies=[Depends(require_token)],
+    )
+    def list_predictions(
+        limit: Annotated[int, Query(ge=1, le=100)] = 25,
+        cursor: Annotated[str | None, Query(max_length=4096)] = None,
+        registration_status: RegistrationStatus | None = None,
+        status: PredictionStatus | None = None,
+        strategy_id: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
+        result_state: ResultState | None = None,
+    ) -> PredictionPage:
+        try:
+            filters = PredictionListFilters(
+                registration_status=registration_status,
+                status=status,
+                strategy_id=strategy_id,
+                result_state=result_state,
+            )
+        except ValueError as exc:
+            raise _APIException(
+                status_code=422,
+                code="invalid_request",
+                message="request validation failed",
+                details=(str(exc),),
+            ) from exc
+        return reads.list_predictions(limit=limit, cursor=cursor, filters=filters)
+
+    @app.get(
+        "/v1/predictions/{prediction_id}",
+        response_model=PredictionDetail,
+        dependencies=[Depends(require_token)],
+    )
+    def get_prediction(prediction_id: str) -> PredictionDetail:
+        return reads.get_prediction(prediction_id)
+
+    @app.get(
+        "/v1/status",
+        response_model=LedgerStatus,
+        dependencies=[Depends(require_token)],
+    )
+    def get_status() -> LedgerStatus:
+        return reads.get_status()
 
     return app
 

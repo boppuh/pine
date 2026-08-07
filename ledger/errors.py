@@ -40,3 +40,11 @@ class SnapshotCaptureError(IntegrityError):
 
 class RunStateError(IntegrityError):
     """Raised when a run cannot make the requested lifecycle transition."""
+
+
+class PredictionNotFoundError(LedgerError):
+    """Raised when a committed prediction is not available to the read API."""
+
+
+class ReadCursorError(LedgerError):
+    """Raised when a prediction-list cursor is malformed or used with new filters."""

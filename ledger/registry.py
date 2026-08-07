@@ -516,6 +516,121 @@ class LedgerRegistry:
             if owns_connection:
                 active.close()
 
+    def list_committed_predictions(
+        self,
+        *,
+        limit: int,
+        registration_status: str | None = None,
+        status: str | None = None,
+        result_state: str | None = None,
+        after_committed_at: str | None = None,
+        after_prediction_id: str | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> list[sqlite3.Row]:
+        """Return a deterministic keyset page of committed registry identities."""
+
+        if not 1 <= limit <= 100:
+            raise ValueError("prediction read limit must be between 1 and 100")
+        if (after_committed_at is None) != (after_prediction_id is None):
+            raise ValueError("prediction read cursor requires both sort fields")
+        if result_state not in (None, "present", "absent"):
+            raise ValueError("result_state must be present or absent")
+
+        clauses = ["predictions.transaction_state = 'committed'"]
+        parameters: list[Any] = []
+        if registration_status is not None:
+            clauses.append("predictions.registration_status = ?")
+            parameters.append(registration_status)
+        if status is None:
+            clauses.append("predictions.status != 'quarantined'")
+        else:
+            clauses.append("predictions.status = ?")
+            parameters.append(status)
+        if result_state is not None:
+            operator = "IS NOT NULL" if result_state == "present" else "IS NULL"
+            clauses.append(f"run_results.run_id {operator}")
+        if after_committed_at is not None and after_prediction_id is not None:
+            clauses.append(
+                "(predictions.committed_at < ? OR "
+                "(predictions.committed_at = ? AND predictions.prediction_id < ?))"
+            )
+            parameters.extend((after_committed_at, after_committed_at, after_prediction_id))
+        parameters.append(limit)
+
+        owns_connection = connection is None
+        active = connection or self.connect()
+        try:
+            return active.execute(
+                f"""
+                SELECT predictions.*, runs.state AS run_state,
+                       CASE WHEN run_results.run_id IS NULL THEN 0 ELSE 1 END AS has_result
+                FROM predictions
+                LEFT JOIN runs ON runs.run_id = predictions.run_id
+                LEFT JOIN run_results ON run_results.run_id = predictions.run_id
+                WHERE {" AND ".join(clauses)}
+                ORDER BY predictions.committed_at DESC, predictions.prediction_id DESC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        finally:
+            if owns_connection:
+                active.close()
+
+    def list_integrity_violations(
+        self,
+        prediction_id: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> list[sqlite3.Row]:
+        """Return immutable integrity evidence for one prediction in stable order."""
+
+        owns_connection = connection is None
+        active = connection or self.connect()
+        try:
+            return active.execute(
+                """
+                SELECT field, detected_at, note
+                FROM integrity_violations
+                WHERE prediction_id = ?
+                ORDER BY detected_at, field, note
+                """,
+                (prediction_id,),
+            ).fetchall()
+        finally:
+            if owns_connection:
+                active.close()
+
+    def get_read_status(self) -> dict[str, int]:
+        """Return non-secret registry counts used by the status projection."""
+
+        connection = self.connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN transaction_state = 'committed' THEN 1 ELSE 0 END)
+                        AS committed_predictions,
+                    SUM(CASE WHEN transaction_state = 'committed'
+                                  AND status = 'quarantined' THEN 1 ELSE 0 END)
+                        AS quarantined_predictions,
+                    (SELECT COUNT(*) FROM integrity_violations) AS integrity_violations,
+                    (SELECT COUNT(*) FROM run_results) AS run_results
+                FROM predictions
+                """
+            ).fetchone()
+            if row is None:  # pragma: no cover - aggregate SELECT always returns one row
+                raise IntegrityError("registry status query returned no row")
+            return {
+                "registry_version": int(connection.execute("PRAGMA user_version").fetchone()[0]),
+                "committed_predictions": int(row["committed_predictions"] or 0),
+                "quarantined_predictions": int(row["quarantined_predictions"] or 0),
+                "integrity_violations": int(row["integrity_violations"]),
+                "run_results": int(row["run_results"]),
+            }
+        finally:
+            connection.close()
+
     def get_prediction_by_idempotency_key(
         self,
         idempotency_key: str,
