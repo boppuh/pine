@@ -31,6 +31,11 @@ The installer creates:
 - `/etc/pine/backend.env` — root-readable provider configuration;
 - hardened backend, readiness, and backup systemd units.
 
+The shared virtual environment installs Pine and MSM editably from the immutable
+release checkouts. The installer rejects a runtime whose module paths resolve through
+copied `site-packages` trees instead of the pinned release sources, because MSM result
+evidence must inspect the exact Git checkout before emission.
+
 Use the host secret-management workflow to set `OPENAI_API_KEY` in
 `/etc/pine/backend.env`; do not put it in Git or shell history. Then start and verify:
 
