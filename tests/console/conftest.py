@@ -10,7 +10,12 @@ import pytest
 from ledger.api import CaptureResponse, HealthResponse
 from ledger.console.models import CaptureInput
 from ledger.console.state import ConsoleStateStore
-from ledger.extraction import DraftProposal, ExtractionResult, ExtractionStatus
+from ledger.extraction import (
+    DraftProposal,
+    ExtractionResult,
+    ExtractionStatus,
+    HypothesisExtractionRequest,
+)
 from ledger.integrity import PreregisteredCaptureRequest
 
 
@@ -29,15 +34,15 @@ class FakeBackend:
     def __init__(self, proposal: DraftProposal, response: CaptureResponse) -> None:
         self.proposal = proposal
         self.response = response
-        self.capture_outcomes: list[object] = []
-        self.draft_outcomes: list[object] = []
+        self.capture_outcomes: list[CaptureResponse | BaseException] = []
+        self.draft_outcomes: list[ExtractionResult | BaseException] = []
         self.capture_requests: list[PreregisteredCaptureRequest] = []
-        self.draft_requests: list[object] = []
+        self.draft_requests: list[HypothesisExtractionRequest] = []
 
     def health(self) -> HealthResponse:
         return HealthResponse()
 
-    def create_draft(self, request):
+    def create_draft(self, request: HypothesisExtractionRequest) -> ExtractionResult:
         self.draft_requests.append(request)
         if self.draft_outcomes:
             outcome = self.draft_outcomes.pop(0)

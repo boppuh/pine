@@ -143,9 +143,7 @@ class FrozenCaptureRequest(_ImmutableConsoleModel):
     @field_validator("idempotency_key")
     @classmethod
     def idempotency_key_is_console_owned(cls, value: str) -> str:
-        if not value.startswith("console-"):
-            raise ValueError("idempotency_key must be console-owned")
-        return value
+        return _validate_console_idempotency_key(value)
 
     @field_serializer("lineage")
     def serialize_lineage(self, value: FrozenDict) -> dict[str, JsonValue]:
@@ -208,12 +206,7 @@ class ConsoleWorkflow(_ImmutableConsoleModel):
     @field_validator("idempotency_key")
     @classmethod
     def idempotency_key_is_console_uuid(cls, value: str) -> str:
-        if not value.startswith("console-"):
-            raise ValueError("idempotency_key must be console-owned")
-        parsed = UUID(value.removeprefix("console-"))
-        if parsed.version != 4 or f"console-{parsed}" != value:
-            raise ValueError("idempotency_key must contain a canonical UUIDv4")
-        return value
+        return _validate_console_idempotency_key(value)
 
     @field_validator("created_at", "updated_at", "expires_at")
     @classmethod
@@ -242,8 +235,22 @@ class ConsoleWorkflow(_ImmutableConsoleModel):
             raise ValueError("only committed workflows may contain a receipt")
         if self.state in RECONCILIATION_STATES and self.expires_at is not None:
             raise ValueError("reconciliation workflow must not expire")
+        if self.state is WorkflowState.TERMINAL_FAILURE and self.expires_at is None:
+            raise ValueError("terminal failure workflow must expire")
         if self.state is WorkflowState.CANCELLED and (
             self.source_text is not None or self.proposal is not None
         ):
             raise ValueError("cancelled workflows must discard transient content")
         return self
+
+
+def _validate_console_idempotency_key(value: str) -> str:
+    if not value.startswith("console-"):
+        raise ValueError("idempotency_key must be console-owned")
+    try:
+        parsed = UUID(value.removeprefix("console-"))
+    except ValueError as exc:
+        raise ValueError("idempotency_key must contain a canonical UUIDv4") from exc
+    if parsed.version != 4 or f"console-{parsed}" != value:
+        raise ValueError("idempotency_key must contain a canonical UUIDv4")
+    return value

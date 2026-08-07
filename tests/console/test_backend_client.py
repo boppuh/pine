@@ -85,6 +85,13 @@ def test_capture_sends_canonical_bytes_once_and_accepts_additive_receipt(
     assert calls == [canonical_json(request.model_dump(mode="json")).encode()]
 
 
+def test_frozen_capture_requires_canonical_console_uuid(
+    capture_input: CaptureInput,
+) -> None:
+    with pytest.raises(ValueError, match="canonical UUIDv4"):
+        capture_input.freeze("console-not-a-uuid")
+
+
 def test_draft_response_is_strict_but_tolerates_additive_envelope_fields(
     tmp_path: Path,
     proposal: DraftProposal,
@@ -212,6 +219,49 @@ def test_structured_error_is_classified_and_sensitive_details_are_redacted(
     )
 
 
+@pytest.mark.parametrize(
+    ("status_code", "code"),
+    [(500, "internal_error"), (418, "future_error")],
+)
+def test_internal_and_unknown_errors_have_uncertain_disposition(
+    tmp_path: Path,
+    capture_input: CaptureInput,
+    status_code: int,
+    code: str,
+) -> None:
+    request = capture_input.freeze("console-00000000-0000-4000-8000-000000000001")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status_code,
+            json={"error": {"code": code, "message": "unverified", "details": []}},
+        )
+
+    with pytest.raises(BackendDomainError) as captured:
+        _client(tmp_path, handler).capture(request)
+
+    assert captured.value.disposition is FailureDisposition.UNCERTAIN
+
+
+def test_empty_backend_message_gets_a_safe_placeholder(
+    tmp_path: Path,
+    capture_input: CaptureInput,
+) -> None:
+    request = capture_input.freeze("console-00000000-0000-4000-8000-000000000001")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            418,
+            json={"error": {"code": "future_error", "message": " ", "details": ["  "]}},
+        )
+
+    with pytest.raises(BackendDomainError) as captured:
+        _client(tmp_path, handler).capture(request)
+
+    assert captured.value.message == "[empty backend detail]"
+    assert captured.value.details == ("[empty backend detail]",)
+
+
 def test_known_error_code_with_wrong_http_status_is_unverified(
     tmp_path: Path,
     capture_input: CaptureInput,
@@ -251,6 +301,74 @@ def test_transport_failure_is_not_retried_automatically(
     assert calls == 1
 
 
+def test_decoding_failure_is_classified_as_transport_failure(
+    tmp_path: Path,
+    capture_input: CaptureInput,
+) -> None:
+    request = capture_input.freeze("console-00000000-0000-4000-8000-000000000001")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-encoding": "gzip"},
+            content=b"not-a-gzip-stream",
+        )
+
+    with pytest.raises(BackendTransportError, match="not received"):
+        _client(tmp_path, handler).capture(request)
+
+
+def test_owned_client_disables_environment_proxy_inheritance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class ClientStub:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(httpx, "Client", ClientStub)
+    client = ConsoleBackendClient(_config(tmp_path), token=TOKEN)
+    client.close()
+
+    assert captured["follow_redirects"] is False
+    assert captured["trust_env"] is False
+
+
+def test_streamed_response_has_an_overall_deadline(tmp_path: Path) -> None:
+    class Clock:
+        value = 0.0
+
+        def __call__(self) -> float:
+            return self.value
+
+    clock = Clock()
+
+    class TrickleStream(httpx.SyncByteStream):
+        def __iter__(self):
+            clock.value += 2.0
+            yield b'{"status":"ok",'
+            clock.value += 2.0
+            yield b'"api_version":"v1"}'
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=TrickleStream())
+
+    client = ConsoleBackendClient(
+        _config(tmp_path),
+        token=TOKEN,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        monotonic_clock=clock,
+    )
+
+    with pytest.raises(BackendTransportError, match="overall deadline"):
+        client.health()
+
+
 def test_config_loads_private_credential_and_rejects_unsafe_networks(
     tmp_path: Path,
 ) -> None:
@@ -271,6 +389,13 @@ def test_config_loads_private_credential_and_rejects_unsafe_networks(
     unsafe = dict(environment, PINE_CONSOLE_BACKEND_URL="https://public.example.com")
     with pytest.raises(ConsoleConfigError, match="invalid"):
         ConsoleConfig.from_env(unsafe)
+    ledger_dir = tmp_path / "vault" / ".ledger"
+    ledger_dir.mkdir(parents=True)
+    state_link = tmp_path / "state-link"
+    state_link.symlink_to(ledger_dir, target_is_directory=True)
+    escaped = dict(environment, PINE_CONSOLE_STATE_PATH=str(state_link / "console.db"))
+    with pytest.raises(ConsoleConfigError, match="invalid"):
+        ConsoleConfig.from_env(escaped)
     credential.chmod(0o644)
     with pytest.raises(ConsoleConfigError, match="group/world"):
         config.read_backend_token()

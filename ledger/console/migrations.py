@@ -158,6 +158,13 @@ BEGIN
     SELECT RAISE(ABORT, 'reconciliation workflow cannot expire');
 END;
 
+CREATE TRIGGER workflows_terminal_failure_expires
+BEFORE UPDATE ON workflows
+WHEN NEW.state = 'terminal_failure' AND NEW.expires_at IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'terminal failure workflow must expire');
+END;
+
 CREATE TRIGGER workflows_cancelled_discards_content
 BEFORE UPDATE ON workflows
 WHEN NEW.state = 'cancelled'
@@ -168,7 +175,9 @@ END;
 
 CREATE TRIGGER workflows_protected_from_cleanup
 BEFORE DELETE ON workflows
-WHEN OLD.state NOT IN ('editing', 'reviewing', 'committed', 'cancelled')
+WHEN OLD.state NOT IN (
+    'editing', 'reviewing', 'terminal_failure', 'committed', 'cancelled'
+)
 BEGIN
     SELECT RAISE(ABORT, 'workflow state is protected from automatic cleanup');
 END;
@@ -180,26 +189,48 @@ _MIGRATIONS = {1: _MIGRATION_1}
 def migrate(connection: sqlite3.Connection) -> int:
     """Migrate an empty or supported console database to the current version."""
 
-    current = schema_version(connection)
-    if current > CONSOLE_SCHEMA_VERSION:
-        raise ConsoleStateError(
-            f"console schema {current} is newer than supported {CONSOLE_SCHEMA_VERSION}"
-        )
-    for version in range(current + 1, CONSOLE_SCHEMA_VERSION + 1):
-        script = _MIGRATIONS[version]
-        try:
-            connection.executescript(
-                "BEGIN IMMEDIATE;\n"
-                f"{script}\n"
-                "INSERT INTO console_schema_migrations (version, applied_at) "
-                f"VALUES ({version}, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));\n"
-                f"PRAGMA user_version = {version};\n"
-                "COMMIT;"
+    version = 0
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        current = schema_version(connection)
+        if current > CONSOLE_SCHEMA_VERSION:
+            raise ConsoleStateError(
+                f"console schema {current} is newer than supported {CONSOLE_SCHEMA_VERSION}"
             )
-        except sqlite3.DatabaseError as exc:
-            connection.rollback()
-            raise ConsoleStateError(f"console schema migration {version} failed") from exc
+        for version in range(current + 1, CONSOLE_SCHEMA_VERSION + 1):
+            for statement in _migration_statements(_MIGRATIONS[version]):
+                connection.execute(statement)
+            connection.execute(
+                "INSERT INTO console_schema_migrations (version, applied_at) "
+                "VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                (version,),
+            )
+            connection.execute(f"PRAGMA user_version = {version}")
+        connection.commit()
+    except ConsoleStateError:
+        connection.rollback()
+        raise
+    except sqlite3.DatabaseError as exc:
+        connection.rollback()
+        raise ConsoleStateError(f"console schema migration {version} failed") from exc
     return CONSOLE_SCHEMA_VERSION
+
+
+def _migration_statements(script: str) -> tuple[str, ...]:
+    """Split a trusted migration script without breaking trigger bodies."""
+
+    statements: list[str] = []
+    pending = ""
+    for line in script.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            statement = pending.strip()
+            if statement:
+                statements.append(statement)
+            pending = ""
+    if pending.strip():
+        raise ConsoleStateError("console migration contains an incomplete statement")
+    return tuple(statements)
 
 
 def schema_version(connection: sqlite3.Connection) -> int:

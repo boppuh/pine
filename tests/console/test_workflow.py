@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import sqlite3
 import threading
 from pathlib import Path
@@ -171,6 +172,26 @@ def test_backend_failures_are_classified_without_changing_frozen_request(
             service.retry(failed.workflow_id, failed.user_id)
 
 
+def test_unexpected_capture_failure_logs_a_redacted_traceback(
+    console_store: ConsoleStateStore,
+    fake_backend: FakeBackend,
+    proposal: DraftProposal,
+    capture_input: CaptureInput,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    unsafe_message = "backend-token-sensitive-value"
+    fake_backend.capture_outcomes = [RuntimeError(unsafe_message)]
+    service = WorkflowService(console_store, fake_backend)
+    reviewing = _ready_workflow(service, proposal)
+
+    with caplog.at_level(logging.ERROR, logger="ledger.console.workflow"):
+        failed = service.confirm(reviewing.workflow_id, reviewing.user_id, capture_input)
+
+    assert failed.state is WorkflowState.UNCERTAIN
+    assert unsafe_message not in caplog.text
+    assert "RuntimeError: details redacted" in caplog.text
+
+
 def test_process_interruption_is_recovered_to_uncertain_without_backend_lookup(
     console_store: ConsoleStateStore,
     fake_backend: FakeBackend,
@@ -184,6 +205,7 @@ def test_process_interruption_is_recovered_to_uncertain_without_backend_lookup(
     with pytest.raises(KeyboardInterrupt):
         service.confirm(reviewing.workflow_id, reviewing.user_id, capture_input)
     interrupted = console_store.get_workflow(reviewing.workflow_id, reviewing.user_id)
+    assert interrupted.frozen_request is not None
     frozen_json = canonical_json(interrupted.frozen_request.model_dump(mode="json"))
     assert interrupted.state is WorkflowState.SUBMITTING
 
@@ -193,6 +215,7 @@ def test_process_interruption_is_recovered_to_uncertain_without_backend_lookup(
     assert recovered_counts["submitting_to_uncertain"] == 1
     assert recovered.state is WorkflowState.UNCERTAIN
     assert recovered.expires_at is None
+    assert recovered.frozen_request is not None
     assert canonical_json(recovered.frozen_request.model_dump(mode="json")) == frozen_json
     assert len(fake_backend.capture_requests) == 1
 

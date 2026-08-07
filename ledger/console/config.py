@@ -53,10 +53,13 @@ class ConsoleConfig(BaseModel):
             not normalized
             or len(normalized) > 253
             or normalized != value
-            or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-." for character in value)
-            or value.startswith(".")
-            or value.endswith(".")
-            or ".." in value
+            or any(
+                character not in "abcdefghijklmnopqrstuvwxyz0123456789-."
+                for character in normalized
+            )
+            or normalized.startswith(".")
+            or normalized.endswith(".")
+            or ".." in normalized
         ):
             raise ValueError("allowed_host must be one normalized DNS hostname")
         return normalized
@@ -87,9 +90,18 @@ class ConsoleConfig(BaseModel):
             raise ValueError("console socket path must end in .sock")
         if self.state_path.suffix != ".db":
             raise ValueError("console state path must end in .db")
-        if ".ledger" in self.state_path.parts:
+        try:
+            resolved_state_path = self.state_path.resolve(strict=False)
+            resolved_paths = {
+                self.socket_path.resolve(strict=False),
+                resolved_state_path,
+                self.backend_credential_path.resolve(strict=False),
+            }
+        except OSError as exc:
+            raise ValueError("console paths could not be resolved safely") from exc
+        if ".ledger" in resolved_state_path.parts:
             raise ValueError("console state must live outside the authoritative ledger")
-        if len({self.socket_path, self.state_path, self.backend_credential_path}) != 3:
+        if len(resolved_paths) != 3:
             raise ValueError("console socket, state, and credential paths must be distinct")
         if self.session_idle_minutes >= self.session_absolute_minutes:
             raise ValueError("session idle lifetime must be shorter than absolute lifetime")

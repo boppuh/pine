@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from pathlib import PurePosixPath
 from typing import Any, Protocol
 
@@ -147,6 +148,7 @@ class ConsoleBackendClient:
         *,
         token: str | None = None,
         client: httpx.Client | None = None,
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.config = config
         self._token = token if token is not None else config.read_backend_token()
@@ -157,8 +159,9 @@ class ConsoleBackendClient:
             or any(character.isspace() for character in self._token)
         ):
             raise ValueError("backend token format is invalid")
-        self._client = client or httpx.Client(follow_redirects=False)
+        self._client = client or httpx.Client(follow_redirects=False, trust_env=False)
         self._owns_client = client is None
+        self._monotonic = monotonic_clock
 
     def close(self) -> None:
         """Close the owned HTTP connection pool."""
@@ -251,6 +254,7 @@ class ConsoleBackendClient:
         if body is not None:
             headers["content-type"] = "application/json"
             content = canonical_json(body).encode("utf-8")
+        deadline = self._monotonic() + timeout
         try:
             with self._client.stream(
                 method,
@@ -261,8 +265,12 @@ class ConsoleBackendClient:
             ) as response:
                 status_code = response.status_code
                 is_error = response.is_error
-                raw = _read_response_bytes(response)
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
+                raw = _read_response_bytes(
+                    response,
+                    deadline=deadline,
+                    monotonic_clock=self._monotonic,
+                )
+        except httpx.RequestError as exc:
             raise BackendTransportError("backend response was not received") from exc
         payload = _response_object(raw)
         if is_error:
@@ -290,6 +298,9 @@ def sanitize_backend_details(details: tuple[str, ...]) -> tuple[str, ...]:
     sanitized: list[str] = []
     for detail in details[:20]:
         normalized = detail.strip()[:500]
+        if not normalized:
+            sanitized.append("[empty backend detail]")
+            continue
         if _SECRET_PATTERN.search(normalized):
             sanitized.append("[redacted sensitive backend detail]")
             continue
@@ -297,7 +308,14 @@ def sanitize_backend_details(details: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(sanitized)
 
 
-def _read_response_bytes(response: httpx.Response) -> bytes:
+def _read_response_bytes(
+    response: httpx.Response,
+    *,
+    deadline: float,
+    monotonic_clock: Callable[[], float],
+) -> bytes:
+    if monotonic_clock() >= deadline:
+        raise BackendTransportError("backend response exceeded the overall deadline")
     content_length = response.headers.get("content-length")
     if content_length is not None:
         try:
@@ -308,9 +326,13 @@ def _read_response_bytes(response: httpx.Response) -> bytes:
             raise BackendProtocolError("backend response exceeds the read limit")
     raw = bytearray()
     for chunk in response.iter_bytes():
+        if monotonic_clock() >= deadline:
+            raise BackendTransportError("backend response exceeded the overall deadline")
         raw.extend(chunk)
         if len(raw) > _MAX_RESPONSE_BYTES:
             raise BackendProtocolError("backend response exceeds the read limit")
+    if monotonic_clock() >= deadline:
+        raise BackendTransportError("backend response exceeded the overall deadline")
     return bytes(raw)
 
 

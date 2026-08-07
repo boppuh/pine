@@ -85,10 +85,11 @@ class WorkflowService:
                 code="backend_unavailable",
                 details=("extraction may be started again",),
             )
-        except Exception:
-            logger.error(
+        except Exception as exc:
+            logger.exception(
                 "console_extraction_unexpected_failure",
                 extra={"workflow_id": workflow_id},
+                exc_info=_redacted_exception(exc),
             )
             return self.store.fail_extraction(
                 workflow_id,
@@ -194,10 +195,11 @@ class WorkflowService:
                 code="backend_response_unverified",
                 details=("capture outcome requires exact replay",),
             )
-        except Exception:
-            logger.error(
+        except Exception as exc:
+            logger.exception(
                 "console_capture_unexpected_failure",
                 extra={"workflow_id": workflow.workflow_id},
+                exc_info=_redacted_exception(exc),
             )
             return self.store.record_capture_failure(
                 workflow.workflow_id,
@@ -224,3 +226,10 @@ def _failure_state(disposition: FailureDisposition) -> WorkflowState:
     if disposition is FailureDisposition.RETRYABLE:
         return WorkflowState.RETRYABLE_FAILURE
     return WorkflowState.UNCERTAIN
+
+
+def _redacted_exception(exc: Exception) -> RuntimeError:
+    """Retain an internal traceback without logging an exception's unsafe message."""
+
+    sanitized = RuntimeError(f"{type(exc).__name__}: details redacted")
+    return sanitized.with_traceback(exc.__traceback__)

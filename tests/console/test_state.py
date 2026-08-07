@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import stat
+import threading
 from datetime import timedelta
 from pathlib import Path
 
@@ -69,6 +70,49 @@ def test_unversioned_or_newer_database_fails_closed(tmp_path: Path) -> None:
         ConsoleStateStore(current)
 
 
+def test_concurrent_initialization_serializes_migration(tmp_path: Path) -> None:
+    path = tmp_path / "concurrent" / "console.db"
+    path.parent.mkdir(mode=0o700)
+    path.touch(mode=0o600)
+    barrier = threading.Barrier(2)
+    results: list[ConsoleStateStore | BaseException] = []
+
+    def initialize() -> None:
+        barrier.wait()
+        try:
+            results.append(ConsoleStateStore(path))
+        except BaseException as exc:
+            results.append(exc)
+
+    workers = [threading.Thread(target=initialize) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(5)
+
+    assert len(results) == 2
+    failures = [result for result in results if isinstance(result, BaseException)]
+    assert failures == []
+    assert ConsoleStateStore(path).get_status() == {"schema_version": CONSOLE_SCHEMA_VERSION}
+
+
+def test_state_path_rejects_ledger_symlink_and_permissive_parent(tmp_path: Path) -> None:
+    ledger_dir = tmp_path / "vault" / ".ledger"
+    ledger_dir.mkdir(parents=True)
+    symlink = tmp_path / "state-link"
+    symlink.symlink_to(ledger_dir, target_is_directory=True)
+
+    with pytest.raises(ConsoleStateError, match="outside the authoritative ledger"):
+        ConsoleStateStore(symlink / "console.db")
+    assert not (ledger_dir / "console.db").exists()
+
+    permissive = tmp_path / "permissive"
+    permissive.mkdir(mode=0o755)
+    permissive.chmod(0o755)
+    with pytest.raises(ConsoleStateError, match="group/world"):
+        ConsoleStateStore(permissive / "console.db")
+
+
 def test_create_extract_review_and_cancel_discards_transient_content(
     console_store: ConsoleStateStore,
     proposal: DraftProposal,
@@ -112,12 +156,68 @@ def test_create_extract_review_and_cancel_discards_transient_content(
     assert cancelled.proposal is None
 
 
+def test_ready_extraction_without_proposal_fails_with_typed_state_error(
+    console_store: ConsoleStateStore,
+) -> None:
+    created = console_store.create_workflow(user_id="user@example.com", source_text="text")
+    extracting = console_store.begin_extraction(created.workflow_id, created.user_id)
+    malformed = ExtractionResult.model_construct(
+        status=ExtractionStatus.READY,
+        proposal=None,
+        errors=(),
+    )
+
+    with pytest.raises(ConsoleStateError, match="lacks a proposal"):
+        console_store.finish_extraction(
+            extracting.workflow_id,
+            extracting.user_id,
+            malformed,
+        )
+
+    assert (
+        console_store.get_workflow(extracting.workflow_id, extracting.user_id).state
+        is WorkflowState.EXTRACTING
+    )
+
+
 def test_user_scope_does_not_reveal_foreign_workflow(
     console_store: ConsoleStateStore,
 ) -> None:
     created = console_store.create_workflow(user_id="owner@example.com", source_text="text")
     with pytest.raises(WorkflowNotFoundError, match="not found"):
         console_store.get_workflow(created.workflow_id, "other@example.com")
+
+
+def test_expired_review_cannot_transition_before_cleanup(
+    tmp_path: Path,
+    clock: MutableClock,
+    proposal: DraftProposal,
+    capture_input: CaptureInput,
+) -> None:
+    store = ConsoleStateStore(
+        tmp_path / "console.db",
+        clock=clock,
+        ordinary_retention=timedelta(hours=1),
+    )
+    reviewing = _reviewing(store, proposal)
+    clock.advance(timedelta(hours=2))
+
+    with pytest.raises(WorkflowNotFoundError, match="not found"):
+        store.freeze_and_begin_submission(
+            reviewing.workflow_id,
+            reviewing.user_id,
+            capture_input,
+        )
+
+    connection = store.connect()
+    try:
+        state = connection.execute(
+            "SELECT state FROM workflows WHERE workflow_id = ?",
+            (reviewing.workflow_id,),
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert state == WorkflowState.REVIEWING.value
 
 
 def test_database_triggers_reject_identity_payload_and_transition_bypasses(
@@ -153,6 +253,11 @@ def test_database_triggers_reject_identity_payload_and_transition_bypasses(
             (
                 "UPDATE workflows SET state = 'editing', version = version + 1 "
                 "WHERE workflow_id = ?",
+                (submitting.workflow_id,),
+            ),
+            (
+                "UPDATE workflows SET state = 'terminal_failure', expires_at = NULL, "
+                "version = version + 1 WHERE workflow_id = ?",
                 (submitting.workflow_id,),
             ),
             (
@@ -211,9 +316,23 @@ def test_cleanup_removes_only_expired_approved_states(
         code="timeout",
         details=("exact replay required",),
     )
+    terminal_review = _reviewing(store, proposal, user_id="user@example.com")
+    terminal_submit = store.freeze_and_begin_submission(
+        terminal_review.workflow_id,
+        terminal_review.user_id,
+        capture_input,
+    )
+    terminal = store.record_capture_failure(
+        terminal_submit.workflow_id,
+        terminal_submit.user_id,
+        state=WorkflowState.TERMINAL_FAILURE,
+        code="invalid_forecast",
+        details=("new workflow required",),
+    )
+    assert terminal.expires_at is not None
     clock.advance(timedelta(hours=2))
 
-    assert store.cleanup_expired() == 4
+    assert store.cleanup_expired() == 5
     with pytest.raises(WorkflowNotFoundError):
         store.get_workflow(editing.workflow_id, editing.user_id)
     with pytest.raises(WorkflowNotFoundError):
@@ -221,3 +340,14 @@ def test_cleanup_removes_only_expired_approved_states(
     preserved = store.get_workflow(protected.workflow_id, protected.user_id)
     assert preserved.state is WorkflowState.UNCERTAIN
     assert preserved.expires_at is None
+    connection = store.connect()
+    try:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM workflows WHERE workflow_id = ?",
+                (terminal.workflow_id,),
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        connection.close()

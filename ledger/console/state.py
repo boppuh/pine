@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import stat
+import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -46,7 +47,15 @@ class ConsoleStateStore:
         clock: Callable[[], datetime] | None = None,
         uuid_factory: Callable[[], UUID] | None = None,
     ) -> None:
-        self.db_path = Path(db_path).expanduser().absolute()
+        requested_path = Path(db_path).expanduser().absolute()
+        if requested_path.is_symlink():
+            raise ConsoleStateError("console state path must not be a symlink")
+        try:
+            self.db_path = requested_path.resolve(strict=False)
+        except OSError as exc:
+            raise ConsoleStateError("console state path could not be resolved safely") from exc
+        if ".ledger" in self.db_path.parts:
+            raise ConsoleStateError("console state must live outside the authoritative ledger")
         self.ordinary_retention = ordinary_retention
         self.receipt_retention = receipt_retention
         self.clock = clock or (lambda: datetime.now(UTC))
@@ -68,11 +77,29 @@ class ConsoleStateStore:
         connection.execute("PRAGMA busy_timeout = 30000")
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA synchronous = FULL")
-        journal_mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
-        if str(journal_mode).lower() != "wal":
-            connection.close()
-            raise ConsoleStateError("console database refused WAL mode")
+        self._enable_wal(connection)
         return connection
+
+    @staticmethod
+    def _enable_wal(connection: sqlite3.Connection) -> None:
+        """Enable WAL with bounded retry during concurrent process startup."""
+
+        deadline = time.monotonic() + 30.0
+        delay = 0.001
+        last_error: sqlite3.OperationalError | None = None
+        while True:
+            try:
+                journal_mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+            except sqlite3.OperationalError as exc:
+                last_error = exc
+            else:
+                if str(journal_mode).lower() == "wal":
+                    return
+            if time.monotonic() >= deadline:
+                connection.close()
+                raise ConsoleStateError("console database refused WAL mode") from last_error
+            time.sleep(delay)
+            delay = min(delay * 2, 0.05)
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -181,10 +208,11 @@ class ConsoleStateStore:
         now = self._now()
         expires_at = now + self.ordinary_retention
         with self.transaction() as connection:
-            row = self._get_row(connection, workflow_id, identity)
+            row = self._get_row(connection, workflow_id, identity, reject_expired=False)
             self._require_state(row, WorkflowState.EXTRACTING)
             if result.status is ExtractionStatus.READY:
-                assert result.proposal is not None
+                if result.proposal is None:
+                    raise ConsoleStateError("ready extraction result lacks a proposal")
                 self._update(
                     connection,
                     workflow_id,
@@ -230,7 +258,7 @@ class ConsoleStateStore:
         identity = normalize_user_identity(user_id)
         now = self._now()
         with self.transaction() as connection:
-            row = self._get_row(connection, workflow_id, identity)
+            row = self._get_row(connection, workflow_id, identity, reject_expired=False)
             self._require_state(row, WorkflowState.EXTRACTING)
             self._update(
                 connection,
@@ -385,13 +413,18 @@ class ConsoleStateStore:
                 workflow_id,
                 """
                 state = ?, error_code = ?, error_details_json = ?, updated_at = ?,
-                expires_at = NULL, version = version + 1
+                expires_at = ?, version = version + 1
                 """,
                 (
                     state.value,
                     code,
                     canonical_json({"details": list(details)}),
                     _timestamp(now),
+                    (
+                        _timestamp(now + self.ordinary_retention)
+                        if state is WorkflowState.TERMINAL_FAILURE
+                        else None
+                    ),
                 ),
             )
             updated = self._get_row(connection, workflow_id, identity)
@@ -468,7 +501,9 @@ class ConsoleStateStore:
                 """
                 DELETE FROM workflows
                 WHERE expires_at IS NOT NULL AND expires_at <= ?
-                  AND state IN ('editing', 'reviewing', 'committed', 'cancelled')
+                  AND state IN (
+                      'editing', 'reviewing', 'terminal_failure', 'committed', 'cancelled'
+                  )
                 """,
                 (now,),
             ).rowcount
@@ -494,11 +529,19 @@ class ConsoleStateStore:
         parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if not parent.is_dir():
             raise ConsoleStateError("console state parent is not a directory")
+        if stat.S_IMODE(parent.stat().st_mode) & 0o077:
+            raise ConsoleStateError("console state directory must not be group/world accessible")
         if self.db_path.is_symlink() or (self.db_path.exists() and not self.db_path.is_file()):
             raise ConsoleStateError("console state path must be a regular file")
         if not self.db_path.exists():
-            descriptor = os.open(self.db_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-            os.close(descriptor)
+            try:
+                descriptor = os.open(self.db_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            except FileExistsError:
+                pass
+            else:
+                os.close(descriptor)
+        if self.db_path.is_symlink() or not self.db_path.is_file():
+            raise ConsoleStateError("console state path must be a regular file")
         mode = stat.S_IMODE(self.db_path.stat().st_mode)
         if mode & 0o077:
             raise ConsoleStateError("console state database must not be group/world accessible")
@@ -509,11 +552,13 @@ class ConsoleStateStore:
             raise ConsoleStateError("console clock returned a naive timestamp")
         return value.astimezone(UTC)
 
-    @staticmethod
     def _get_row(
+        self,
         connection: sqlite3.Connection,
         workflow_id: str,
         user_id: str,
+        *,
+        reject_expired: bool = True,
     ) -> sqlite3.Row:
         row = connection.execute(
             "SELECT * FROM workflows WHERE workflow_id = ? AND user_id = ?",
@@ -521,6 +566,13 @@ class ConsoleStateStore:
         ).fetchone()
         if row is None:
             raise WorkflowNotFoundError("console workflow was not found")
+        if reject_expired and row["expires_at"] is not None:
+            try:
+                expires_at = datetime.fromisoformat(row["expires_at"])
+            except (TypeError, ValueError) as exc:
+                raise ConsoleStateError("console workflow expiry is invalid") from exc
+            if expires_at <= self._now():
+                raise WorkflowNotFoundError("console workflow was not found")
         return row
 
     @staticmethod
