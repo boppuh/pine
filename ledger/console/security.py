@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import secrets
 import time
 from collections.abc import Callable
@@ -11,6 +12,7 @@ from http import HTTPStatus
 from typing import Any
 from urllib.parse import parse_qs
 
+from starlette.concurrency import run_in_threadpool
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ledger.console.auth import authenticate_tailscale_identity, single_header
@@ -80,7 +82,7 @@ class ConsoleSecurityMiddleware:
         started = self.monotonic_clock()
         status_code = HTTPStatus.INTERNAL_SERVER_ERROR
         identity_hash: str | None = None
-        new_cookie: str | None = None
+        response_cookie: tuple[str, int] | None = None
         clear_cookie = False
 
         async def secured_send(message: Message) -> None:
@@ -94,13 +96,14 @@ class ConsoleSecurityMiddleware:
                 )
                 if should_clear:
                     headers.append((b"set-cookie", _expired_cookie()))
-                elif new_cookie is not None:
+                elif response_cookie is not None:
+                    cookie_value, max_age_seconds = response_cookie
                     headers.append(
                         (
                             b"set-cookie",
                             _session_cookie(
-                                new_cookie,
-                                max_age_seconds=self.config.session_idle_minutes * 60,
+                                cookie_value,
+                                max_age_seconds=max_age_seconds,
                             ),
                         )
                     )
@@ -127,8 +130,28 @@ class ConsoleSecurityMiddleware:
                 await _send_plain(secured_send, HTTPStatus.BAD_REQUEST, "Bad Request")
                 return
 
+            method = str(scope.get("method", "GET")).upper()
+            state_changing = method not in {"GET", "HEAD", "OPTIONS"}
+            if state_changing and not _valid_origin(scope, self.config.allowed_host):
+                await _send_plain(secured_send, HTTPStatus.FORBIDDEN, "Forbidden")
+                return
+
+            content_length = _content_length(scope)
+            if content_length is not None and content_length > self.config.max_request_bytes:
+                await _send_plain(secured_send, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Too Large")
+                return
+
+            csrf_header = single_header(scope, "x-pine-csrf-token")
+            if state_changing and csrf_header is None and not _is_urlencoded(scope):
+                await _send_plain(secured_send, HTTPStatus.FORBIDDEN, "Forbidden")
+                return
+
             cookie_value = _session_cookie_value(scope)
-            lookup = self.sessions.lookup(cookie_value, identity.user_id)
+            lookup = await run_in_threadpool(
+                self.sessions.lookup,
+                cookie_value,
+                identity.user_id,
+            )
             if lookup.status is SessionLookupStatus.IDENTITY_MISMATCH:
                 clear_cookie = True
                 await _send_plain(secured_send, HTTPStatus.FORBIDDEN, "Forbidden")
@@ -137,34 +160,32 @@ class ConsoleSecurityMiddleware:
                 session = lookup.session
                 if session is None:
                     raise RuntimeError("valid console session lookup lacked state")
+                if cookie_value is None:
+                    raise RuntimeError("valid console session lacked a browser cookie")
+                response_cookie = (cookie_value, _session_cookie_max_age(session))
             else:
+                if state_changing:
+                    clear_cookie = lookup.status is SessionLookupStatus.EXPIRED
+                    await _send_plain(secured_send, HTTPStatus.FORBIDDEN, "Forbidden")
+                    return
                 self.abuse_controls.session_establishment(identity_hash)
-                created = self.sessions.create(identity.user_id)
+                await run_in_threadpool(self.sessions.cleanup_expired)
+                created = await run_in_threadpool(self.sessions.create, identity.user_id)
                 session = created.session
-                new_cookie = created.cookie_value
+                response_cookie = (
+                    created.cookie_value,
+                    _session_cookie_max_age(created.session),
+                )
 
             state = _request_state(scope)
             state["pine.identity"] = identity.user_id
             state["pine.identity_hash"] = identity_hash
             state["pine.session"] = session
 
-            content_length = _content_length(scope)
-            if content_length is not None and content_length > self.config.max_request_bytes:
-                await _send_plain(secured_send, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Too Large")
-                return
-
-            method = str(scope.get("method", "GET")).upper()
-            csrf_header = single_header(scope, "x-pine-csrf-token")
-            if method not in {"GET", "HEAD", "OPTIONS"}:
-                if not _valid_origin(scope, self.config.allowed_host):
-                    await _send_plain(secured_send, HTTPStatus.FORBIDDEN, "Forbidden")
-                    return
+            if state_changing:
                 if csrf_header is not None and not session.validates_csrf(
                     csrf_header, method, path
                 ):
-                    await _send_plain(secured_send, HTTPStatus.FORBIDDEN, "Forbidden")
-                    return
-                if csrf_header is None and not _is_urlencoded(scope):
                     await _send_plain(secured_send, HTTPStatus.FORBIDDEN, "Forbidden")
                     return
 
@@ -173,7 +194,7 @@ class ConsoleSecurityMiddleware:
                 await _send_plain(secured_send, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Too Large")
                 return
 
-            if method not in {"GET", "HEAD", "OPTIONS"} and csrf_header is None:
+            if state_changing and csrf_header is None:
                 form_token, form_field_names = _form_csrf(body)
                 if form_token is None or not session.validates_csrf(form_token, method, path):
                     await _send_plain(secured_send, HTTPStatus.FORBIDDEN, "Forbidden")
@@ -377,6 +398,11 @@ def _session_cookie(value: str, *, max_age_seconds: int) -> bytes:
         f"{SESSION_COOKIE_NAME}={value}; Path=/; Max-Age={max_age_seconds}; "
         "Secure; HttpOnly; SameSite=Strict"
     ).encode("ascii")
+
+
+def _session_cookie_max_age(session: ConsoleSession) -> int:
+    remaining = session.idle_expires_at - session.last_seen_at
+    return max(1, math.ceil(remaining.total_seconds()))
 
 
 def _expired_cookie() -> bytes:

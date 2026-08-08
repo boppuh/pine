@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import threading
@@ -206,7 +207,8 @@ def test_authenticated_shell_sets_exact_cookie_headers_and_local_assets(
         assert "focus-visible" not in response.text
 
         repeated = client.get("/", headers=_identity_headers())
-        assert "set-cookie" not in repeated.headers
+        assert repeated.cookies.get(SESSION_COOKIE_NAME) == cookie
+        assert "Max-Age=1800" in repeated.headers["set-cookie"]
         status = client.get("/status", headers=_identity_headers())
         assert status.status_code == 200
         assert "Console status" in status.text
@@ -227,6 +229,123 @@ def test_authenticated_shell_sets_exact_cookie_headers_and_local_assets(
     assert row is not None
     assert row["session_hash"] == hash_session_id(cookie)
     assert row["session_hash"] != cookie
+
+
+def test_active_session_refreshes_cookie_and_preserves_original_csrf(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+    clock: MutableClock,
+) -> None:
+    app, config, _store, _sessions = _build_app(tmp_path, fake_backend, clock)
+
+    with _client(app, config) as client:
+        home = client.get("/", headers=_identity_headers())
+        cookie = home.cookies.get(SESSION_COOKIE_NAME)
+        csrf = _csrf_from_html(home.text)
+        assert cookie is not None
+
+        clock.advance(timedelta(minutes=20))
+        refreshed = client.get("/status", headers=_identity_headers())
+        assert refreshed.cookies.get(SESSION_COOKIE_NAME) == cookie
+        assert "Max-Age=1800" in refreshed.headers["set-cookie"]
+
+        clock.advance(timedelta(minutes=20))
+        logged_out = client.post(
+            "/session/logout",
+            headers={**_identity_headers(), "Origin": f"https://{HOST}"},
+            data={"csrf_token": csrf},
+        )
+        assert logged_out.status_code == 200
+
+
+def test_sessionless_writes_are_denied_without_creating_or_rotating_session(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+    clock: MutableClock,
+) -> None:
+    app, config, store, _sessions = _build_app(tmp_path, fake_backend, clock)
+
+    with _client(app, config) as client:
+        cross_origin = client.post(
+            "/session/logout",
+            headers={**_identity_headers(), "Origin": "https://evil.example"},
+            data={"csrf_token": "x" * 43},
+        )
+        same_origin = client.post(
+            "/session/logout",
+            headers={**_identity_headers(), "Origin": f"https://{HOST}"},
+            data={"csrf_token": "x" * 43},
+        )
+
+    assert cross_origin.status_code == 403
+    assert same_origin.status_code == 403
+    assert "set-cookie" not in cross_origin.headers
+    assert "set-cookie" not in same_origin.headers
+    connection = store.connect()
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM console_sessions").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_session_database_wait_does_not_block_liveness(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+    clock: MutableClock,
+    monkeypatch,
+) -> None:
+    app, config, _store, sessions = _build_app(tmp_path, fake_backend, clock)
+    started = threading.Event()
+    release = threading.Event()
+    original_lookup = sessions.lookup
+
+    def blocking_lookup(cookie_value, user_id):
+        started.set()
+        assert release.wait(5)
+        return original_lookup(cookie_value, user_id)
+
+    monkeypatch.setattr(sessions, "lookup", blocking_lookup)
+
+    async def exercise() -> tuple[httpx.Response, httpx.Response]:
+        transport = httpx.ASGITransport(app=UnixSocketScope(app, config.socket_path))
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url=f"https://{HOST}",
+        ) as client:
+            protected = asyncio.create_task(client.get("/", headers=_identity_headers()))
+            assert await asyncio.to_thread(started.wait, 2)
+            live = await asyncio.wait_for(client.get("/livez"), timeout=1)
+            release.set()
+            return await protected, live
+
+    try:
+        protected, live = asyncio.run(exercise())
+    finally:
+        release.set()
+    assert protected.status_code == 200
+    assert live.status_code == 200
+
+
+def test_session_establishment_cleans_abandoned_expired_rows(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+    clock: MutableClock,
+) -> None:
+    app, config, store, sessions = _build_app(tmp_path, fake_backend, clock)
+    orphaned = sessions.create(IDENTITY)
+    clock.advance(timedelta(minutes=31))
+
+    with _client(app, config) as client:
+        established = client.get("/", headers=_identity_headers())
+
+    assert established.status_code == 200
+    connection = store.connect()
+    try:
+        rows = connection.execute("SELECT session_hash FROM console_sessions").fetchall()
+    finally:
+        connection.close()
+    assert len(rows) == 1
+    assert rows[0]["session_hash"] != orphaned.session.session_hash
 
 
 def test_unknown_cookie_cannot_fix_a_session_and_expiry_rotates_it(
