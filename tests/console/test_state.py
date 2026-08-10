@@ -153,11 +153,13 @@ def test_failed_state_migration_rolls_back_and_remains_recoverable(
     monkeypatch.setitem(
         console_migrations._MIGRATIONS,
         2,
-        valid_migration + "\nCREATE TABLE incomplete(\n",
+        valid_migration + "\nINSERT INTO missing_migration_table(value) VALUES (1);\n",
     )
 
-    with pytest.raises(ConsoleStateError, match="incomplete"):
+    with pytest.raises(ConsoleStateError, match="migration 2 failed") as failure:
         ConsoleStateStore(path)
+    assert isinstance(failure.value.__cause__, sqlite3.OperationalError)
+    assert "missing_migration_table" in str(failure.value.__cause__)
 
     unchanged = sqlite3.connect(path)
     try:

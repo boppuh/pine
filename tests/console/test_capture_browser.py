@@ -5,7 +5,7 @@ import os
 import socket
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +44,13 @@ class _BrowserProbe:
     trace_path: Path
 
 
+@dataclass(frozen=True, slots=True)
+class _BrowserServer:
+    base_url: str
+    backend: FakeBackend
+    credential_path: Path
+
+
 @contextmanager
 def _browser_probe(
     playwright_runtime: Playwright,
@@ -55,8 +62,9 @@ def _browser_probe(
     color_scheme: str = "light",
     evidence_root: Path | None = None,
     har_path: Path | None = None,
+    after_context: Callable[[_BrowserProbe], None] | None = None,
 ) -> Iterator[_BrowserProbe]:
-    """Run one instrumented browser context and retain a trace only on failure."""
+    """Run an instrumented context and retain a trace on in- or post-context failure."""
 
     browser_type: BrowserType = getattr(playwright_runtime, engine)
     browser = browser_type.launch()
@@ -101,15 +109,17 @@ def _browser_probe(
         });
         """
     )
+    context_closed = False
     try:
         try:
-            yield _BrowserProbe(
+            probe = _BrowserProbe(
                 page=page,
                 context=context,
                 errors=errors,
                 requests=requests,
                 trace_path=trace_path,
             )
+            yield probe
         except BaseException:
             trace_path.parent.mkdir(parents=True, exist_ok=True)
             try:
@@ -118,9 +128,20 @@ def _browser_probe(
                 pass
             raise
         else:
-            context.tracing.stop()
+            if after_context is None:
+                context.tracing.stop()
+            else:
+                trace_path.parent.mkdir(parents=True, exist_ok=True)
+                context.tracing.stop(path=trace_path)
+                try:
+                    context.close()
+                finally:
+                    context_closed = True
+                after_context(probe)
+                trace_path.unlink()
     finally:
-        context.close()
+        if not context_closed:
+            context.close()
         browser.close()
 
 
@@ -198,7 +219,7 @@ def browser_server(
     tmp_path: Path,
     fake_backend: FakeBackend,
     clock: MutableClock,
-) -> Iterator[tuple[str, FakeBackend]]:
+) -> Iterator[_BrowserServer]:
     socket_path = tmp_path / "console.sock"
     credential = tmp_path / "backend-token"
     credential.write_text(TOKEN, encoding="ascii")
@@ -236,7 +257,11 @@ def browser_server(
         time.sleep(0.01)
     assert server.started
     try:
-        yield f"http://localhost:{port}", fake_backend
+        yield _BrowserServer(
+            base_url=f"http://localhost:{port}",
+            backend=fake_backend,
+            credential_path=credential,
+        )
     finally:
         server.should_exit = True
         worker.join(5)
@@ -247,11 +272,12 @@ def browser_server(
 @pytest.mark.parametrize("engine", ["chromium", "webkit"])
 def test_keyboard_capture_flow_in_chromium_and_webkit(
     playwright_runtime: Playwright,
-    browser_server: tuple[str, FakeBackend],
+    browser_server: _BrowserServer,
     tmp_path: Path,
     engine: str,
 ) -> None:
-    base_url, backend = browser_server
+    base_url = browser_server.base_url
+    backend = browser_server.backend
     with _browser_probe(
         playwright_runtime,
         base_url=base_url,
@@ -303,9 +329,9 @@ def test_keyboard_capture_flow_in_chromium_and_webkit(
 
 def test_capture_layout_has_no_horizontal_overflow_at_supported_widths(
     playwright_runtime: Playwright,
-    browser_server: tuple[str, FakeBackend],
+    browser_server: _BrowserServer,
 ) -> None:
-    base_url, _backend = browser_server
+    base_url = browser_server.base_url
     browser = playwright_runtime.chromium.launch()
     try:
         for width, height in ((390, 844), (768, 1024), (1440, 1000)):
@@ -327,11 +353,12 @@ def test_capture_layout_has_no_horizontal_overflow_at_supported_widths(
 @pytest.mark.parametrize("engine", ["chromium", "webkit"])
 def test_verified_inspection_flow_in_chromium_and_webkit(
     playwright_runtime: Playwright,
-    browser_server: tuple[str, FakeBackend],
+    browser_server: _BrowserServer,
     tmp_path: Path,
     engine: str,
 ) -> None:
-    base_url, backend = browser_server
+    base_url = browser_server.base_url
+    backend = browser_server.backend
     strategy_id = backend.prediction_detail.forecast.strategy_id
     with _browser_probe(
         playwright_runtime,
@@ -362,9 +389,10 @@ def test_verified_inspection_flow_in_chromium_and_webkit(
 
 def test_inspection_layout_has_no_horizontal_overflow_at_supported_widths(
     playwright_runtime: Playwright,
-    browser_server: tuple[str, FakeBackend],
+    browser_server: _BrowserServer,
 ) -> None:
-    base_url, backend = browser_server
+    base_url = browser_server.base_url
+    backend = browser_server.backend
     browser = playwright_runtime.chromium.launch()
     paths = (
         "/",
@@ -392,10 +420,11 @@ def test_inspection_layout_has_no_horizontal_overflow_at_supported_widths(
 
 def test_inspection_dark_mode_uses_a_distinct_background(
     playwright_runtime: Playwright,
-    browser_server: tuple[str, FakeBackend],
+    browser_server: _BrowserServer,
     tmp_path: Path,
 ) -> None:
-    base_url, backend = browser_server
+    base_url = browser_server.base_url
+    backend = browser_server.backend
     backgrounds: dict[str, str] = {}
     for color_scheme in ("light", "dark"):
         with _browser_probe(
@@ -511,11 +540,12 @@ def _contrast_ratio(page: Page, foreground: str, background: str) -> float:
 @pytest.mark.parametrize("color_scheme", ["light", "dark"])
 def test_console_pages_pass_automated_accessibility_checks(
     playwright_runtime: Playwright,
-    browser_server: tuple[str, FakeBackend],
+    browser_server: _BrowserServer,
     tmp_path: Path,
     color_scheme: str,
 ) -> None:
-    base_url, backend = browser_server
+    base_url = browser_server.base_url
+    backend = browser_server.backend
     paths = (
         "/",
         "/hypotheses/new",
@@ -560,19 +590,41 @@ def test_console_pages_pass_automated_accessibility_checks(
 
 def test_browser_traffic_storage_and_assets_exclude_server_secrets(
     playwright_runtime: Playwright,
-    browser_server: tuple[str, FakeBackend],
+    browser_server: _BrowserServer,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    base_url, backend = browser_server
+    base_url = browser_server.base_url
+    backend = browser_server.backend
     har_path = tmp_path / "browser-security.har"
-    rendered_pages: list[str] = []
+    browser_material_parts: list[str] = []
+
+    def assert_no_server_secrets(_probe: _BrowserProbe) -> None:
+        assert har_path.is_file()
+        browser_material = "\n".join(
+            [
+                *browser_material_parts,
+                har_path.read_text(encoding="utf-8"),
+                caplog.text,
+            ]
+        )
+        for forbidden in (
+            TOKEN,
+            "Authorization: Bearer",
+            '"name": "authorization"',
+            str(browser_server.credential_path),
+            "/run/credentials/pine-console.service/backend-token",
+        ):
+            assert forbidden not in browser_material
+        har_path.unlink()
+
     with _browser_probe(
         playwright_runtime,
         base_url=base_url,
         tmp_path=tmp_path,
         name="browser-security",
         har_path=har_path,
+        after_context=assert_no_server_secrets,
     ) as probe:
         for path in (
             "/",
@@ -583,15 +635,19 @@ def test_browser_traffic_storage_and_assets_exclude_server_secrets(
         ):
             response = probe.page.goto(path)
             assert response is not None and response.ok
-            rendered_pages.append(probe.page.content())
+            browser_material_parts.append(probe.page.content())
             assert probe.page.evaluate("window.__pineCspViolations") == []
 
         javascript = probe.page.request.get(f"{base_url}/assets/console.js")
         stylesheet = probe.page.request.get(f"{base_url}/assets/console.css")
         assert javascript.ok and stylesheet.ok
-        javascript_text = javascript.text()
-        stylesheet_text = stylesheet.text()
-        storage_state = json.dumps(probe.context.storage_state(), sort_keys=True)
+        browser_material_parts.extend(
+            [
+                javascript.text(),
+                stylesheet.text(),
+                json.dumps(probe.context.storage_state(), sort_keys=True),
+            ]
+        )
         assert probe.page.evaluate("localStorage.length") == 0
         assert probe.page.evaluate("sessionStorage.length") == 0
         assert probe.errors == []
@@ -609,47 +665,36 @@ def test_browser_traffic_storage_and_assets_exclude_server_secrets(
         }
         assert external_requests == set()
 
-    assert har_path.is_file()
-    browser_material = "\n".join(
-        [
-            *rendered_pages,
-            javascript_text,
-            stylesheet_text,
-            storage_state,
-            har_path.read_text(encoding="utf-8"),
-            caplog.text,
-        ]
-    )
-    for forbidden in (
-        TOKEN,
-        "Authorization: Bearer",
-        '"name": "authorization"',
-        "/run/credentials/pine-console.service/backend-token",
-    ):
-        assert forbidden not in browser_material
-    har_path.unlink()
     assert not probe.trace_path.exists()
 
 
-def test_browser_trace_is_retained_only_for_a_failed_journey(
+@pytest.mark.parametrize("failure_stage", ["in-context", "post-context"])
+def test_browser_trace_is_retained_for_a_failed_journey(
     playwright_runtime: Playwright,
-    browser_server: tuple[str, FakeBackend],
+    browser_server: _BrowserServer,
     tmp_path: Path,
+    failure_stage: str,
 ) -> None:
-    base_url, _backend = browser_server
+    base_url = browser_server.base_url
     failure_evidence = tmp_path / "synthetic-failure-evidence"
-    trace_path = failure_evidence / "synthetic-failure-chromium.zip"
+    trace_path = failure_evidence / f"synthetic-{failure_stage}-chromium.zip"
 
-    with pytest.raises(RuntimeError, match="synthetic browser failure"):
+    def fail_after_context(_probe: _BrowserProbe) -> None:
+        raise RuntimeError("synthetic post-context failure")
+
+    expected_failure = f"synthetic {failure_stage} failure"
+    with pytest.raises(RuntimeError, match=expected_failure):
         with _browser_probe(
             playwright_runtime,
             base_url=base_url,
             tmp_path=tmp_path,
-            name="synthetic-failure",
+            name=f"synthetic-{failure_stage}",
             evidence_root=failure_evidence,
+            after_context=fail_after_context if failure_stage == "post-context" else None,
         ) as probe:
             probe.page.goto("/")
-            raise RuntimeError("synthetic browser failure")
+            if failure_stage == "in-context":
+                raise RuntimeError(expected_failure)
 
     assert trace_path.is_file()
     assert trace_path.stat().st_size > 0
