@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-heading compact-heading" aria-labelledby="new-heading">
+  <p class="eyebrow">Capture</p>
+  <h1 id="new-heading">New strategy hypothesis</h1>
+  <p class="lede">Turn research notes into a structured proposal. Extraction does not write to the ledger.</p>
+</section>
+
+{% if request.query_params.get('cancelled') == '1' %}
+<div class="notice is-neutral" role="status">
+  <strong>Draft cancelled.</strong> No ledger record was created.
+</div>
+{% endif %}
+
+{% if errors %}
+<section class="error-summary" role="alert" aria-labelledby="error-heading">
+  <h2 id="error-heading">{% if workflow %}Pine could not extract a complete proposal{% else %}Check the source text{% endif %}</h2>
+  <ul>
+    {% for field, message in errors.items() %}
+    <li>{% if field == 'source_text' %}<a href="#source_text">{{ message }}</a>{% else %}{{ message }}{% endif %}</li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+<form class="capture-form source-form" method="post" action="/workflows" data-submit-once>
+  <input type="hidden" name="csrf_token" value="{{ form_csrf_token }}">
+  {% if workflow %}
+  <input type="hidden" name="workflow_id" value="{{ workflow.workflow_id }}">
+  <input type="hidden" name="version" value="{{ workflow.version }}">
+  {% endif %}
+
+  <div class="form-section">
+    <div class="section-heading">
+      <div>
+        <p class="section-label">1. Source</p>
+        <h2>{% if workflow %}Edit source and try again{% else %}Research notes{% endif %}</h2>
+      </div>
+      <output class="character-count" for="source_text" data-character-count>{{ source_text | length }} / 200,000</output>
+    </div>
+
+    <label for="schema_id">Forecast schema</label>
+    <select id="schema_id" name="schema_id">
+      <option value="finance/strategy-edge:1">finance/strategy-edge:1</option>
+    </select>
+
+    <label for="source_text">Hypothesis source</label>
+    <textarea
+      id="source_text"
+      name="source_text"
+      rows="18"
+      minlength="1"
+      maxlength="200000"
+      required
+      aria-describedby="source-help provider-disclosure{% if errors.get('source_text') %} source-error{% endif %}"
+      {% if errors.get('source_text') %}aria-invalid="true"{% endif %}
+      data-source-text
+    >{{ source_text }}</textarea>
+    {% if errors.get('source_text') %}<p class="field-error" id="source-error">{{ errors.get('source_text') }}</p>{% endif %}
+    <p class="field-help" id="source-help">Paste plain text or Markdown. Pine treats raw HTML as text.</p>
+  </div>
+
+  <aside class="disclosure" id="provider-disclosure">
+    <strong>Extraction processing</strong>
+    <p>The submitted text is sent by the Pine backend to its configured model provider. Pine requests no provider-side storage. Extraction is a proposal only and creates no prediction, run, snapshot, or touched window.</p>
+  </aside>
+
+  <div class="form-actions">
+    <a class="text-action" href="/">Back to home</a>
+    <button class="primary-button" type="submit" data-pending-label="Extracting proposal...">Extract proposal</button>
+  </div>
+</form>
+{% endblock %}

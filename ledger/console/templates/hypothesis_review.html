@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-heading compact-heading" aria-labelledby="review-heading">
+  <p class="eyebrow">Review</p>
+  <h1 id="review-heading">Confirm strategy hypothesis</h1>
+  <div class="record-meta" aria-label="Proposal identity">
+    <span class="badge is-fixed">preregistered</span>
+    <code>{{ proposal.schema_id }}</code>
+    <code title="{{ proposal.schema_hash }}">{{ proposal.schema_hash[:15] }}...</code>
+  </div>
+</section>
+
+{% if errors %}
+<section class="error-summary" role="alert" aria-labelledby="review-errors-heading" tabindex="-1" data-error-summary>
+  <h2 id="review-errors-heading">Check the highlighted fields</h2>
+  <ul>
+    {% for field, message in errors.items() %}
+    <li>{% if field in values %}<a href="#{{ field }}">{{ message }}</a>{% else %}{{ message }}{% endif %}</li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+<section
+  class="freshness-notice{% if freshness_changed or not proposal.fresh_window %} is-warning{% endif %}"
+  role="status"
+  data-freshness
+  data-original-family="{{ proposal.lineage.get('family_id', '') }}"
+  data-original-oos-start="{{ proposal.forecast.out_of_sample_window.start.isoformat() }}"
+  data-original-oos-end="{{ proposal.forecast.out_of_sample_window.end.isoformat() }}"
+  data-original-fresh="{{ 'true' if proposal.fresh_window else 'false' }}"
+>
+  <span class="status-dot" aria-hidden="true"></span>
+  <div>
+    <strong data-freshness-title>{% if freshness_changed %}Freshness changed{% elif proposal.fresh_window %}Window was fresh at extraction{% else %}Window overlap detected{% endif %}</strong>
+    <span data-freshness-message>{% if freshness_changed %}Changed since advisory check; Pine will re-check on confirmation.{% elif proposal.fresh_window %}No touched family window overlapped at the advisory check.{% else %}The proposed family and OOS window overlapped prior research. Confirmation will fail closed unless the authoritative check passes.{% endif %}</span>
+  </div>
+</section>
+
+<form class="capture-form review-form" method="post" action="/workflows/{{ workflow.workflow_id }}/confirm" data-submit-once data-lock-workflow>
+  <input type="hidden" name="csrf_token" value="{{ confirm_csrf_token }}">
+  <input type="hidden" name="version" value="{{ values.version }}">
+  <input type="hidden" name="schema_id" value="{{ values.schema_id }}">
+
+  <fieldset class="form-section">
+    <legend><span class="section-label">1. Forecast</span>Expected edge</legend>
+    <div class="field-grid two-columns">
+      <div class="field-group span-all">
+        <label for="strategy_id">Strategy ID</label>
+        <input id="strategy_id" name="strategy_id" value="{{ values.strategy_id }}" required{% if errors.get('strategy_id') %} aria-invalid="true" aria-describedby="strategy_id-error"{% endif %}>
+        {% if errors.get('strategy_id') %}<p class="field-error" id="strategy_id-error">{{ errors.get('strategy_id') }}</p>{% endif %}
+      </div>
+      {% for field, label, step, help in [
+        ('sharpe', 'Expected Sharpe', 'any', ''),
+        ('win_rate', 'Expected win rate', 'any', 'Decimal from 0 to 1'),
+        ('max_drawdown', 'Expected maximum drawdown', 'any', ''),
+        ('expectancy', 'Expected expectancy', 'any', '')
+      ] %}
+      <div class="field-group">
+        <label for="{{ field }}">{{ label }}</label>
+        <input id="{{ field }}" name="{{ field }}" type="number" step="{{ step }}" value="{{ values[field] }}" required{% if field == 'win_rate' %} min="0" max="1"{% endif %}{% if errors.get(field) %} aria-invalid="true" aria-describedby="{{ field }}-error"{% endif %}>
+        {% if help %}<p class="field-help">{{ help }}</p>{% endif %}
+        {% if errors.get(field) %}<p class="field-error" id="{{ field }}-error">{{ errors.get(field) }}</p>{% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  </fieldset>
+
+  <fieldset class="form-section">
+    <legend><span class="section-label">2. Windows</span>Research periods</legend>
+    <div class="window-grid">
+      <div class="window-group">
+        <h2>In-sample</h2>
+        <div class="field-grid two-columns">
+          {% for field, label in [('in_sample_start', 'Start'), ('in_sample_end', 'End')] %}
+          <div class="field-group">
+            <label for="{{ field }}">{{ label }}</label>
+            <input id="{{ field }}" name="{{ field }}" type="date" value="{{ values[field] }}" required{% if errors.get(field) %} aria-invalid="true" aria-describedby="{{ field }}-error"{% endif %}>
+            {% if errors.get(field) %}<p class="field-error" id="{{ field }}-error">{{ errors.get(field) }}</p>{% endif %}
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      <div class="window-group">
+        <h2>Out-of-sample</h2>
+        <div class="field-grid two-columns">
+          {% for field, label in [('out_of_sample_start', 'Start'), ('out_of_sample_end', 'End')] %}
+          <div class="field-group">
+            <label for="{{ field }}">{{ label }}</label>
+            <input id="{{ field }}" name="{{ field }}" type="date" value="{{ values[field] }}" required data-freshness-input{% if errors.get(field) %} aria-invalid="true" aria-describedby="{{ field }}-error"{% endif %}>
+            {% if errors.get(field) %}<p class="field-error" id="{{ field }}-error">{{ errors.get(field) }}</p>{% endif %}
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset class="form-section">
+    <legend><span class="section-label">3. Decision</span>Decision and attribution</legend>
+    <div class="field-grid two-columns">
+      {% for field, label in [('decision', 'Decision'), ('invalidation', 'Invalidation condition'), ('edge_source', 'Edge source')] %}
+      <div class="field-group span-all">
+        <label for="{{ field }}">{{ label }}</label>
+        <textarea id="{{ field }}" name="{{ field }}" rows="3" required{% if errors.get(field) %} aria-invalid="true" aria-describedby="{{ field }}-error"{% endif %}>{{ values[field] }}</textarea>
+        {% if errors.get(field) %}<p class="field-error" id="{{ field }}-error">{{ errors.get(field) }}</p>{% endif %}
+      </div>
+      {% endfor %}
+      <div class="field-group span-all">
+        <label for="family_id">Research family ID</label>
+        <input id="family_id" name="family_id" value="{{ values.family_id }}" required data-freshness-input{% if errors.get('family_id') %} aria-invalid="true" aria-describedby="family_id-error"{% endif %}>
+        <p class="field-help">Used with the OOS window for the authoritative freshness check.</p>
+        {% if errors.get('family_id') %}<p class="field-error" id="family_id-error">{{ errors.get('family_id') }}</p>{% endif %}
+      </div>
+    </div>
+  </fieldset>
+
+  <section class="immutable-panel" aria-labelledby="binding-heading">
+    <div>
+      <p class="section-label">Permanent binding</p>
+      <h2 id="binding-heading">What confirmation will freeze</h2>
+    </div>
+    <dl class="definition-grid">
+      <div><dt>Registration</dt><dd>preregistered</dd></div>
+      <div><dt>Schema</dt><dd><code>{{ proposal.schema_id }}</code></dd></div>
+      <div class="span-all"><dt>Schema hash</dt><dd><code class="wrap-code">{{ proposal.schema_hash }}</code></dd></div>
+      <div><dt>Extracted</dt><dd><time datetime="{{ workflow.updated_at.isoformat() }}">{{ workflow.updated_at.strftime('%Y-%m-%d %H:%M UTC') }}</time></dd></div>
+      <div><dt>Freshness checked</dt><dd><time datetime="{{ workflow.updated_at.isoformat() }}">{{ workflow.updated_at.strftime('%Y-%m-%d %H:%M UTC') }}</time></dd></div>
+    </dl>
+  </section>
+
+  <details class="source-details">
+    <summary>Original source text</summary>
+    <p class="field-help">Context is retained as mutable Markdown body text and is not verified by the immutable hash.</p>
+    <pre>{{ proposal.body }}</pre>
+  </details>
+
+  <div class="confirmation-bar">
+    <div>
+      <strong>This is the committing action.</strong>
+      <span>Pine freezes the exact request before contacting the authoritative ledger.</span>
+    </div>
+    <button class="primary-button" type="submit" data-pending-label="Submitting preregistration...">Confirm preregistration</button>
+  </div>
+</form>
+
+<form class="secondary-form" method="post" action="/workflows/{{ workflow.workflow_id }}/cancel">
+  <input type="hidden" name="csrf_token" value="{{ cancel_csrf_token }}">
+  <input type="hidden" name="version" value="{{ workflow.version }}">
+  <button class="quiet-button" type="submit">Cancel draft</button>
+</form>
+{% endblock %}

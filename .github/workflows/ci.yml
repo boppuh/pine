@@ -68,3 +68,39 @@ jobs:
       - name: Check plugin
         run: npm run check
         working-directory: obsidian-plugin
+
+  browser:
+    name: Capture browser acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Install browser runtimes
+        run: uv run playwright install --with-deps chromium webkit
+
+      - name: Run capture browser acceptance
+        env:
+          PINE_BROWSER_EVIDENCE_DIR: test-results/browser
+          PINE_RUN_BROWSER_TESTS: "1"
+        run: uv run pytest -m browser tests/console/test_capture_browser.py
+
+      - name: Upload browser traces
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: capture-browser-traces
+          path: test-results/browser/*.zip
+          if-no-files-found: warn

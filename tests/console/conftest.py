@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from ledger.api import CaptureResponse, HealthResponse
+from ledger.console.backend_client import AuthoritativeReceipt
 from ledger.console.models import CaptureInput
 from ledger.console.state import ConsoleStateStore
 from ledger.extraction import (
@@ -16,7 +17,7 @@ from ledger.extraction import (
     ExtractionStatus,
     HypothesisExtractionRequest,
 )
-from ledger.integrity import PreregisteredCaptureRequest
+from ledger.integrity import PredictionStatus, PreregisteredCaptureRequest, RegistrationStatus
 
 
 class MutableClock:
@@ -39,6 +40,8 @@ class FakeBackend:
         self.ready_outcomes: list[HealthResponse | BaseException] = []
         self.capture_requests: list[PreregisteredCaptureRequest] = []
         self.draft_requests: list[HypothesisExtractionRequest] = []
+        self.receipt_requests: list[str] = []
+        self.receipt_outcomes: list[AuthoritativeReceipt | BaseException] = []
 
     def health(self) -> HealthResponse:
         return HealthResponse()
@@ -71,6 +74,26 @@ class FakeBackend:
             assert isinstance(outcome, CaptureResponse)
             return outcome
         return self.response
+
+    def get_receipt(self, prediction_id: str) -> AuthoritativeReceipt:
+        self.receipt_requests.append(prediction_id)
+        if self.receipt_outcomes:
+            outcome = self.receipt_outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+        return AuthoritativeReceipt(
+            prediction_id=self.response.prediction_id,
+            run_id=self.response.run_id,
+            registration_status=RegistrationStatus.PREREGISTERED,
+            status=PredictionStatus.OPEN,
+            transaction_state="committed",
+            schema_id=self.response.schema_id,
+            schema_hash=self.response.schema_hash,
+            immutable_hash=self.response.immutable_hash,
+            snapshot_ref=self.response.snapshot_ref,
+            committed_at=datetime(2026, 8, 7, 12, 1, tzinfo=UTC),
+        )
 
 
 @pytest.fixture

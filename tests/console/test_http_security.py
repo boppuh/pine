@@ -181,7 +181,17 @@ def test_route_inventory_is_public_only_for_health(
     with _client(app, config) as client:
         for public_path in ("/healthz", "/livez", "/readyz"):
             assert client.get(public_path).status_code == 200
-        for protected_path in ("/", "/status", "/assets/console.css", "/unknown"):
+        for protected_path in (
+            "/",
+            "/hypotheses/new",
+            "/status",
+            "/assets/console.css",
+            "/assets/console.js",
+            "/workflows/00000000-0000-4000-8000-000000000001/review",
+            "/workflows/00000000-0000-4000-8000-000000000001/status",
+            "/workflows/00000000-0000-4000-8000-000000000001/receipt",
+            "/unknown",
+        ):
             assert client.get(protected_path).status_code == 403
         assert client.post("/session/logout").status_code == 403
 
@@ -235,7 +245,7 @@ def test_authenticated_shell_sets_exact_cookie_headers_and_local_assets(
         assert "https://" not in asset.text
         assert "http://" not in asset.text
         assert "@import" not in asset.text
-        assert response.text.count("(not yet available)") == 2
+        assert response.text.count("(not yet available)") == 1
         assert ".visually-hidden" in asset.text
 
     connection = store.connect()

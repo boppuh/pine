@@ -6,6 +6,7 @@
     <meta name="color-scheme" content="light dark">
     <title>{{ page_title }} | Pine</title>
     <link rel="stylesheet" href="/assets/console.css">
+    <script src="/assets/console.js" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content">Skip to content</a>
@@ -17,7 +18,7 @@
         </a>
         <nav class="primary-nav" aria-label="Primary navigation">
           <a href="/"{% if active_page == 'home' %} aria-current="page"{% endif %}>Home</a>
-          <span aria-disabled="true">Capture <span class="visually-hidden">(not yet available)</span></span>
+          <a href="/hypotheses/new"{% if active_page == 'capture' %} aria-current="page"{% endif %}>Capture</a>
           <span aria-disabled="true">Predictions <span class="visually-hidden">(not yet available)</span></span>
           <a href="/status"{% if active_page == 'status' %} aria-current="page"{% endif %}>Status</a>
         </nav>

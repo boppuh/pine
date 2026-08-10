@@ -99,6 +99,30 @@ class WorkflowService:
             )
         return self.store.finish_extraction(workflow_id, user_id, result)
 
+    def revise_and_extract(
+        self,
+        workflow_id: str,
+        user_id: str,
+        *,
+        source_text: str,
+        schema_id: str,
+        expected_version: int | None = None,
+    ) -> ConsoleWorkflow:
+        """Replace failed transient source and run a fresh side-effect-free extraction."""
+
+        revised = self.store.revise_source(
+            workflow_id,
+            user_id,
+            source_text=source_text,
+            schema_id=schema_id,
+            expected_version=expected_version,
+        )
+        return self.extract(
+            workflow_id,
+            user_id,
+            expected_version=revised.version,
+        )
+
     def confirm(
         self,
         workflow_id: str,
