@@ -705,7 +705,8 @@ def _verified_receipt(
     workflow: ConsoleWorkflow,
 ) -> _ReceiptVerification:
     response = workflow.capture_response
-    if response is None:
+    frozen = workflow.frozen_request
+    if response is None or frozen is None:
         return _ReceiptVerification(_ReceiptVerificationState.INTEGRITY_FAILURE)
     try:
         authority = backend.get_receipt(response.prediction_id)
@@ -716,6 +717,9 @@ def _verified_receipt(
             or authority.schema_hash != response.schema_hash
             or authority.immutable_hash != response.immutable_hash
             or authority.snapshot_ref != response.snapshot_ref
+            or authority.forecast.model_dump(mode="json") != frozen.forecast.model_dump(mode="json")
+            or authority.decision != frozen.decision
+            or authority.lineage != frozen.lineage.to_dict()
         ):
             raise BackendProtocolError("authoritative receipt does not match capture response")
     except BackendProtocolError:

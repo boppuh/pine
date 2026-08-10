@@ -82,10 +82,14 @@ class FakeBackend:
             if isinstance(outcome, BaseException):
                 raise outcome
             return outcome
+        capture = self.capture_requests[-1] if self.capture_requests else None
         return AuthoritativeReceipt(
             prediction_id=self.response.prediction_id,
             run_id=self.response.run_id,
             registration_status=RegistrationStatus.PREREGISTERED,
+            forecast=self.proposal.forecast if capture is None else capture.forecast,
+            decision=self.proposal.decision if capture is None else capture.decision,
+            lineage=self.proposal.lineage if capture is None else capture.lineage,
             status=PredictionStatus.OPEN,
             transaction_state="committed",
             schema_id=self.response.schema_id,

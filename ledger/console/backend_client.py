@@ -12,7 +12,7 @@ from typing import Any, Literal, Protocol
 from urllib.parse import quote
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator
 
 from ledger.api import CaptureResponse, HealthResponse
 from ledger.console.config import ConsoleConfig
@@ -27,7 +27,12 @@ from ledger.extraction import (
     ExtractionStatus,
     HypothesisExtractionRequest,
 )
-from ledger.integrity import PredictionStatus, PreregisteredCaptureRequest, RegistrationStatus
+from ledger.integrity import (
+    PredictionStatus,
+    PreregisteredCaptureRequest,
+    RegistrationStatus,
+    StrategyEdgeForecast,
+)
 from ledger.json_utils import canonical_json
 
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -84,6 +89,9 @@ class AuthoritativeReceipt(BaseModel):
     prediction_id: str = Field(min_length=1, max_length=128)
     run_id: str = Field(min_length=1, max_length=128)
     registration_status: Literal[RegistrationStatus.PREREGISTERED]
+    forecast: StrategyEdgeForecast
+    decision: str = Field(min_length=1)
+    lineage: dict[str, JsonValue]
     status: PredictionStatus
     transaction_state: Literal["committed"]
     schema_id: str = Field(min_length=1, max_length=256)
@@ -167,6 +175,9 @@ class _WireReceipt(BaseModel):
     prediction_id: str
     run_id: str
     registration_status: str
+    forecast: dict[str, Any]
+    decision: str
+    lineage: dict[str, Any]
     status: str
     transaction_state: str
     schema_id: str

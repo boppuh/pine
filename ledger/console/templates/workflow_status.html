@@ -2,7 +2,10 @@
 {% block content %}
 <section class="page-heading compact-heading" aria-labelledby="workflow-status-heading">
   <p class="eyebrow">Capture status</p>
-  {% if workflow.state.value in ['frozen', 'submitting'] %}
+  {% if workflow.state.value == 'extracting' %}
+  <h1 id="workflow-status-heading">Extracting proposal</h1>
+  <p class="lede">Pine is validating the source and preparing a reviewable proposal. No ledger record has been created.</p>
+  {% elif workflow.state.value in ['frozen', 'submitting'] %}
   <h1 id="workflow-status-heading">Submitting frozen request</h1>
   <p class="lede">The reviewed request is locked while Pine waits for an authoritative result.</p>
   {% elif workflow.state.value == 'uncertain' %}
@@ -17,7 +20,7 @@
   {% endif %}
 </section>
 
-<section class="status-card" aria-label="Frozen workflow state">
+<section class="status-card" aria-label="Workflow state">
   <div class="status-card-heading">
     <span class="badge{% if workflow.state.value == 'terminal_failure' %} is-warning{% endif %}">{{ workflow.state.value | replace('_', ' ') }}</span>
     <code>{{ workflow.workflow_id }}</code>
@@ -27,7 +30,11 @@
     {% for key, detail in error_details.items() %}<li>{{ detail }}</li>{% endfor %}
   </ul>
   {% endif %}
+  {% if workflow.state.value == 'extracting' %}
+  <p class="field-help">Extraction is proposal-only. Return to this status page to continue when it completes.</p>
+  {% else %}
   <p class="field-help">No fields can change after confirmation. The stored idempotency key remains bound to the frozen request.</p>
+  {% endif %}
 </section>
 
 <div class="form-actions status-actions">

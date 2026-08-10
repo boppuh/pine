@@ -105,7 +105,10 @@ def test_capture_sends_canonical_bytes_once_and_accepts_additive_receipt(
     assert calls == [canonical_json(request.model_dump(mode="json")).encode()]
 
 
-def test_authoritative_receipt_validates_committed_projection(tmp_path: Path) -> None:
+def test_authoritative_receipt_validates_committed_projection(
+    tmp_path: Path,
+    proposal: DraftProposal,
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/predictions/pred_client"
         assert request.headers["authorization"] == f"Bearer {TOKEN}"
@@ -115,6 +118,9 @@ def test_authoritative_receipt_validates_committed_projection(tmp_path: Path) ->
                 "prediction_id": "pred_client",
                 "run_id": "run_client",
                 "registration_status": "preregistered",
+                "forecast": proposal.forecast.model_dump(mode="json"),
+                "decision": proposal.decision,
+                "lineage": proposal.lineage,
                 "status": "open",
                 "transaction_state": "committed",
                 "schema_id": "finance/strategy-edge:1",
@@ -133,7 +139,10 @@ def test_authoritative_receipt_validates_committed_projection(tmp_path: Path) ->
     assert receipt.committed_at.tzinfo is not None
 
 
-def test_authoritative_receipt_rejects_wrong_prediction_binding(tmp_path: Path) -> None:
+def test_authoritative_receipt_rejects_wrong_prediction_binding(
+    tmp_path: Path,
+    proposal: DraftProposal,
+) -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -141,6 +150,9 @@ def test_authoritative_receipt_rejects_wrong_prediction_binding(tmp_path: Path) 
                 "prediction_id": "different_prediction",
                 "run_id": "run_client",
                 "registration_status": "preregistered",
+                "forecast": proposal.forecast.model_dump(mode="json"),
+                "decision": proposal.decision,
+                "lineage": proposal.lineage,
                 "status": "open",
                 "transaction_state": "committed",
                 "schema_id": "finance/strategy-edge:1",

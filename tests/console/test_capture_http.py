@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from ledger.console.errors import BackendDomainError, BackendTransportError
 from ledger.console.models import CaptureInput, WorkflowState
 from ledger.extraction import ExtractionResult, ExtractionStatus
+from ledger.integrity import StrategyEdgeForecast
 
 from .conftest import FakeBackend, MutableClock
 from .test_http_security import HOST, IDENTITY, _build_app, _client, _identity_headers
@@ -305,6 +306,37 @@ def test_submitting_status_does_not_display_a_generic_failure(
         assert "The request could not be completed safely" not in status.text
 
 
+def test_extracting_status_is_presented_as_proposal_work_in_progress(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+    clock: MutableClock,
+) -> None:
+    app, config, store, _sessions = _build_app(tmp_path, fake_backend, clock)
+
+    with _client(app, config) as client:
+        assert client.get("/", headers=_identity_headers()).status_code == 200
+        workflow = store.create_workflow(
+            user_id=IDENTITY,
+            source_text="Proposal extraction in progress",
+        )
+        extracting = store.begin_extraction(
+            workflow.workflow_id,
+            workflow.user_id,
+            expected_version=workflow.version,
+        )
+
+        status = client.get(
+            f"/workflows/{extracting.workflow_id}/status",
+            headers=_identity_headers(),
+        )
+
+        assert status.status_code == 200
+        assert "Extracting proposal" in status.text
+        assert "No ledger record has been created" in status.text
+        assert "Action required" not in status.text
+        assert "rejected this frozen request" not in status.text
+
+
 def test_cancel_discards_transient_content_without_capture(
     tmp_path: Path,
     fake_backend: FakeBackend,
@@ -505,7 +537,16 @@ def test_receipt_does_not_infer_commit_when_authoritative_read_is_unavailable(
         assert "Preregistration committed" not in receipt.text
 
 
-@pytest.mark.parametrize("failure_kind", ["backend_integrity", "binding_mismatch"])
+@pytest.mark.parametrize(
+    "failure_kind",
+    [
+        "backend_integrity",
+        "binding_mismatch",
+        "forecast_mismatch",
+        "decision_mismatch",
+        "lineage_mismatch",
+    ],
+)
 def test_receipt_integrity_failure_is_not_presented_as_a_transient_outage(
     tmp_path: Path,
     fake_backend: FakeBackend,
@@ -531,11 +572,33 @@ def test_receipt_integrity_failure_is_not_presented_as_a_transient_outage(
                     message="receipt verification failed",
                 )
             )
-        else:
+        elif failure_kind == "binding_mismatch":
             authority = fake_backend.get_receipt(fake_backend.response.prediction_id)
             fake_backend.receipt_requests.clear()
             fake_backend.receipt_outcomes.append(
                 authority.model_copy(update={"run_id": "run_mismatched"})
+            )
+        elif failure_kind == "forecast_mismatch":
+            authority = fake_backend.get_receipt(fake_backend.response.prediction_id)
+            fake_backend.receipt_requests.clear()
+            forecast = authority.forecast.model_dump(mode="json")
+            forecast["strategy_id"] = "strat_mismatched"
+            fake_backend.receipt_outcomes.append(
+                authority.model_copy(
+                    update={"forecast": StrategyEdgeForecast.model_validate(forecast)}
+                )
+            )
+        elif failure_kind == "decision_mismatch":
+            authority = fake_backend.get_receipt(fake_backend.response.prediction_id)
+            fake_backend.receipt_requests.clear()
+            fake_backend.receipt_outcomes.append(
+                authority.model_copy(update={"decision": "A different decision."})
+            )
+        else:
+            authority = fake_backend.get_receipt(fake_backend.response.prediction_id)
+            fake_backend.receipt_requests.clear()
+            fake_backend.receipt_outcomes.append(
+                authority.model_copy(update={"lineage": {"family_id": "fam_mismatched"}})
             )
 
         receipt = client.get(confirmed.headers["location"], headers=_identity_headers())

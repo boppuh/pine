@@ -190,6 +190,11 @@ class WorkflowService:
         )
         try:
             response = self.backend.capture(request.to_backend_request())
+            committed = self.store.record_capture_response(
+                workflow.workflow_id,
+                user_id,
+                response,
+            )
         except BackendDomainError as exc:
             state = _failure_state(exc.disposition)
             logger.warning(
@@ -232,7 +237,6 @@ class WorkflowService:
                 code="console_internal_error",
                 details=("capture outcome requires exact replay",),
             )
-        committed = self.store.record_capture_response(workflow.workflow_id, user_id, response)
         logger.info(
             "console_capture_receipt_persisted",
             extra={
