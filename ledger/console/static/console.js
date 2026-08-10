@@ -57,6 +57,21 @@ if (freshness instanceof HTMLElement) {
         message.textContent =
           "Changed since advisory check; Pine will re-check on confirmation.";
       }
+    } else if (freshness.dataset.originalFresh === "true") {
+      freshness.classList.remove("is-warning");
+      if (title) title.textContent = "Window was fresh at extraction";
+      if (message) {
+        message.textContent =
+          "No touched family window overlapped at the advisory check.";
+      }
+    } else {
+      freshness.classList.add("is-warning");
+      if (title) title.textContent = "Window overlap detected";
+      if (message) {
+        message.textContent =
+          "The proposed family and OOS window overlapped prior research. " +
+          "Confirmation will fail closed unless the authoritative check passes.";
+      }
     }
   };
   for (const input of inputs) input?.addEventListener("input", updateFreshness);

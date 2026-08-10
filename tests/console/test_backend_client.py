@@ -257,6 +257,31 @@ def test_capture_receipt_must_bind_schema_and_artifact_names(
         _client(tmp_path, handler).capture(request)
 
 
+def test_capture_receipt_must_bind_reviewed_schema_hash(
+    tmp_path: Path,
+    capture_input: CaptureInput,
+) -> None:
+    request = capture_input.freeze("console-00000000-0000-4000-8000-000000000001")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "prediction_id": "pred_client",
+                "run_id": "run_client",
+                "record_ref": "predictions/pred_client.md",
+                "snapshot_ref": ".ledger/snapshots/pred_client.json",
+                "schema_id": "finance/strategy-edge:1",
+                "schema_hash": f"sha256:{'c' * 64}",
+                "immutable_hash": f"sha256:{'b' * 64}",
+                "created": True,
+            },
+        )
+
+    with pytest.raises(BackendProtocolError, match="binding"):
+        _client(tmp_path, handler).capture(request)
+
+
 def test_structured_error_is_classified_and_sensitive_details_are_redacted(
     tmp_path: Path,
     capture_input: CaptureInput,

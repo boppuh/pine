@@ -183,6 +183,14 @@ def test_keyboard_capture_flow_in_chromium_and_webkit(
         page.keyboard.press("ControlOrMeta+A")
         page.keyboard.type("fam_console_keyboard")
         expect(page.get_by_text("Changed since advisory check", exact=False)).to_be_visible()
+        page.get_by_label("Research family ID").fill("fam_console")
+        expect(page.get_by_text("Window was fresh at extraction", exact=True)).to_be_visible()
+        expect(
+            page.get_by_text(
+                "No touched family window overlapped at the advisory check.",
+                exact=True,
+            )
+        ).to_be_visible()
         page.get_by_role("button", name="Confirm preregistration").focus()
         page.keyboard.press("Enter")
         page.wait_for_url("**/receipt")

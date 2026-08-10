@@ -15,6 +15,7 @@ from ledger.errors import (
     ForecastValidationError,
     FreshWindowError,
     IdempotencyConflictError,
+    IntegrityError,
     SnapshotCaptureError,
 )
 from ledger.integrity import (
@@ -101,6 +102,11 @@ class CaptureService:
                 if not valid:
                     raise ForecastValidationError(errors)
                 schema_hash = self.schema_registry.hash(schema)
+                if (
+                    capture.expected_schema_hash is not None
+                    and schema_hash != capture.expected_schema_hash
+                ):
+                    raise IntegrityError("capture schema differs from the reviewed schema hash")
 
                 window = capture.forecast.out_of_sample_window
                 overlap = self.registry.find_touched_window_overlap(
@@ -236,13 +242,14 @@ class CaptureService:
 
     @staticmethod
     def _request_hash(request: PreregisteredCaptureRequest) -> str:
-        return sha256_json(
-            {
-                "schema_id": request.schema_id,
-                "registration_status": RegistrationStatus.PREREGISTERED.value,
-                "forecast": request.forecast.model_dump(mode="json"),
-                "decision": request.decision,
-                "lineage": request.lineage,
-                "body": request.body,
-            }
-        )
+        payload = {
+            "schema_id": request.schema_id,
+            "registration_status": RegistrationStatus.PREREGISTERED.value,
+            "forecast": request.forecast.model_dump(mode="json"),
+            "decision": request.decision,
+            "lineage": request.lineage,
+            "body": request.body,
+        }
+        if request.expected_schema_hash is not None:
+            payload["expected_schema_hash"] = request.expected_schema_hash
+        return sha256_json(payload)

@@ -88,6 +88,7 @@ class ReviewForm(BaseModel):
         self,
         *,
         body: str,
+        schema_hash: str,
         lineage_context: dict[str, JsonValue] | None = None,
     ) -> CaptureInput:
         """Build a validated nested capture request while preserving lineage context."""
@@ -96,6 +97,7 @@ class ReviewForm(BaseModel):
         lineage["family_id"] = self.family_id
         return CaptureInput(
             schema_id=self.schema_id,
+            schema_hash=schema_hash,
             forecast=StrategyEdgeForecast(
                 strategy_id=self.strategy_id,
                 expected_metrics=ExpectedMetrics(

@@ -297,3 +297,34 @@ def test_schema_drift_during_snapshot_capture_fails_closed(
 
     assert list((vault / "predictions").iterdir()) == []
     assert list((vault / ".ledger" / "snapshots").iterdir()) == []
+
+
+def test_reviewed_schema_hash_drift_fails_before_snapshot(
+    vault: Path,
+    capture_request: PreregisteredCaptureRequest,
+) -> None:
+    provider = FakeSnapshotProvider()
+    service = CaptureService(vault, provider, clock=lambda: DECISION_AT)
+    reviewed_hash = service.schema_registry.hash(
+        service.schema_registry.load(capture_request.schema_id)
+    )
+    request_data = capture_request.model_dump(mode="json")
+    request_data["expected_schema_hash"] = reviewed_hash
+    reviewed_request = PreregisteredCaptureRequest.model_validate(request_data)
+    schema_path = vault / ".ledger" / "schemas" / "finance" / "strategy-edge.1.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema["$comment"] = "changed after proposal review"
+    schema_path.write_text(json.dumps(schema), encoding="utf-8")
+
+    with pytest.raises(IntegrityError, match="reviewed schema hash"):
+        service.capture(reviewed_request)
+
+    assert provider.calls == []
+    assert list((vault / "predictions").iterdir()) == []
+    assert list((vault / ".ledger" / "snapshots").iterdir()) == []
+    connection = service.registry.connect()
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM predictions").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM capture_requests").fetchone()[0] == 0
+    finally:
+        connection.close()

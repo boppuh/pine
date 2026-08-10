@@ -42,6 +42,7 @@ _EXPECTED_ERROR_STATUSES = {
     "idempotency_conflict": 409,
     "snapshot_unavailable": 503,
     "integrity_error": 409,
+    "prediction_not_found": 404,
     "internal_error": 500,
 }
 
@@ -285,6 +286,10 @@ class ConsoleBackendClient:
             raise BackendProtocolError("backend capture response is invalid") from exc
         if (
             response.schema_id != request.schema_id
+            or (
+                request.expected_schema_hash is not None
+                and response.schema_hash != request.expected_schema_hash
+            )
             or response.record_ref != f"predictions/{response.prediction_id}.md"
             or response.snapshot_ref != f".ledger/snapshots/{response.prediction_id}.json"
         ):

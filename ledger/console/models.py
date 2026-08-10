@@ -83,6 +83,7 @@ class CaptureInput(BaseModel):
     model_config = ConfigDict(allow_inf_nan=False, extra="forbid", frozen=True)
 
     schema_id: str = Field(default="finance/strategy-edge:1", min_length=1, max_length=256)
+    schema_hash: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     forecast: StrategyEdgeForecast
     decision: str = Field(min_length=1)
     lineage: dict[str, JsonValue]
@@ -102,6 +103,7 @@ class CaptureInput(BaseModel):
         request = PreregisteredCaptureRequest(
             idempotency_key=idempotency_key,
             schema_id=self.schema_id,
+            expected_schema_hash=self.schema_hash,
             forecast=self.forecast,
             decision=self.decision,
             lineage=self.lineage,
@@ -122,6 +124,10 @@ class FrozenCaptureRequest(_ImmutableConsoleModel):
 
     idempotency_key: str = Field(min_length=1, max_length=256)
     schema_id: str = Field(min_length=1, max_length=256)
+    expected_schema_hash: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+    )
     forecast: StrategyEdgeForecast
     decision: str = Field(min_length=1)
     lineage: FrozenDict

@@ -341,6 +341,13 @@ class ConsoleStateStore:
             )
             if capture_input.schema_id != row["schema_id"]:
                 raise WorkflowConflictError("capture schema differs from the workflow schema")
+            proposal = self._workflow_from_row(row).proposal
+            if proposal is None:
+                raise WorkflowConflictError("reviewing workflow lacks a proposal")
+            if capture_input.schema_hash != proposal.schema_hash:
+                raise WorkflowConflictError(
+                    "capture schema hash differs from the reviewed proposal"
+                )
             request = capture_input.freeze(row["idempotency_key"])
             self._update(
                 connection,

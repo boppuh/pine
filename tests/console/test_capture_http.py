@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ledger.console.errors import BackendDomainError, BackendTransportError
-from ledger.console.models import WorkflowState
+from ledger.console.models import CaptureInput, WorkflowState
 from ledger.extraction import ExtractionResult, ExtractionStatus
 
 from .conftest import FakeBackend, MutableClock
@@ -205,17 +205,35 @@ def test_unable_extraction_preserves_editable_source_and_reuses_transient_workfl
         assert "field required" in unable.text
         assert fake_backend.capture_requests == []
 
+        invalid_revision = client.post(
+            "/workflows",
+            headers=_post_headers(),
+            data={
+                "csrf_token": _form_token(unable.text, "/workflows"),
+                "schema_id": "finance/strategy-edge:1",
+                "source_text": "   ",
+                "workflow_id": workflow_id,
+                "version": _hidden_value(unable.text, "version"),
+            },
+        )
+        assert invalid_revision.status_code == 422
+        assert _hidden_value(invalid_revision.text, "workflow_id") == workflow_id
+        assert _hidden_value(invalid_revision.text, "version") == _hidden_value(
+            unable.text, "version"
+        )
+        assert store.get_workflow(workflow_id, IDENTITY).state is WorkflowState.EDITING
+
         revised = original + " Expected Sharpe 1.0 and win rate 0.55."
         fake_backend.proposal.body = revised
         retry = client.post(
             "/workflows",
             headers=_post_headers(),
             data={
-                "csrf_token": _form_token(unable.text, "/workflows"),
+                "csrf_token": _form_token(invalid_revision.text, "/workflows"),
                 "schema_id": "finance/strategy-edge:1",
                 "source_text": revised,
                 "workflow_id": workflow_id,
-                "version": _hidden_value(unable.text, "version"),
+                "version": _hidden_value(invalid_revision.text, "version"),
             },
             follow_redirects=False,
         )
@@ -226,6 +244,40 @@ def test_unable_extraction_preserves_editable_source_and_reuses_transient_workfl
         assert workflow.source_text == revised
         assert len(fake_backend.draft_requests) == 2
         assert fake_backend.capture_requests == []
+        connection = store.connect()
+        try:
+            assert connection.execute("SELECT COUNT(*) FROM workflows").fetchone()[0] == 1
+        finally:
+            connection.close()
+
+
+def test_submitting_status_does_not_display_a_generic_failure(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+    clock: MutableClock,
+    capture_input: CaptureInput,
+) -> None:
+    app, config, store, _sessions = _build_app(tmp_path, fake_backend, clock)
+
+    with _client(app, config) as client:
+        workflow_id, _review_path = _start_ready_workflow(client, fake_backend)
+        reviewing = store.get_workflow(workflow_id, IDENTITY)
+        submitting = store.freeze_and_begin_submission(
+            workflow_id,
+            IDENTITY,
+            capture_input,
+            expected_version=reviewing.version,
+        )
+        assert submitting.state is WorkflowState.SUBMITTING
+
+        status = client.get(
+            f"/workflows/{workflow_id}/status",
+            headers=_identity_headers(),
+        )
+
+        assert status.status_code == 200
+        assert "Submitting frozen request" in status.text
+        assert "The request could not be completed safely" not in status.text
 
 
 def test_cancel_discards_transient_content_without_capture(
@@ -425,4 +477,47 @@ def test_receipt_does_not_infer_commit_when_authoritative_read_is_unavailable(
         assert receipt.status_code == 200
         assert "Capture response retained" in receipt.text
         assert "Transaction state is not being inferred" in receipt.text
+        assert "Preregistration committed" not in receipt.text
+
+
+@pytest.mark.parametrize("failure_kind", ["backend_integrity", "binding_mismatch"])
+def test_receipt_integrity_failure_is_not_presented_as_a_transient_outage(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+    clock: MutableClock,
+    failure_kind: str,
+) -> None:
+    app, config, _store, _sessions = _build_app(tmp_path, fake_backend, clock)
+
+    with _client(app, config) as client:
+        workflow_id, review_path = _start_ready_workflow(client, fake_backend)
+        review = client.get(review_path, headers=_identity_headers())
+        confirmed = client.post(
+            f"/workflows/{workflow_id}/confirm",
+            headers=_post_headers(),
+            data=_review_data(review.text, workflow_id),
+            follow_redirects=False,
+        )
+        if failure_kind == "backend_integrity":
+            fake_backend.receipt_outcomes.append(
+                BackendDomainError(
+                    status_code=409,
+                    code="integrity_error",
+                    message="receipt verification failed",
+                )
+            )
+        else:
+            authority = fake_backend.get_receipt(fake_backend.response.prediction_id)
+            fake_backend.receipt_requests.clear()
+            fake_backend.receipt_outcomes.append(
+                authority.model_copy(update={"run_id": "run_mismatched"})
+            )
+
+        receipt = client.get(confirmed.headers["location"], headers=_identity_headers())
+
+        assert receipt.status_code == 200
+        assert "Receipt integrity check failed" in receipt.text
+        assert "Do not rely on this receipt" in receipt.text
+        assert "temporarily unavailable" not in receipt.text
+        assert "Reload this page" not in receipt.text
         assert "Preregistration committed" not in receipt.text

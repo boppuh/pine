@@ -69,6 +69,7 @@ def test_successful_confirmation_freezes_request_and_receipt_once(
     )
     assert committed.frozen_request is not None
     assert committed.frozen_request.idempotency_key == reviewing.idempotency_key
+    assert committed.frozen_request.expected_schema_hash == proposal.schema_hash
     with pytest.raises(IntegrityError, match="immutable"):
         committed.frozen_request.lineage["family_id"] = "changed"
     with pytest.raises(ValidationError, match="frozen"):
@@ -91,6 +92,36 @@ def test_successful_confirmation_freezes_request_and_receipt_once(
             )
     finally:
         connection.close()
+
+
+def test_confirmation_rejects_a_schema_hash_other_than_the_reviewed_proposal(
+    console_store: ConsoleStateStore,
+    fake_backend: FakeBackend,
+    proposal: DraftProposal,
+    capture_input: CaptureInput,
+) -> None:
+    service = WorkflowService(console_store, fake_backend)
+    reviewing = _ready_workflow(service, proposal)
+    mismatched = CaptureInput.model_validate(
+        {
+            **capture_input.model_dump(mode="json"),
+            "schema_hash": f"sha256:{'c' * 64}",
+        }
+    )
+
+    with pytest.raises(WorkflowConflictError, match="reviewed proposal"):
+        service.confirm(
+            reviewing.workflow_id,
+            reviewing.user_id,
+            mismatched,
+            expected_version=reviewing.version,
+        )
+
+    assert fake_backend.capture_requests == []
+    assert (
+        console_store.get_workflow(reviewing.workflow_id, reviewing.user_id).state
+        is WorkflowState.REVIEWING
+    )
 
 
 def test_lost_response_retry_replays_byte_equivalent_frozen_request(

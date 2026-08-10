@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import anyio
+from anyio.to_thread import run_sync
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,6 +26,7 @@ from ledger.console.backend_client import (
 )
 from ledger.console.config import ConsoleConfig
 from ledger.console.errors import (
+    BackendDomainError,
     BackendError,
     BackendProtocolError,
     WorkflowConflictError,
@@ -75,8 +81,12 @@ def create_console_app(
     *,
     sessions: ConsoleSessionStore | None = None,
     limiter: ConsoleRateLimiter | None = None,
+    retention_sweep_interval_seconds: float = 300.0,
 ) -> FastAPI:
     """Create the private console with its capture workflow and locked boundary."""
+
+    if retention_sweep_interval_seconds <= 0:
+        raise ValueError("retention sweep interval must be positive")
 
     session_store = sessions or ConsoleSessionStore(
         store,
@@ -95,11 +105,24 @@ def create_console_app(
     workflows = WorkflowService(store, backend)
     session_store.cleanup_expired()
     templates = _templates()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(
+                _retention_cleanup_loop,
+                store,
+                retention_sweep_interval_seconds,
+            )
+            yield
+            task_group.cancel_scope.cancel()
+
     app = FastAPI(
         title="Pine Research Console",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=lifespan,
     )
     app.state.console_sessions = session_store
     app.state.console_limiter = rate_limiter
@@ -184,9 +207,16 @@ def create_console_app(
         except (HTTPException, ValidationError, ValueError) as exc:
             source_text = _first_form_value(request, "source_text")
             errors = _form_errors(exc)
+            workflow = _preserved_revision_workflow(
+                request,
+                store,
+                identity,
+                field_names=field_names,
+            )
             return _render_new(
                 templates,
                 request,
+                workflow=workflow,
                 source_text=source_text,
                 errors=errors,
                 status_code=422,
@@ -247,6 +277,7 @@ def create_console_app(
             form = ReviewForm.model_validate(values)
             capture = form.to_capture_input(
                 body=workflow.proposal.body,
+                schema_hash=workflow.proposal.schema_hash,
                 lineage_context=workflow.proposal.lineage,
             )
         except (HTTPException, ValidationError, ValueError) as exc:
@@ -342,7 +373,7 @@ def create_console_app(
                 f"/workflows/{workflow.workflow_id}/status",
                 status_code=303,
             )
-        authority = _verified_receipt(backend, workflow)
+        verification = _verified_receipt(backend, workflow)
         return templates.TemplateResponse(
             request=request,
             name="hypothesis_receipt.html",
@@ -354,7 +385,8 @@ def create_console_app(
                 ),
                 "workflow": workflow,
                 "receipt": workflow.capture_response,
-                "authority": authority,
+                "authority": verification.authority,
+                "verification_state": verification.state.value,
             },
         )
 
@@ -514,6 +546,37 @@ def _first_form_value(request: Request, field: str) -> str:
     return values[0] if len(values) == 1 else ""
 
 
+def _preserved_revision_workflow(
+    request: Request,
+    store: ConsoleStateStore,
+    identity: str,
+    *,
+    field_names: frozenset[str],
+) -> ConsoleWorkflow | None:
+    """Recover only a valid, owner-bound revision after source validation fails."""
+
+    if field_names != HYPOTHESIS_REVISION_FIELDS:
+        return None
+    raw = require_form_values(request.scope)
+    if frozenset(raw) != HYPOTHESIS_REVISION_FIELDS or any(
+        len(items) != 1 for items in raw.values()
+    ):
+        return None
+    try:
+        workflow_id = _uuid4(raw["workflow_id"][0])
+        version = _version({"version": raw["version"][0]})
+        workflow = store.get_workflow(workflow_id, identity)
+    except (HTTPException, WorkflowNotFoundError):
+        return None
+    if (
+        workflow.state is not WorkflowState.EDITING
+        or workflow.version != version
+        or workflow.schema_id != raw["schema_id"][0]
+    ):
+        return None
+    return workflow
+
+
 def _submitted_review_values(
     request: Request,
     workflow: ConsoleWorkflow,
@@ -578,6 +641,8 @@ def _form_errors(exc: Exception) -> dict[str, str]:
 
 
 def _workflow_errors(workflow: ConsoleWorkflow) -> dict[str, str]:
+    if workflow.error_code is None and workflow.error_details is None:
+        return {}
     details = workflow.error_details or {}
     values = details.get("details", [])
     if not isinstance(values, list):
@@ -623,13 +688,25 @@ def _workflow_redirect(workflow: ConsoleWorkflow) -> RedirectResponse:
     )
 
 
+class _ReceiptVerificationState(StrEnum):
+    VERIFIED = "verified"
+    UNAVAILABLE = "unavailable"
+    INTEGRITY_FAILURE = "integrity_failure"
+
+
+@dataclass(frozen=True, slots=True)
+class _ReceiptVerification:
+    state: _ReceiptVerificationState
+    authority: AuthoritativeReceipt | None = None
+
+
 def _verified_receipt(
     backend: ConsoleBackend,
     workflow: ConsoleWorkflow,
-) -> AuthoritativeReceipt | None:
+) -> _ReceiptVerification:
     response = workflow.capture_response
     if response is None:
-        return None
+        return _ReceiptVerification(_ReceiptVerificationState.INTEGRITY_FAILURE)
     try:
         authority = backend.get_receipt(response.prediction_id)
         if (
@@ -641,13 +718,51 @@ def _verified_receipt(
             or authority.snapshot_ref != response.snapshot_ref
         ):
             raise BackendProtocolError("authoritative receipt does not match capture response")
+    except BackendProtocolError:
+        LOGGER.error(
+            "console_receipt_integrity_failed",
+            extra={"workflow_id": workflow.workflow_id},
+        )
+        return _ReceiptVerification(_ReceiptVerificationState.INTEGRITY_FAILURE)
+    except BackendDomainError as exc:
+        if exc.code in {"integrity_error", "prediction_not_found"}:
+            LOGGER.error(
+                "console_receipt_integrity_failed",
+                extra={"workflow_id": workflow.workflow_id},
+            )
+            return _ReceiptVerification(_ReceiptVerificationState.INTEGRITY_FAILURE)
+        LOGGER.warning(
+            "console_receipt_authority_unavailable",
+            extra={"workflow_id": workflow.workflow_id},
+        )
+        return _ReceiptVerification(_ReceiptVerificationState.UNAVAILABLE)
     except BackendError:
         LOGGER.warning(
             "console_receipt_authority_unavailable",
             extra={"workflow_id": workflow.workflow_id},
         )
-        return None
-    return authority
+        return _ReceiptVerification(_ReceiptVerificationState.UNAVAILABLE)
+    return _ReceiptVerification(_ReceiptVerificationState.VERIFIED, authority)
+
+
+async def _retention_cleanup_loop(
+    store: ConsoleStateStore,
+    interval_seconds: float,
+) -> None:
+    """Continuously enforce workflow expiry for a long-running console process."""
+
+    while True:
+        try:
+            removed = await run_sync(store.cleanup_expired)
+        except Exception:
+            LOGGER.error("console_retention_cleanup_failed", exc_info=True)
+        else:
+            if removed:
+                LOGGER.info(
+                    "console_retention_cleanup_completed",
+                    extra={"removed_count": removed},
+                )
+        await anyio.sleep(interval_seconds)
 
 
 def _templates() -> Jinja2Templates:

@@ -59,6 +59,7 @@ def _build_app(
     *,
     allowed_identities: tuple[str, ...] = (IDENTITY,),
     socket_path: Path | None = None,
+    retention_sweep_interval_seconds: float = 300.0,
 ):
     socket_path = socket_path or tmp_path / "console.sock"
     state_path = tmp_path / "state" / "console.db"
@@ -79,7 +80,13 @@ def _build_app(
         idle_lifetime=config.session_idle_lifetime,
         clock=clock,
     )
-    app = create_console_app(config, store, backend, sessions=sessions)
+    app = create_console_app(
+        config,
+        store,
+        backend,
+        sessions=sessions,
+        retention_sweep_interval_seconds=retention_sweep_interval_seconds,
+    )
     return app, config, store, sessions
 
 
@@ -95,6 +102,36 @@ def _identity_headers(identity: str = IDENTITY) -> dict[str, str]:
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Dest": "document",
     }
+
+
+def test_long_running_console_continuously_removes_expired_workflows(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+    clock: MutableClock,
+) -> None:
+    app, config, store, _sessions = _build_app(
+        tmp_path,
+        fake_backend,
+        clock,
+        retention_sweep_interval_seconds=0.01,
+    )
+
+    with _client(app, config) as client:
+        assert client.get("/", headers=_identity_headers()).status_code == 200
+        store.create_workflow(user_id=IDENTITY, source_text="Temporary hypothesis")
+        clock.advance(timedelta(hours=25))
+        deadline = time.monotonic() + 2
+        remaining = 1
+        while remaining and time.monotonic() < deadline:
+            connection = store.connect()
+            try:
+                remaining = connection.execute("SELECT COUNT(*) FROM workflows").fetchone()[0]
+            finally:
+                connection.close()
+            if remaining:
+                time.sleep(0.01)
+
+    assert remaining == 0
 
 
 def _csrf_from_html(content: str) -> str:

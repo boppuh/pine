@@ -125,6 +125,7 @@ def proposal(valid_forecast: Mapping[str, Any]) -> DraftProposal:
 def capture_input(proposal: DraftProposal) -> CaptureInput:
     return CaptureInput(
         schema_id=proposal.schema_id,
+        schema_hash=proposal.schema_hash,
         forecast=proposal.forecast,
         decision=proposal.decision,
         lineage=proposal.lineage,
