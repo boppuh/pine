@@ -12,8 +12,8 @@
       <label for="registration_status">Registration</label>
       <select id="registration_status" name="registration_status">
         <option value="">All registrations</option>
-        {% for value in ['preregistered', 'exploratory', 'imported', 'unregistered_external'] %}
-        <option value="{{ value }}"{% if filters.registration_status == value %} selected{% endif %}>{{ value | replace('_', ' ') | title }}</option>
+        {% for option in registration_status_options %}
+        <option value="{{ option.value }}"{% if filters.registration_status == option.value %} selected{% endif %}>{{ option.value | replace('_', ' ') | title }}</option>
         {% endfor %}
       </select>
     </div>
@@ -21,8 +21,8 @@
       <label for="status">Prediction status</label>
       <select id="status" name="status">
         <option value="">All statuses</option>
-        {% for value in ['open', 'resolved', 'quarantined'] %}
-        <option value="{{ value }}"{% if filters.status == value %} selected{% endif %}>{{ value | title }}</option>
+        {% for option in status_options %}
+        <option value="{{ option.value }}"{% if filters.status == option.value %} selected{% endif %}>{{ option.value | replace('_', ' ') | title }}</option>
         {% endfor %}
       </select>
     </div>
@@ -30,8 +30,8 @@
       <label for="result_state">Result evidence</label>
       <select id="result_state" name="result_state">
         <option value="">Any result state</option>
-        {% for value in ['present', 'absent'] %}
-        <option value="{{ value }}"{% if filters.result_state == value %} selected{% endif %}>{{ value | title }}</option>
+        {% for option in result_state_options %}
+        <option value="{{ option.value }}"{% if filters.result_state == option.value %} selected{% endif %}>{{ option.value | replace('_', ' ') | title }}</option>
         {% endfor %}
       </select>
     </div>
@@ -57,7 +57,7 @@
     <article class="prediction-row prediction-row-detailed{% if prediction.integrity_state.value == 'failed' %} is-unverified{% endif %}">
       <div class="prediction-primary">
         {% if prediction.integrity_state.value == 'verified' %}
-        <a href="/predictions/{{ prediction.prediction_id }}">{{ prediction.strategy_id }}</a>
+        <a href="/predictions/{{ prediction.prediction_id | url_path_segment }}">{{ prediction.strategy_id }}</a>
         <span>{{ prediction.prediction_id }}</span>
         {% else %}
         <strong>Verification failed</strong>

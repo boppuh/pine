@@ -74,11 +74,35 @@ def test_prediction_list_passes_filters_and_preserves_them_in_next_page(
     assert strategy_id in response.text
     assert "cursor=next%2B%2F%3D" in response.text
     assert "registration_status=preregistered" in response.text
+    assert '<option value="invalidated">Invalidated</option>' in response.text
     request = fake_backend.prediction_list_requests[-1]
     assert request["registration_status"] == "preregistered"
     assert request["status"] == "open"
     assert request["strategy_id"] == strategy_id
     assert request["result_state"] is ResultState.ABSENT
+
+
+def test_prediction_links_encode_opaque_ids_as_path_segments(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+    clock: MutableClock,
+) -> None:
+    opaque_id = "pred?query#fragment"
+    summary = fake_backend.prediction_page.items[0].model_copy(update={"prediction_id": opaque_id})
+    fake_backend.prediction_page = PredictionPage(items=(summary,), next_cursor=None)
+    app, config, _store, _sessions = _build_app(tmp_path, fake_backend, clock)
+
+    with _client(app, config) as client:
+        dashboard = client.get("/", headers=_identity_headers())
+        listing = client.get("/predictions", headers=_identity_headers())
+
+    encoded_link = 'href="/predictions/pred%3Fquery%23fragment"'
+    assert dashboard.status_code == 200
+    assert listing.status_code == 200
+    assert encoded_link in dashboard.text
+    assert encoded_link in listing.text
+    assert 'href="/predictions/pred?query#fragment"' not in dashboard.text
+    assert 'href="/predictions/pred?query#fragment"' not in listing.text
 
 
 def test_failed_summary_does_not_render_unverified_forecast_fields(
@@ -144,6 +168,7 @@ def test_prediction_detail_is_verified_plain_text_and_renders_result_evidence(
     run = detail.run.model_copy(
         update={
             "state": RunState.COMPLETED,
+            "execution_started_at": clock.value,
             "completed_at": clock.value,
             "exit_code": 0,
         }
@@ -168,6 +193,13 @@ def test_prediction_detail_is_verified_plain_text_and_renders_result_evidence(
     assert "Evidence verified" in response.text
     assert "Out-of-sample result" in response.text
     assert "summary.csv" in response.text
+    assert "Allocated at" in response.text
+    assert "Execution started" in response.text
+    assert "Exit code" in response.text
+    assert "<dd>0</dd>" in response.text
+    assert response.text.count('class="plain-text structured-text" tabindex="0"') == 5
+    assert 'aria-label="Lineage JSON"' in response.text
+    assert 'aria-label="Mutable record body"' in response.text
     assert "&lt;script&gt;alert" in response.text
     assert "&lt;img src=x onerror=alert(1)&gt;" in response.text
     assert "<script>alert('record')</script>" not in response.text
@@ -232,6 +264,9 @@ def test_status_combines_console_and_non_secret_ledger_counts(
     fake_backend: FakeBackend,
     clock: MutableClock,
 ) -> None:
+    fake_backend.ledger_status = fake_backend.ledger_status.model_copy(
+        update={"quarantined_predictions": 2}
+    )
     app, config, _store, _sessions = _build_app(tmp_path, fake_backend, clock)
 
     with _client(app, config) as client:
@@ -240,5 +275,7 @@ def test_status_combines_console_and_non_secret_ledger_counts(
     assert response.status_code == 200
     assert "Committed predictions" in response.text
     assert "Integrity violations" in response.text
+    assert "Quarantined predictions" in response.text
+    assert ">2</span>" in response.text
     assert "Verified run results" in response.text
     assert f"Version {CONSOLE_SCHEMA_VERSION}" in response.text

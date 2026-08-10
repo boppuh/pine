@@ -69,7 +69,7 @@
     <article class="prediction-row{% if prediction.integrity_state.value == 'failed' %} is-unverified{% endif %}">
       <div class="prediction-primary">
         {% if prediction.integrity_state.value == 'verified' %}
-        <a href="/predictions/{{ prediction.prediction_id }}">{{ prediction.strategy_id }}</a>
+        <a href="/predictions/{{ prediction.prediction_id | url_path_segment }}">{{ prediction.strategy_id }}</a>
         <span>{{ prediction.prediction_id }}</span>
         {% else %}
         <strong>Verification failed</strong>

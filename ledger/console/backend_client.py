@@ -349,7 +349,7 @@ class ConsoleBackendClient:
         payload = self._request(
             "GET",
             f"/v1/predictions/{quote(safe_prediction_id, safe='')}",
-            timeout=self.config.health_timeout_seconds,
+            timeout=self.config.read_timeout_seconds,
         )
         try:
             wire = _WireReceipt.model_validate(payload)
@@ -400,7 +400,7 @@ class ConsoleBackendClient:
         payload = self._request(
             "GET",
             f"/v1/predictions?{urlencode(parameters)}",
-            timeout=self.config.health_timeout_seconds,
+            timeout=self.config.read_timeout_seconds,
         )
         page = _validated_read_projection(payload, PredictionPage, operation="prediction list")
         if len(page.items) > limit:
@@ -412,8 +412,8 @@ class ConsoleBackendClient:
 
         seen: set[str] = set()
         for item in page.items:
-            _safe_identifier(item.prediction_id)
-            _safe_identifier(item.run_id)
+            _validated_response_identifier(item.prediction_id)
+            _validated_response_identifier(item.run_id)
             if item.prediction_id in seen:
                 raise BackendProtocolError("backend prediction list contains duplicate identities")
             seen.add(item.prediction_id)
@@ -457,14 +457,14 @@ class ConsoleBackendClient:
         payload = self._request(
             "GET",
             f"/v1/predictions/{quote(safe_prediction_id, safe='')}",
-            timeout=self.config.health_timeout_seconds,
+            timeout=self.config.read_timeout_seconds,
         )
         detail = _validated_read_projection(
             payload, PredictionDetail, operation="prediction detail"
         )
-        _safe_identifier(detail.prediction_id)
-        _safe_identifier(detail.run_id)
-        _safe_relative_reference(detail.snapshot_ref)
+        _validated_response_identifier(detail.prediction_id)
+        _validated_response_identifier(detail.run_id)
+        _validated_response_reference(detail.snapshot_ref)
         binding = detail.run.binding
         if (
             detail.prediction_id != safe_prediction_id
@@ -494,7 +494,7 @@ class ConsoleBackendClient:
         payload = self._request(
             "GET",
             "/v1/status",
-            timeout=self.config.health_timeout_seconds,
+            timeout=self.config.read_timeout_seconds,
         )
         status = _validated_read_projection(payload, LedgerStatus, operation="ledger status")
         if status.status != "ok" or status.api_version != "v1":
@@ -603,6 +603,15 @@ def _safe_identifier(value: str) -> str:
     return value
 
 
+def _validated_response_identifier(value: str) -> str:
+    """Convert an unsafe authenticated response identity into a protocol failure."""
+
+    try:
+        return _safe_identifier(value)
+    except ValueError as exc:
+        raise BackendProtocolError("backend response identifier is unsafe") from exc
+
+
 def _safe_relative_reference(value: str) -> str:
     path = PurePosixPath(value)
     if (
@@ -614,6 +623,15 @@ def _safe_relative_reference(value: str) -> str:
     ):
         raise ValueError("backend artifact reference is unsafe")
     return value
+
+
+def _validated_response_reference(value: str) -> str:
+    """Convert an unsafe authenticated artifact reference into a protocol failure."""
+
+    try:
+        return _safe_relative_reference(value)
+    except ValueError as exc:
+        raise BackendProtocolError("backend response artifact reference is unsafe") from exc
 
 
 def sanitize_backend_details(details: tuple[str, ...]) -> tuple[str, ...]:

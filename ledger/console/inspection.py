@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 from datetime import datetime
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -90,3 +90,9 @@ def display_json(value: object | None) -> str:
     if value is None:
         return "Not recorded"
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def url_path_segment(value: str) -> str:
+    """Encode one opaque identifier without allowing URL path delimiters."""
+
+    return quote(value, safe="")

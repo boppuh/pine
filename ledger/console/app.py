@@ -44,6 +44,7 @@ from ledger.console.inspection import (
     display_json,
     display_timestamp,
     parse_prediction_query,
+    url_path_segment,
 )
 from ledger.console.models import ConsoleWorkflow, WorkflowState
 from ledger.console.rate_limit import ConsoleAbuseControls, ConsoleRateLimiter
@@ -58,7 +59,8 @@ from ledger.console.security import (
 from ledger.console.sessions import ConsoleSessionStore, hash_user_identity
 from ledger.console.state import ConsoleStateStore
 from ledger.console.workflow import WorkflowService
-from ledger.read_models import LedgerStatus
+from ledger.integrity import PredictionStatus, RegistrationStatus
+from ledger.read_models import LedgerStatus, ResultState
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent
 _TEMPLATE_ROOT = _PACKAGE_ROOT / "templates"
@@ -249,6 +251,9 @@ def create_console_app(
                 **_page_context(request, page_title="Predictions", active_page="predictions"),
                 "predictions": page.items,
                 "filters": query.filter_values(),
+                "registration_status_options": tuple(RegistrationStatus),
+                "status_options": tuple(PredictionStatus),
+                "result_state_options": tuple(ResultState),
                 "next_page_url": (
                     None if page.next_cursor is None else query.page_url(cursor=page.next_cursor)
                 ),
@@ -941,6 +946,7 @@ def _templates() -> Jinja2Templates:
         enable_async=False,
     )
     environment.filters["timestamp"] = display_timestamp
+    environment.filters["url_path_segment"] = url_path_segment
     return Jinja2Templates(env=environment)
 
 

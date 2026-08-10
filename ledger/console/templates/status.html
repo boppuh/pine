@@ -46,6 +46,13 @@
   </div>
   <div class="status-row">
     <div>
+      <h2>Quarantined predictions</h2>
+      <p>Committed records withheld from normal inspection</p>
+    </div>
+    <span class="status-value is-plain">{% if ledger_status %}{{ ledger_status.quarantined_predictions }}{% else %}Unavailable{% endif %}</span>
+  </div>
+  <div class="status-row">
+    <div>
       <h2>Verified run results</h2>
       <p>Immutable MSM result evidence</p>
     </div>

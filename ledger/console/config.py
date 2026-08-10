@@ -29,6 +29,7 @@ class ConsoleConfig(BaseModel):
     allowed_identities: tuple[str, ...]
     connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
     health_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
+    read_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     extraction_timeout_seconds: float = Field(default=90.0, gt=0, le=300)
     capture_timeout_seconds: float = Field(default=120.0, gt=0, le=600)
     ordinary_retention_hours: int = Field(default=24, ge=1, le=24 * 30)
@@ -150,6 +151,7 @@ class ConsoleConfig(BaseModel):
             "PINE_CONSOLE_BACKEND_CREDENTIAL_PATH": ("backend_credential_path", Path),
             "PINE_CONSOLE_CONNECT_TIMEOUT_SECONDS": ("connect_timeout_seconds", float),
             "PINE_CONSOLE_HEALTH_TIMEOUT_SECONDS": ("health_timeout_seconds", float),
+            "PINE_CONSOLE_READ_TIMEOUT_SECONDS": ("read_timeout_seconds", float),
             "PINE_CONSOLE_EXTRACTION_TIMEOUT_SECONDS": (
                 "extraction_timeout_seconds",
                 float,

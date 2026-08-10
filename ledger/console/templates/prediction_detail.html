@@ -62,8 +62,11 @@
   <dl class="definition-grid detail-definitions">
     <div><dt>Run ID</dt><dd><code>{{ prediction.run_id }}</code></dd></div>
     <div><dt>Run state</dt><dd>{{ prediction.run.state.value }}</dd></div>
-    <div><dt>Started</dt><dd>{{ prediction.run.started_at | timestamp }}</dd></div>
+    <div><dt>Allocated at</dt><dd>{{ prediction.run.started_at | timestamp }}</dd></div>
+    <div><dt>Execution started</dt><dd>{{ prediction.run.execution_started_at | timestamp }}</dd></div>
     <div><dt>Completed</dt><dd>{{ prediction.run.completed_at | timestamp }}</dd></div>
+    <div><dt>Exit code</dt><dd>{% if prediction.run.exit_code is not none %}{{ prediction.run.exit_code }}{% else %}Not recorded{% endif %}</dd></div>
+    <div><dt>Failure note</dt><dd>{{ prediction.run.failure_note or 'Not recorded' }}</dd></div>
     <div><dt>Prediction created</dt><dd>{{ prediction.created_at | timestamp }}</dd></div>
     <div><dt>Prediction committed</dt><dd>{{ prediction.committed_at | timestamp }}</dd></div>
   </dl>
@@ -148,21 +151,21 @@
 <section class="detail-section detail-split" aria-label="Lineage and record context">
   <article>
     <h2>Lineage</h2>
-    <pre class="plain-text structured-text">{{ lineage_json }}</pre>
+    <pre class="plain-text structured-text" tabindex="0" role="region" aria-label="Lineage JSON">{{ lineage_json }}</pre>
   </article>
   <article>
     <h2>Mutable record context</h2>
     <p class="muted-copy">This body is displayed as plain text and is not trusted as immutable evidence.</p>
-    <pre class="plain-text structured-text">{{ prediction.body }}</pre>
+    <pre class="plain-text structured-text" tabindex="0" role="region" aria-label="Mutable record body">{{ prediction.body }}</pre>
   </article>
 </section>
 
 <section class="detail-section" aria-labelledby="resolution-heading">
   <div class="section-heading"><h2 id="resolution-heading">Resolution metadata</h2></div>
   <div class="structured-grid">
-    <article><h3>Outcome</h3><pre class="plain-text structured-text">{{ outcome_json }}</pre></article>
-    <article><h3>Grade</h3><pre class="plain-text structured-text">{{ grade_json }}</pre></article>
-    <article><h3>Resolution</h3><pre class="plain-text structured-text">{{ resolution_json }}</pre></article>
+    <article><h3>Outcome</h3><pre class="plain-text structured-text" tabindex="0" role="region" aria-label="Outcome JSON">{{ outcome_json }}</pre></article>
+    <article><h3>Grade</h3><pre class="plain-text structured-text" tabindex="0" role="region" aria-label="Grade JSON">{{ grade_json }}</pre></article>
+    <article><h3>Resolution</h3><pre class="plain-text structured-text" tabindex="0" role="region" aria-label="Resolution JSON">{{ resolution_json }}</pre></article>
   </div>
 </section>
 
