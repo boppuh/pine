@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 import threading
@@ -26,6 +27,7 @@ from playwright.sync_api import (
 
 from ledger.console.app import create_console_app
 from ledger.console.config import ConsoleConfig
+from ledger.console.errors import BackendTransportError
 from ledger.console.sessions import ConsoleSessionStore
 from ledger.console.state import ConsoleStateStore
 
@@ -63,6 +65,7 @@ def _browser_probe(
     evidence_root: Path | None = None,
     har_path: Path | None = None,
     after_context: Callable[[_BrowserProbe], None] | None = None,
+    trace_sources: bool = True,
 ) -> Iterator[_BrowserProbe]:
     """Run an instrumented context and retain a trace on in- or post-context failure."""
 
@@ -88,7 +91,7 @@ def _browser_probe(
             }
         )
     context = browser.new_context(**context_options)
-    context.tracing.start(screenshots=True, snapshots=True, sources=True)
+    context.tracing.start(screenshots=True, snapshots=True, sources=trace_sources)
     page = context.new_page()
     errors: list[str] = []
     requests: list[str] = []
@@ -537,6 +540,19 @@ def _contrast_ratio(page: Page, foreground: str, background: str) -> float:
     )
 
 
+def _assert_accessible_page(page: Page, label: str) -> None:
+    assert _dom_accessibility_issues(page) == [], label
+    assert _contrast_ratio(page, "body", "body") >= 4.5, label
+    for foreground, background in (
+        (".lede", "body"),
+        (".freshness-notice.is-warning", ".freshness-notice.is-warning"),
+        (".notice.is-warning", ".notice.is-warning"),
+        (".error-summary", ".error-summary"),
+    ):
+        if page.locator(foreground).count():
+            assert _contrast_ratio(page, foreground, background) >= 4.5, f"{label}: {foreground}"
+
+
 @pytest.mark.parametrize("color_scheme", ["light", "dark"])
 def test_console_pages_pass_automated_accessibility_checks(
     playwright_runtime: Playwright,
@@ -564,9 +580,7 @@ def test_console_pages_pass_automated_accessibility_checks(
             response = probe.page.goto(path)
             assert response is not None
             assert "default-src 'none'" in response.headers["content-security-policy"]
-            assert _dom_accessibility_issues(probe.page) == [], path
-            assert _contrast_ratio(probe.page, "body", "body") >= 4.5
-            assert _contrast_ratio(probe.page, ".lede", "body") >= 4.5
+            _assert_accessible_page(probe.page, path)
             assert probe.page.evaluate("window.__pineCspViolations") == []
 
         probe.page.goto("/")
@@ -580,10 +594,27 @@ def test_console_pages_pass_automated_accessibility_checks(
         probe.page.get_by_role("button", name="Extract proposal").click()
         error_summary = probe.page.locator("[data-error-summary]")
         expect(error_summary).to_be_focused()
-        assert _dom_accessibility_issues(probe.page) == []
-        assert _contrast_ratio(probe.page, ".error-summary", ".error-summary") >= 4.5
+        _assert_accessible_page(probe.page, "capture validation error")
         assert probe.errors and all("422" in message for message in probe.errors)
         probe.errors.clear()
+        assert probe.page.evaluate("window.__pineCspViolations") == []
+
+        probe.page.get_by_label("Hypothesis source").fill(backend.proposal.body)
+        probe.page.get_by_role("button", name="Extract proposal").click()
+        probe.page.wait_for_url("**/review")
+        probe.page.get_by_label("Research family ID").fill("fam_console_accessibility_changed")
+        expect(probe.page.get_by_text("Changed since advisory check", exact=False)).to_be_visible()
+        _assert_accessible_page(probe.page, "capture review")
+
+        backend.capture_outcomes.append(BackendTransportError("synthetic uncertain outcome"))
+        probe.page.get_by_role("button", name="Confirm preregistration").click()
+        probe.page.wait_for_url("**/status")
+        _assert_accessible_page(probe.page, "workflow status")
+
+        probe.page.get_by_role("button", name="Retry exact frozen request").click()
+        probe.page.wait_for_url("**/receipt")
+        _assert_accessible_page(probe.page, "capture receipt")
+        assert probe.errors == []
         assert probe.page.evaluate("window.__pineCspViolations") == []
     assert not probe.trace_path.exists()
 
@@ -598,9 +629,18 @@ def test_browser_traffic_storage_and_assets_exclude_server_secrets(
     backend = browser_server.backend
     har_path = tmp_path / "browser-security.har"
     browser_material_parts: list[str] = []
+    forbidden_values = (
+        TOKEN,
+        "Authorization: Bearer",
+        '"name": "authorization"',
+        str(browser_server.credential_path),
+        "/run/credentials/pine-console.service/backend-token",
+    )
+    caplog.set_level(logging.INFO)
 
     def assert_no_server_secrets(_probe: _BrowserProbe) -> None:
         assert har_path.is_file()
+        assert _probe.trace_path.is_file()
         browser_material = "\n".join(
             [
                 *browser_material_parts,
@@ -608,14 +648,14 @@ def test_browser_traffic_storage_and_assets_exclude_server_secrets(
                 caplog.text,
             ]
         )
-        for forbidden in (
-            TOKEN,
-            "Authorization: Bearer",
-            '"name": "authorization"',
-            str(browser_server.credential_path),
-            "/run/credentials/pine-console.service/backend-token",
-        ):
+        for forbidden in forbidden_values:
             assert forbidden not in browser_material
+        with ZipFile(_probe.trace_path) as archive:
+            assert archive.testzip() is None
+            for name in archive.namelist():
+                material = archive.read(name)
+                for forbidden in forbidden_values:
+                    assert forbidden.encode("utf-8") not in material, name
         har_path.unlink()
 
     with _browser_probe(
@@ -625,6 +665,7 @@ def test_browser_traffic_storage_and_assets_exclude_server_secrets(
         name="browser-security",
         har_path=har_path,
         after_context=assert_no_server_secrets,
+        trace_sources=False,
     ) as probe:
         for path in (
             "/",
@@ -638,11 +679,13 @@ def test_browser_traffic_storage_and_assets_exclude_server_secrets(
             browser_material_parts.append(probe.page.content())
             assert probe.page.evaluate("window.__pineCspViolations") == []
 
+        readiness = probe.page.request.get(f"{base_url}/readyz")
         javascript = probe.page.request.get(f"{base_url}/assets/console.js")
         stylesheet = probe.page.request.get(f"{base_url}/assets/console.css")
-        assert javascript.ok and stylesheet.ok
+        assert readiness.ok and javascript.ok and stylesheet.ok
         browser_material_parts.extend(
             [
+                readiness.text(),
                 javascript.text(),
                 stylesheet.text(),
                 json.dumps(probe.context.storage_state(), sort_keys=True),
