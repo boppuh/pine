@@ -51,6 +51,9 @@ assets, configuration, a temporary restricted Unix socket, the backend health co
 when an existing backend is discoverable, and the console schema. An older console
 schema receives an online verified backup before its transactional migration. Any
 failure before selection leaves `current` unchanged and removes the incomplete release.
+At service start, a credential-free state preflight runs before the console server. The
+server then verifies its loaded backend credential and backend readiness before opening
+the Unix socket; the periodic readiness unit repeats the full credentialed check.
 
 ## Configure Tailscale Serve
 
