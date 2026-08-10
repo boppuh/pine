@@ -17,7 +17,13 @@ uv run ruff format --check .
 uv run pyright ledger
 ```
 
-After installing the Playwright Chromium and WebKit runtimes, run the opt-in browser gate:
+Install the Playwright Chromium and WebKit runtimes:
+
+```console
+uv run playwright install --with-deps chromium webkit
+```
+
+Then run the opt-in browser gate:
 
 ```console
 PINE_RUN_BROWSER_TESTS=1 \

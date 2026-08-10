@@ -10,6 +10,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit
 from zipfile import ZipFile
@@ -71,53 +72,59 @@ def _browser_probe(
 
     browser_type: BrowserType = getattr(playwright_runtime, engine)
     browser = browser_type.launch()
-    trace_root = evidence_root or Path(
-        os.environ.get("PINE_BROWSER_EVIDENCE_DIR", str(tmp_path / "browser-evidence"))
-    )
-    trace_path = trace_root / f"{name}-{engine}.zip"
-    trace_path.unlink(missing_ok=True)
-    context_options: dict[str, Any] = {
-        "base_url": base_url,
-        "viewport": {"width": 1280, "height": 900},
-        "color_scheme": color_scheme,
-    }
-    if har_path is not None:
-        har_path.unlink(missing_ok=True)
-        context_options.update(
-            {
-                "record_har_path": str(har_path),
-                "record_har_content": "embed",
-                "record_har_mode": "full",
-            }
-        )
-    context = browser.new_context(**context_options)
-    context.tracing.start(screenshots=True, snapshots=True, sources=trace_sources)
-    page = context.new_page()
-    errors: list[str] = []
-    requests: list[str] = []
-    page.on("pageerror", lambda error: errors.append(str(error)))
-    page.on(
-        "console",
-        lambda message: errors.append(message.text) if message.type == "error" else None,
-    )
-    page.on("request", lambda request: requests.append(request.url))
-    page.add_init_script(
-        """
-        window.__pineCspViolations = [];
-        document.addEventListener("securitypolicyviolation", (event) => {
-          window.__pineCspViolations.push({
-            blockedURI: event.blockedURI,
-            directive: event.effectiveDirective,
-          });
-        });
-        """
-    )
+    context: BrowserContext | None = None
     context_closed = False
     try:
+        trace_root = evidence_root or Path(
+            os.environ.get("PINE_BROWSER_EVIDENCE_DIR", str(tmp_path / "browser-evidence"))
+        )
+        trace_path = trace_root / f"{name}-{engine}.zip"
+        trace_path.unlink(missing_ok=True)
+        context_options: dict[str, Any] = {
+            "base_url": base_url,
+            "viewport": {"width": 1280, "height": 900},
+            "color_scheme": color_scheme,
+        }
+        if har_path is not None:
+            har_path.unlink(missing_ok=True)
+            context_options.update(
+                {
+                    "record_har_path": str(har_path),
+                    "record_har_content": "embed",
+                    "record_har_mode": "full",
+                }
+            )
+        active_context = browser.new_context(**context_options)
+        context = active_context
+        active_context.tracing.start(
+            screenshots=True,
+            snapshots=True,
+            sources=trace_sources,
+        )
+        page = active_context.new_page()
+        errors: list[str] = []
+        requests: list[str] = []
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.on(
+            "console",
+            lambda message: errors.append(message.text) if message.type == "error" else None,
+        )
+        page.on("request", lambda request: requests.append(request.url))
+        page.add_init_script(
+            """
+            window.__pineCspViolations = [];
+            document.addEventListener("securitypolicyviolation", (event) => {
+              window.__pineCspViolations.push({
+                blockedURI: event.blockedURI,
+                directive: event.effectiveDirective,
+              });
+            });
+            """
+        )
         try:
             probe = _BrowserProbe(
                 page=page,
-                context=context,
+                context=active_context,
                 errors=errors,
                 requests=requests,
                 trace_path=trace_path,
@@ -126,26 +133,28 @@ def _browser_probe(
         except BaseException:
             trace_path.parent.mkdir(parents=True, exist_ok=True)
             try:
-                context.tracing.stop(path=trace_path)
+                active_context.tracing.stop(path=trace_path)
             except Exception:
                 pass
             raise
         else:
             if after_context is None:
-                context.tracing.stop()
+                active_context.tracing.stop()
             else:
                 trace_path.parent.mkdir(parents=True, exist_ok=True)
-                context.tracing.stop(path=trace_path)
+                active_context.tracing.stop(path=trace_path)
                 try:
-                    context.close()
+                    active_context.close()
                 finally:
                     context_closed = True
                 after_context(probe)
                 trace_path.unlink()
     finally:
-        if not context_closed:
-            context.close()
-        browser.close()
+        try:
+            if context is not None and not context_closed:
+                context.close()
+        finally:
+            browser.close()
 
 
 class _TrustedIngress:
@@ -270,6 +279,57 @@ def browser_server(
         worker.join(5)
         listener.close()
         assert not worker.is_alive()
+
+
+def test_browser_probe_closes_resources_when_setup_fails(
+    playwright_runtime: Playwright,
+    tmp_path: Path,
+) -> None:
+    closed: list[str] = []
+
+    class FakeTracing:
+        def start(self, **_kwargs: object) -> None:
+            return None
+
+    class FakePage:
+        def on(self, *_args: object) -> None:
+            return None
+
+        def add_init_script(self, _script: str) -> None:
+            raise RuntimeError("synthetic setup failure")
+
+    class FakeContext:
+        tracing = FakeTracing()
+
+        def new_page(self) -> FakePage:
+            return FakePage()
+
+        def close(self) -> None:
+            closed.append("context")
+
+    class FakeBrowser:
+        def new_context(self, **_kwargs: object) -> FakeContext:
+            return FakeContext()
+
+        def close(self) -> None:
+            closed.append("browser")
+
+    class FakeBrowserType:
+        def launch(self) -> FakeBrowser:
+            return FakeBrowser()
+
+    runtime: Any = SimpleNamespace(chromium=FakeBrowserType())
+    assert playwright_runtime.chromium is not None
+    with pytest.raises(RuntimeError, match="synthetic setup failure"):
+        with _browser_probe(
+            runtime,
+            base_url="http://localhost",
+            tmp_path=tmp_path,
+            name="setup-failure",
+        ):
+            pytest.fail("setup failure should occur before the probe yields")
+
+    assert closed == ["context", "browser"]
 
 
 @pytest.mark.parametrize("engine", ["chromium", "webkit"])
@@ -513,7 +573,11 @@ def _contrast_ratio(page: Page, foreground: str, background: str) -> float:
                 context.clearRect(0, 0, 1, 1);
                 context.fillStyle = color;
                 context.fillRect(0, 0, 1, 1);
-                return Array.from(context.getImageData(0, 0, 1, 1).data).slice(0, 3);
+                const [red, green, blue, alpha] = Array.from(
+                  context.getImageData(0, 0, 1, 1).data
+                );
+                if (alpha !== 255) throw new Error("contrast sample must be opaque");
+                return [red, green, blue];
               };
               const luminance = (rgb) => {
                 const channels = rgb.map((value) => {
@@ -631,8 +695,6 @@ def test_browser_traffic_storage_and_assets_exclude_server_secrets(
     browser_material_parts: list[str] = []
     forbidden_values = (
         TOKEN,
-        "Authorization: Bearer",
-        '"name": "authorization"',
         str(browser_server.credential_path),
         "/run/credentials/pine-console.service/backend-token",
     )
@@ -641,10 +703,19 @@ def test_browser_traffic_storage_and_assets_exclude_server_secrets(
     def assert_no_server_secrets(_probe: _BrowserProbe) -> None:
         assert har_path.is_file()
         assert _probe.trace_path.is_file()
+        har_text = har_path.read_text(encoding="utf-8")
+        har_document = json.loads(har_text)
+        header_names = {
+            str(header.get("name", "")).casefold()
+            for entry in har_document["log"]["entries"]
+            for exchange in ("request", "response")
+            for header in entry[exchange].get("headers", ())
+        }
+        assert "authorization" not in header_names
         browser_material = "\n".join(
             [
                 *browser_material_parts,
-                har_path.read_text(encoding="utf-8"),
+                har_text,
                 caplog.text,
             ]
         )
@@ -734,6 +805,7 @@ def test_browser_trace_is_retained_for_a_failed_journey(
             name=f"synthetic-{failure_stage}",
             evidence_root=failure_evidence,
             after_context=fail_after_context if failure_stage == "post-context" else None,
+            trace_sources=False,
         ) as probe:
             probe.page.goto("/")
             if failure_stage == "in-context":
