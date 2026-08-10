@@ -3,7 +3,10 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import os
+import socket
+import stat
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
@@ -13,7 +16,8 @@ from ledger.console.config import ConsoleConfig
 from ledger.console.errors import ConsoleConfigError
 from ledger.console.models import CaptureInput, WorkflowState
 from ledger.console.state import ConsoleStateStore
-from ledger.console_cli import run_cli
+from ledger.console.unix_socket import CONSOLE_SOCKET_MODE
+from ledger.console_cli import run_cli, run_console_app
 from ledger.extraction import DraftProposal, ExtractionResult, ExtractionStatus
 
 TOKEN = "console-cli-token-" + "q" * 48
@@ -26,6 +30,9 @@ class FakeClient:
 
     def health(self) -> HealthResponse:
         self.health_calls += 1
+        return HealthResponse()
+
+    def ready(self) -> HealthResponse:
         return HealthResponse()
 
     def close(self) -> None:
@@ -93,6 +100,39 @@ def test_serve_runs_recovery_before_injected_socket_runner(tmp_path: Path) -> No
         "status": {"schema_version": 2},
         "health": "ok",
     }
+
+
+def test_default_runner_passes_an_owner_only_prebound_socket_to_uvicorn(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    environment = _environment(tmp_path)
+    runtime_path = Path("/tmp") / f"pine-console-cli-{uuid4().hex[:12]}"
+    runtime_path.mkdir(mode=0o700)
+    environment["PINE_CONSOLE_SOCKET_PATH"] = str(runtime_path / "console.sock")
+    config = ConsoleConfig.from_env(environment)
+    store = ConsoleStateStore(config.state_path)
+    observed: dict[str, object] = {}
+
+    def fake_run(_app, **options) -> None:
+        assert "uds" not in options
+        duplicated = socket.fromfd(options["fd"], socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            socket_path = Path(duplicated.getsockname())
+        finally:
+            duplicated.close()
+        observed["path"] = socket_path
+        observed["mode"] = stat.S_IMODE(socket_path.stat().st_mode)
+
+    monkeypatch.setattr("ledger.console_cli.uvicorn.run", fake_run)
+    run_console_app(config, store, FakeClient(config))
+
+    assert observed == {
+        "path": config.socket_path,
+        "mode": CONSOLE_SOCKET_MODE,
+    }
+    assert not config.socket_path.exists()
+    runtime_path.rmdir()
 
 
 def test_serve_recovers_submitting_before_backend_initialization(

@@ -198,6 +198,8 @@ CREATE TABLE console_sessions (
     CHECK (LENGTH(user_id) BETWEEN 1 AND 320),
     CHECK (LENGTH(csrf_secret) = 43),
     CHECK (csrf_secret NOT GLOB '*[^A-Za-z0-9_-]*'),
+    CHECK (LENGTH(created_at) >= 20),
+    CHECK (LENGTH(last_seen_at) >= 20),
     CHECK (LENGTH(absolute_expires_at) >= 20),
     CHECK (LENGTH(idle_expires_at) >= 20),
     CHECK (created_at <= last_seen_at),

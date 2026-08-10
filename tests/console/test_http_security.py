@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import stat
 import threading
 import time
 from datetime import timedelta
@@ -11,18 +12,22 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
+import pytest
 import uvicorn
 from fastapi.testclient import TestClient
 
 from ledger.console.app import _templates, create_console_app
 from ledger.console.config import ConsoleConfig
-from ledger.console.security import CONTENT_SECURITY_POLICY
+from ledger.console.errors import BackendTransportError
+from ledger.console.rate_limit import ConsoleAbuseControls, ConsoleRateLimiter
+from ledger.console.security import CONTENT_SECURITY_POLICY, ConsoleSecurityMiddleware
 from ledger.console.sessions import (
     SESSION_COOKIE_NAME,
     ConsoleSessionStore,
     hash_session_id,
 )
 from ledger.console.state import ConsoleStateStore
+from ledger.console.unix_socket import CONSOLE_SOCKET_MODE, secure_unix_socket
 
 from .conftest import FakeBackend, MutableClock
 
@@ -84,7 +89,12 @@ def _client(app, config: ConsoleConfig, *, unix: bool = True) -> TestClient:
 
 
 def _identity_headers(identity: str = IDENTITY) -> dict[str, str]:
-    return {"Tailscale-User-Login": identity}
+    return {
+        "Tailscale-User-Login": identity,
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document",
+    }
 
 
 def _csrf_from_html(content: str) -> str:
@@ -122,38 +132,43 @@ def test_real_uvicorn_unix_socket_scope_establishes_identity(
     fake_backend: FakeBackend,
     clock: MutableClock,
 ) -> None:
-    socket_path = Path("/tmp") / f"pine-console-test-{uuid4().hex}.sock"
+    runtime_path = Path("/tmp") / f"pine-console-test-{uuid4().hex}"
+    runtime_path.mkdir(mode=0o700)
+    socket_path = runtime_path / "console.sock"
     app, config, _store, _sessions = _build_app(
         tmp_path,
         fake_backend,
         clock,
         socket_path=socket_path,
     )
-    server = uvicorn.Server(
-        uvicorn.Config(
-            app,
-            uds=str(config.socket_path),
-            access_log=False,
-            log_level="error",
+    with secure_unix_socket(config.socket_path) as listener:
+        server = uvicorn.Server(
+            uvicorn.Config(
+                app,
+                fd=listener.fileno(),
+                access_log=False,
+                log_level="error",
+            )
         )
-    )
-    worker = threading.Thread(target=server.run, daemon=True)
-    worker.start()
-    deadline = time.monotonic() + 5
-    while not config.socket_path.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert config.socket_path.exists()
-    try:
-        transport = httpx.HTTPTransport(uds=str(config.socket_path))
-        with httpx.Client(transport=transport, base_url=f"http://{HOST}") as client:
-            response = client.get("/", headers=_identity_headers())
-        assert response.status_code == 200
-        assert SESSION_COOKIE_NAME in response.headers["set-cookie"]
-    finally:
-        server.should_exit = True
-        worker.join(5)
-        socket_path.unlink(missing_ok=True)
-    assert not worker.is_alive()
+        worker = threading.Thread(target=server.run, daemon=True)
+        worker.start()
+        deadline = time.monotonic() + 5
+        while not server.started and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server.started
+        assert stat.S_IMODE(config.socket_path.stat().st_mode) == CONSOLE_SOCKET_MODE
+        try:
+            transport = httpx.HTTPTransport(uds=str(config.socket_path))
+            with httpx.Client(transport=transport, base_url=f"http://{HOST}") as client:
+                response = client.get("/", headers=_identity_headers())
+            assert response.status_code == 200
+            assert SESSION_COOKIE_NAME in response.headers["set-cookie"]
+        finally:
+            server.should_exit = True
+            worker.join(5)
+        assert not worker.is_alive()
+    assert not socket_path.exists()
+    runtime_path.rmdir()
 
 
 def test_route_inventory_is_public_only_for_health(
@@ -220,6 +235,8 @@ def test_authenticated_shell_sets_exact_cookie_headers_and_local_assets(
         assert "https://" not in asset.text
         assert "http://" not in asset.text
         assert "@import" not in asset.text
+        assert response.text.count("(not yet available)") == 2
+        assert ".visually-hidden" in asset.text
 
     connection = store.connect()
     try:
@@ -288,42 +305,161 @@ def test_sessionless_writes_are_denied_without_creating_or_rotating_session(
         connection.close()
 
 
-def test_session_database_wait_does_not_block_liveness(
+def test_cross_site_safe_request_cannot_establish_or_consume_a_session(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+    clock: MutableClock,
+) -> None:
+    app, config, store, _sessions = _build_app(tmp_path, fake_backend, clock)
+    embedded_headers = {
+        **_identity_headers(),
+        "Sec-Fetch-Site": "cross-site",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Dest": "image",
+    }
+
+    with _client(app, config) as client:
+        for _attempt in range(config.session_attempt_limit + 1):
+            response = client.get("/", headers=embedded_headers)
+            assert response.status_code == 403
+            assert "set-cookie" not in response.headers
+
+        direct_navigation = client.get("/", headers=_identity_headers())
+
+    assert direct_navigation.status_code == 200
+    connection = store.connect()
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM console_sessions").fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_session_establishment_limit_is_enforced_at_http_boundary(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+    clock: MutableClock,
+) -> None:
+    app, config, _store, _sessions = _build_app(tmp_path, fake_backend, clock)
+
+    with _client(app, config) as client:
+        for _attempt in range(config.session_attempt_limit):
+            client.cookies.clear()
+            assert client.get("/", headers=_identity_headers()).status_code == 200
+        client.cookies.clear()
+        limited = client.get("/", headers=_identity_headers())
+
+    assert limited.status_code == 429
+    assert int(limited.headers["retry-after"]) >= 1
+
+
+def test_session_database_waits_are_bounded_and_do_not_block_liveness(
     tmp_path: Path,
     fake_backend: FakeBackend,
     clock: MutableClock,
     monkeypatch,
 ) -> None:
     app, config, _store, sessions = _build_app(tmp_path, fake_backend, clock)
-    started = threading.Event()
+    at_capacity = threading.Event()
     release = threading.Event()
+    counter_lock = threading.Lock()
+    started = 0
     original_lookup = sessions.lookup
 
     def blocking_lookup(cookie_value, user_id):
-        started.set()
+        nonlocal started
+        with counter_lock:
+            started += 1
+            if started == 4:
+                at_capacity.set()
         assert release.wait(5)
         return original_lookup(cookie_value, user_id)
 
     monkeypatch.setattr(sessions, "lookup", blocking_lookup)
 
-    async def exercise() -> tuple[httpx.Response, httpx.Response]:
+    async def exercise() -> tuple[list[httpx.Response], httpx.Response]:
         transport = httpx.ASGITransport(app=UnixSocketScope(app, config.socket_path))
         async with httpx.AsyncClient(
             transport=transport,
             base_url=f"https://{HOST}",
         ) as client:
-            protected = asyncio.create_task(client.get("/", headers=_identity_headers()))
-            assert await asyncio.to_thread(started.wait, 2)
+            protected = [
+                asyncio.create_task(client.get("/", headers=_identity_headers()))
+                for _attempt in range(8)
+            ]
+            assert await asyncio.to_thread(at_capacity.wait, 2)
+            await asyncio.sleep(0.05)
+            with counter_lock:
+                assert started == 4
             live = await asyncio.wait_for(client.get("/livez"), timeout=1)
             release.set()
-            return await protected, live
+            return await asyncio.gather(*protected), live
 
     try:
         protected, live = asyncio.run(exercise())
     finally:
         release.set()
-    assert protected.status_code == 200
+    assert all(response.status_code == 200 for response in protected)
     assert live.status_code == 200
+
+
+def test_failure_after_response_start_does_not_emit_a_second_start(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+    clock: MutableClock,
+) -> None:
+    _app, config, _store, sessions = _build_app(tmp_path, fake_backend, clock)
+    controls = ConsoleAbuseControls(
+        ConsoleRateLimiter(),
+        session_limit=config.session_attempt_limit,
+        extraction_limit=config.extraction_attempt_limit,
+        confirmation_limit=config.confirmation_attempt_limit,
+        retry_limit=config.retry_attempt_limit,
+        window_seconds=config.rate_limit_window_seconds,
+    )
+
+    async def started_then_failed(_scope, _receive, send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        raise RuntimeError("route failed after response start")
+
+    middleware = ConsoleSecurityMiddleware(
+        started_then_failed,
+        config=config,
+        sessions=sessions,
+        abuse_controls=controls,
+    )
+    headers = {
+        **_identity_headers(),
+        "Host": HOST,
+    }
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "https",
+        "path": "/",
+        "raw_path": b"/",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (name.lower().encode("ascii"), value.encode("ascii")) for name, value in headers.items()
+        ],
+        "client": None,
+        "server": (str(config.socket_path), None),
+        "state": {},
+    }
+    messages: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        messages.append(message)
+
+    with pytest.raises(RuntimeError, match="after response start"):
+        asyncio.run(middleware(scope, receive, send))  # type: ignore[arg-type]
+
+    assert [message["type"] for message in messages] == ["http.response.start"]
 
 
 def test_session_establishment_cleans_abandoned_expired_rows(
@@ -534,3 +670,10 @@ def test_health_is_public_but_contains_no_secret_and_readiness_fails_closed(
         unavailable = client.get("/readyz")
     assert unavailable.status_code == 503
     assert unavailable.json() == {"status": "unavailable"}
+
+    Path(config.backend_credential_path).chmod(0o600)
+    fake_backend.ready_outcomes.append(BackendTransportError("cached token was rejected"))
+    with _client(app, config, unix=False) as client:
+        unauthorized = client.get("/readyz")
+    assert unauthorized.status_code == 503
+    assert unauthorized.json() == {"status": "unavailable"}

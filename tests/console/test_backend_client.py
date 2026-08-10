@@ -55,6 +55,24 @@ def test_health_omits_token_and_accepts_additive_response_fields(tmp_path: Path)
     assert _client(tmp_path, handler).health().api_version == "v1"
 
 
+def test_readiness_uses_cached_workflow_token_on_authenticated_status(
+    tmp_path: Path,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/status"
+        assert request.headers["authorization"] == f"Bearer {TOKEN}"
+        return httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "api_version": "v1",
+                "registry_version": 7,
+            },
+        )
+
+    assert _client(tmp_path, handler).ready().api_version == "v1"
+
+
 def test_capture_sends_canonical_bytes_once_and_accepts_additive_receipt(
     tmp_path: Path,
     capture_input: CaptureInput,
@@ -400,6 +418,12 @@ def test_config_loads_private_credential_and_rejects_unsafe_networks(
     )
     with pytest.raises(ConsoleConfigError, match="invalid"):
         ConsoleConfig.from_env(duplicates)
+    non_ascii = dict(
+        environment,
+        PINE_CONSOLE_ALLOWED_IDENTITIES="ßtrasse@example.com",
+    )
+    with pytest.raises(ConsoleConfigError, match="invalid"):
+        ConsoleConfig.from_env(non_ascii)
     unsafe = dict(environment, PINE_CONSOLE_BACKEND_URL="https://public.example.com")
     with pytest.raises(ConsoleConfigError, match="invalid"):
         ConsoleConfig.from_env(unsafe)

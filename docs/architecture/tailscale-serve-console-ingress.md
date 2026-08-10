@@ -27,6 +27,9 @@ This behavior is defined by the official
 ## Deployment boundary
 
 - The console listens only on its configured Unix socket. It has no TCP listener.
+- Pine pre-binds the socket with mode `0600` in a non-group/world-writable runtime
+  directory and passes the open descriptor to Uvicorn; Uvicorn never creates or
+  widens the trusted socket path.
 - The Serve configuration targets that socket and is not configured as Funnel.
 - Socket ownership and mode permit only the console and ingress service boundary.
 - Security-group rules expose neither the console nor the loopback Pine backend.

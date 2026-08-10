@@ -52,6 +52,11 @@ class ConsoleBackend(Protocol):
 
         ...
 
+    def ready(self) -> HealthResponse:
+        """Verify the cached workflow credential against the backend."""
+
+        ...
+
     def create_draft(self, request: HypothesisExtractionRequest) -> ExtractionResult:
         """Return a side-effect-free extraction result."""
 
@@ -178,14 +183,17 @@ class ConsoleBackendClient:
             timeout=self.config.health_timeout_seconds,
             authenticated=False,
         )
-        try:
-            wire = _WireHealth.model_validate(payload)
-            response = HealthResponse(status=wire.status, api_version=wire.api_version)
-        except ValidationError as exc:
-            raise BackendProtocolError("backend health response is invalid") from exc
-        if response.status != "ok" or response.api_version != "v1":
-            raise BackendProtocolError("backend health contract is incompatible")
-        return response
+        return _validated_health(payload, operation="health")
+
+    def ready(self) -> HealthResponse:
+        """Validate API-v1 readiness through an authenticated read endpoint."""
+
+        payload = self._request(
+            "GET",
+            "/v1/status",
+            timeout=self.config.health_timeout_seconds,
+        )
+        return _validated_health(payload, operation="readiness")
 
     def create_draft(self, request: HypothesisExtractionRequest) -> ExtractionResult:
         """Submit extraction once and validate its complete discriminated response."""
@@ -290,6 +298,19 @@ class ConsoleBackendClient:
         if not 200 <= status_code < 300:
             raise BackendProtocolError("backend returned an unexpected status")
         return payload
+
+
+def _validated_health(payload: Mapping[str, Any], *, operation: str) -> HealthResponse:
+    """Validate the shared API-version contract for health and readiness probes."""
+
+    try:
+        wire = _WireHealth.model_validate(payload)
+        response = HealthResponse(status=wire.status, api_version=wire.api_version)
+    except ValidationError as exc:
+        raise BackendProtocolError(f"backend {operation} response is invalid") from exc
+    if response.status != "ok" or response.api_version != "v1":
+        raise BackendProtocolError(f"backend {operation} contract is incompatible")
+    return response
 
 
 def sanitize_backend_details(details: tuple[str, ...]) -> tuple[str, ...]:

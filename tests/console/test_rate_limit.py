@@ -76,3 +76,20 @@ def test_named_extraction_control_combines_window_and_in_flight_gate() -> None:
         with pytest.raises(RateLimitExceeded):
             with controls.extraction("identity-hash"):
                 pass
+
+    with controls.extraction("identity-hash"):
+        pass
+    with pytest.raises(RateLimitExceeded):
+        with controls.extraction("identity-hash"):
+            pass
+
+
+def test_limiter_bounds_distinct_keys_and_rejects_window_changes() -> None:
+    limiter = ConsoleRateLimiter(max_keys=2)
+    limiter.hit("session", "identity-a", limit=2, window_seconds=60)
+    limiter.hit("session", "identity-b", limit=2, window_seconds=60)
+
+    with pytest.raises(RateLimitExceeded):
+        limiter.hit("session", "identity-c", limit=2, window_seconds=60)
+    with pytest.raises(ValueError, match="window cannot change"):
+        limiter.hit("session", "identity-a", limit=2, window_seconds=120)

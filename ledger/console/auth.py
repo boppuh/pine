@@ -21,14 +21,16 @@ class AuthenticatedIdentity:
 def normalize_user_identity(value: str) -> str:
     """Normalize an ASCII ingress identity without accepting ambiguous whitespace."""
 
-    normalized = value.strip().casefold()
+    if not value.isascii():
+        raise ValueError("authenticated identity is invalid")
+    normalized = value.strip()
     if (
         not normalized
         or len(normalized) > 320
         or any(ord(character) < 0x21 or ord(character) > 0x7E for character in normalized)
     ):
         raise ValueError("authenticated identity is invalid")
-    return normalized
+    return normalized.casefold()
 
 
 def authenticate_tailscale_identity(

@@ -247,42 +247,30 @@ def hash_user_identity(user_id: str) -> str:
 
 
 def _session_from_row(row: sqlite3.Row) -> ConsoleSession:
-    values = {
-        "session_hash": str(row["session_hash"]),
-        "user_id": normalize_user_identity(str(row["user_id"])),
-        "csrf_secret": str(row["csrf_secret"]),
-        "created_at": datetime.fromisoformat(str(row["created_at"])),
-        "last_seen_at": datetime.fromisoformat(str(row["last_seen_at"])),
-        "absolute_expires_at": datetime.fromisoformat(str(row["absolute_expires_at"])),
-        "idle_expires_at": datetime.fromisoformat(str(row["idle_expires_at"])),
-    }
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", values["session_hash"]):
+    session_hash = str(row["session_hash"])
+    user_id = normalize_user_identity(str(row["user_id"]))
+    csrf_secret = str(row["csrf_secret"])
+    created_at = datetime.fromisoformat(str(row["created_at"]))
+    last_seen_at = datetime.fromisoformat(str(row["last_seen_at"]))
+    idle_expires_at = datetime.fromisoformat(str(row["idle_expires_at"]))
+    absolute_expires_at = datetime.fromisoformat(str(row["absolute_expires_at"]))
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", session_hash):
         raise ConsoleSessionError("console session hash is invalid")
-    _decode_secret(values["csrf_secret"])
-    datetimes = (
-        values["created_at"],
-        values["last_seen_at"],
-        values["absolute_expires_at"],
-        values["idle_expires_at"],
-    )
-    if any(
-        not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None
-        for value in datetimes
-    ):
+    _decode_secret(csrf_secret)
+    timestamps = (created_at, last_seen_at, idle_expires_at, absolute_expires_at)
+    if any(value.tzinfo is None or value.utcoffset() is None for value in timestamps):
         raise ConsoleSessionError("console session timestamps are invalid")
-    created_at = values["created_at"]
-    last_seen_at = values["last_seen_at"]
-    idle_expires_at = values["idle_expires_at"]
-    absolute_expires_at = values["absolute_expires_at"]
-    if not (
-        isinstance(created_at, datetime)
-        and isinstance(last_seen_at, datetime)
-        and isinstance(idle_expires_at, datetime)
-        and isinstance(absolute_expires_at, datetime)
-        and created_at <= last_seen_at <= idle_expires_at <= absolute_expires_at
-    ):
+    if not created_at <= last_seen_at <= idle_expires_at <= absolute_expires_at:
         raise ConsoleSessionError("console session timestamp order is invalid")
-    return ConsoleSession(**values)  # type: ignore[arg-type]
+    return ConsoleSession(
+        session_hash=session_hash,
+        user_id=user_id,
+        csrf_secret=csrf_secret,
+        created_at=created_at,
+        last_seen_at=last_seen_at,
+        idle_expires_at=idle_expires_at,
+        absolute_expires_at=absolute_expires_at,
+    )
 
 
 def _decode_secret(value: str) -> bytes:

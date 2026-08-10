@@ -131,13 +131,13 @@ class ConsoleAbuseControls:
     def extraction(self, identity_key: str) -> Iterator[None]:
         """Bound attempts and permit one extraction at a time per identity."""
 
-        self.limiter.hit(
-            "extraction",
-            identity_key,
-            limit=self.extraction_limit,
-            window_seconds=self.window_seconds,
-        )
         with self.limiter.one_in_flight("extraction", identity_key):
+            self.limiter.hit(
+                "extraction",
+                identity_key,
+                limit=self.extraction_limit,
+                window_seconds=self.window_seconds,
+            )
             yield
 
     def confirmation(self, workflow_key: str) -> None:

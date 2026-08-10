@@ -12,7 +12,8 @@ from http import HTTPStatus
 from typing import Any
 from urllib.parse import parse_qs
 
-from starlette.concurrency import run_in_threadpool
+from anyio import CapacityLimiter
+from anyio.to_thread import run_sync
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ledger.console.auth import authenticate_tailscale_identity, single_header
@@ -49,6 +50,7 @@ SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
     (b"strict-transport-security", b"max-age=31536000"),
     (b"cache-control", b"no-store"),
 )
+_SESSION_DATABASE_CONCURRENCY = 4
 
 
 class _RequestDisconnected(Exception):
@@ -72,6 +74,7 @@ class ConsoleSecurityMiddleware:
         self.sessions = sessions
         self.abuse_controls = abuse_controls
         self.monotonic_clock = monotonic_clock
+        self.session_database_limiter = CapacityLimiter(_SESSION_DATABASE_CONCURRENCY)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -84,10 +87,12 @@ class ConsoleSecurityMiddleware:
         identity_hash: str | None = None
         response_cookie: tuple[str, int] | None = None
         clear_cookie = False
+        response_started = False
 
         async def secured_send(message: Message) -> None:
-            nonlocal status_code
+            nonlocal response_started, status_code
             if message["type"] == "http.response.start":
+                response_started = True
                 status_code = int(message["status"])
                 headers = _replace_security_headers(list(message.get("headers", [])))
                 headers.append((b"x-request-id", request_id.encode("ascii")))
@@ -147,10 +152,11 @@ class ConsoleSecurityMiddleware:
                 return
 
             cookie_value = _session_cookie_value(scope)
-            lookup = await run_in_threadpool(
+            lookup = await run_sync(
                 self.sessions.lookup,
                 cookie_value,
                 identity.user_id,
+                limiter=self.session_database_limiter,
             )
             if lookup.status is SessionLookupStatus.IDENTITY_MISMATCH:
                 clear_cookie = True
@@ -168,9 +174,20 @@ class ConsoleSecurityMiddleware:
                     clear_cookie = lookup.status is SessionLookupStatus.EXPIRED
                     await _send_plain(secured_send, HTTPStatus.FORBIDDEN, "Forbidden")
                     return
+                if not _valid_session_establishment(scope, method):
+                    clear_cookie = lookup.status is SessionLookupStatus.EXPIRED
+                    await _send_plain(secured_send, HTTPStatus.FORBIDDEN, "Forbidden")
+                    return
                 self.abuse_controls.session_establishment(identity_hash)
-                await run_in_threadpool(self.sessions.cleanup_expired)
-                created = await run_in_threadpool(self.sessions.create, identity.user_id)
+                await run_sync(
+                    self.sessions.cleanup_expired,
+                    limiter=self.session_database_limiter,
+                )
+                created = await run_sync(
+                    self.sessions.create,
+                    identity.user_id,
+                    limiter=self.session_database_limiter,
+                )
                 session = created.session
                 response_cookie = (
                     created.cookie_value,
@@ -205,6 +222,8 @@ class ConsoleSecurityMiddleware:
         except _RequestDisconnected:
             status_code = 499
         except RateLimitExceeded as exc:
+            if response_started:
+                raise
             await _send_plain(
                 secured_send,
                 HTTPStatus.TOO_MANY_REQUESTS,
@@ -221,6 +240,8 @@ class ConsoleSecurityMiddleware:
                     identity_hash=identity_hash,
                 )
             )
+            if response_started:
+                raise
             await _send_plain(secured_send, HTTPStatus.SERVICE_UNAVAILABLE, "Unavailable")
         except Exception:
             LOGGER.error(
@@ -230,8 +251,11 @@ class ConsoleSecurityMiddleware:
                     route=str(scope.get("path", "")),
                     status=HTTPStatus.INTERNAL_SERVER_ERROR,
                     identity_hash=identity_hash,
-                )
+                ),
+                exc_info=True,
             )
+            if response_started:
+                raise
             await _send_plain(secured_send, HTTPStatus.INTERNAL_SERVER_ERROR, "Error")
         finally:
             duration_ms = max(0, round((self.monotonic_clock() - started) * 1000))
@@ -265,6 +289,23 @@ def require_identity(scope: Scope) -> str:
     return identity
 
 
+def require_form_fields(scope: Scope) -> frozenset[str]:
+    """Return the middleware-validated form field names for a route."""
+
+    field_names = _request_state(scope).get("pine.form_field_names", frozenset())
+    if not isinstance(field_names, frozenset) or not all(
+        isinstance(field, str) for field in field_names
+    ):
+        raise RuntimeError("validated console form fields are unavailable")
+    return field_names
+
+
+def clear_session_cookie(scope: Scope) -> None:
+    """Tell the response boundary to expire the authenticated browser cookie."""
+
+    _request_state(scope)["pine.clear_session_cookie"] = True
+
+
 def _request_state(scope: Scope) -> dict[str, Any]:
     state = scope.setdefault("state", {})
     if not isinstance(state, dict):
@@ -281,6 +322,20 @@ def _valid_origin(scope: Scope, allowed_host: str) -> bool:
     value = single_header(scope, "origin")
     expected = f"https://{allowed_host}"
     return value is not None and secrets.compare_digest(value, expected)
+
+
+def _valid_session_establishment(scope: Scope, method: str) -> bool:
+    """Allow a new browser session only for a direct or same-origin document load."""
+
+    fetch_site = single_header(scope, "sec-fetch-site")
+    fetch_mode = single_header(scope, "sec-fetch-mode")
+    fetch_destination = single_header(scope, "sec-fetch-dest")
+    return (
+        method == "GET"
+        and fetch_site in {"none", "same-origin"}
+        and fetch_mode == "navigate"
+        and fetch_destination == "document"
+    )
 
 
 def _session_cookie_value(scope: Scope) -> str | None:

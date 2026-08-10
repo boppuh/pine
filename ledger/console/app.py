@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -13,13 +14,20 @@ from starlette.templating import Jinja2Templates
 from ledger.console.backend_client import ConsoleBackend
 from ledger.console.config import ConsoleConfig
 from ledger.console.rate_limit import ConsoleAbuseControls, ConsoleRateLimiter
-from ledger.console.security import ConsoleSecurityMiddleware, require_identity, require_session
+from ledger.console.security import (
+    ConsoleSecurityMiddleware,
+    clear_session_cookie,
+    require_form_fields,
+    require_identity,
+    require_session,
+)
 from ledger.console.sessions import ConsoleSessionStore
 from ledger.console.state import ConsoleStateStore
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent
 _TEMPLATE_ROOT = _PACKAGE_ROOT / "templates"
 _STATIC_ROOT = _PACKAGE_ROOT / "static"
+LOGGER = logging.getLogger("ledger.console.app")
 _REQUIRED_FILES = (
     _TEMPLATE_ROOT / "base.html",
     _TEMPLATE_ROOT / "home.html",
@@ -74,7 +82,7 @@ def create_console_app(
 
     @app.get("/healthz")
     @app.get("/livez")
-    def live() -> dict[str, str]:
+    async def live() -> dict[str, str]:
         return {"status": "ok"}
 
     @app.get("/readyz")
@@ -83,9 +91,10 @@ def create_console_app(
             config.read_backend_token()
             _verify_packaged_assets()
             store.check_writable()
-            backend_health = backend.health()
+            backend_health = backend.ready()
             status = store.get_status()
         except Exception:
+            LOGGER.error("console_readiness_failed", exc_info=True)
             return JSONResponse(status_code=503, content={"status": "unavailable"})
         return JSONResponse(
             content={
@@ -134,10 +143,10 @@ def create_console_app(
     def logout(request: Request) -> HTMLResponse:
         session = require_session(request.scope)
         require_identity(request.scope)
-        if request.scope["state"].get("pine.form_field_names") != frozenset({"csrf_token"}):
+        if require_form_fields(request.scope) != frozenset({"csrf_token"}):
             raise HTTPException(status_code=422, detail="invalid form fields")
         session_store.delete_hash(session.session_hash)
-        request.scope["state"]["pine.clear_session_cookie"] = True
+        clear_session_cookie(request.scope)
         return templates.TemplateResponse(
             request=request,
             name="signed_out.html",

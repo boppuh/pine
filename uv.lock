@@ -179,6 +179,7 @@ name = "decision-edge-ledger"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "fastapi" },
     { name = "filelock" },
     { name = "httpx" },
@@ -202,11 +203,12 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.4,<5" },
     { name = "fastapi", specifier = ">=0.139,<1" },
     { name = "filelock", specifier = ">=3.15,<4" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "httpx2", marker = "extra == 'dev'", specifier = ">=2.7,<3" },
-    { name = "jinja2", specifier = ">=3.1,<4" },
+    { name = "jinja2", specifier = ">=3.1.6,<4" },
     { name = "jsonschema", extras = ["format"], specifier = ">=4.22,<5" },
     { name = "openai", specifier = ">=2.46,<3" },
     { name = "pydantic", specifier = ">=2.7,<3" },
