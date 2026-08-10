@@ -331,8 +331,18 @@ def _request_state(scope: Scope) -> dict[str, Any]:
 
 
 def _valid_host(scope: Scope, allowed_host: str) -> bool:
-    value = single_header(scope, "host")
-    return value is not None and secrets.compare_digest(value.lower(), allowed_host)
+    host = single_header(scope, "host")
+    forwarded_host = single_header(scope, "x-forwarded-host")
+    forwarded_proto = single_header(scope, "x-forwarded-proto")
+    if host is None or not secrets.compare_digest(host.lower(), "localhost"):
+        return False
+    if forwarded_host is None or forwarded_proto is None:
+        return False
+    normalized_forwarded_host = forwarded_host.lower()
+    return secrets.compare_digest(forwarded_proto, "https") and any(
+        secrets.compare_digest(normalized_forwarded_host, expected)
+        for expected in (allowed_host, f"{allowed_host}:443")
+    )
 
 
 def _valid_origin(scope: Scope, allowed_host: str) -> bool:
