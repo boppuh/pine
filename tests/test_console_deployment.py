@@ -93,6 +93,15 @@ def test_installer_runs_all_console_gates_before_selecting_the_release() -> None
     assert switch < recovery_after_switch < socket_validated < recovery_disarmed
 
 
+def test_installer_makes_only_the_shared_runtime_readable_before_console_preflight() -> None:
+    installer = _unit("install-release.sh")
+    permission_fix = installer.index('chmod -R a+rX "$release_root/venv"')
+    socket_preflight = installer.index('pine-research-console" socket-check')
+
+    assert installer.index("uv pip install") < permission_fix < socket_preflight
+    assert 'chmod -R a+rX "$release_root"' not in installer
+
+
 def test_deployment_ci_does_not_persist_the_workflow_credential() -> None:
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     deployment_job = workflow.split("  deployment:\n", 1)[1].split("  browser:\n", 1)[0]

@@ -77,6 +77,9 @@ runuser -u "$service_user" -- /home/ubuntu/.local/bin/uv pip install \
     --python "$release_root/venv/bin/python" \
     --editable "$release_root/pine" \
     --editable "$release_root/msm"
+# Wheel archives can contain owner-only file modes. The immutable shared runtime
+# must remain readable and traversable by each dedicated service identity.
+chmod -R a+rX "$release_root/venv"
 
 runtime_check=$(
     runuser -u "$service_user" -- \
