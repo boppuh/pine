@@ -172,6 +172,14 @@ def test_keyboard_capture_flow_in_chromium_and_webkit(
         expect(page.get_by_role("heading", name="New strategy hypothesis")).to_be_visible()
         backend.proposal.body = "Keyboard-only operational hypothesis."
         page.get_by_label("Hypothesis source").focus()
+        page.keyboard.type("   ")
+        page.get_by_role("button", name="Extract proposal").click()
+        expect(page.get_by_role("heading", name="Check the source text")).to_be_visible()
+        expect(page.locator("[data-error-summary]")).to_be_focused()
+        assert backend.draft_requests == []
+        assert browser_errors and all("422" in message for message in browser_errors)
+        browser_errors.clear()
+        page.get_by_label("Hypothesis source").focus()
         page.keyboard.type(backend.proposal.body)
         page.get_by_role("button", name="Extract proposal").focus()
         page.keyboard.press("Enter")

@@ -306,6 +306,40 @@ def test_failed_extraction_source_can_be_revised_only_while_editing(
         )
 
 
+def test_revision_cannot_change_the_workflow_schema(
+    console_store: ConsoleStateStore,
+) -> None:
+    created = console_store.create_workflow(
+        user_id="owner@example.com",
+        source_text="incomplete source",
+    )
+    extracting = console_store.begin_extraction(
+        created.workflow_id,
+        created.user_id,
+        expected_version=created.version,
+    )
+    failed = console_store.fail_extraction(
+        extracting.workflow_id,
+        extracting.user_id,
+        code="extraction_unable",
+        details=("missing expected metrics",),
+    )
+
+    with pytest.raises(WorkflowConflictError, match="schema cannot be changed"):
+        console_store.revise_source(
+            failed.workflow_id,
+            failed.user_id,
+            source_text="revised source",
+            schema_id="finance/other-shape:1",
+            expected_version=failed.version,
+        )
+
+    unchanged = console_store.get_workflow(failed.workflow_id, failed.user_id)
+    assert unchanged.schema_id == created.schema_id
+    assert unchanged.source_text == created.source_text
+    assert unchanged.version == failed.version
+
+
 def test_database_triggers_reject_identity_payload_and_transition_bypasses(
     console_store: ConsoleStateStore,
     proposal: DraftProposal,

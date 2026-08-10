@@ -384,6 +384,7 @@ def _validated_health(payload: Mapping[str, Any], *, operation: str) -> HealthRe
 def _safe_identifier(value: str) -> str:
     if (
         not value
+        or value in {".", ".."}
         or len(value) > 128
         or any(character in value for character in ("/", "\\", "\x00"))
     ):

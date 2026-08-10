@@ -155,6 +155,23 @@ def test_authoritative_receipt_rejects_wrong_prediction_binding(tmp_path: Path) 
         _client(tmp_path, handler).get_receipt("pred_client")
 
 
+@pytest.mark.parametrize("prediction_id", [".", ".."])
+def test_authoritative_receipt_rejects_dot_segment_before_request(
+    tmp_path: Path,
+    prediction_id: str,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500)
+
+    with pytest.raises(ValueError, match="identifier is unsafe"):
+        _client(tmp_path, handler).get_receipt(prediction_id)
+
+    assert requests == []
+
+
 def test_frozen_capture_requires_canonical_console_uuid(
     capture_input: CaptureInput,
 ) -> None:

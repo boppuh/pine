@@ -312,7 +312,7 @@ h1 {
 }
 
 code {
-  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   font-size: 0.88em;
 }
 
@@ -463,7 +463,7 @@ textarea {
 
 .source-form textarea {
   min-height: 24rem;
-  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   font-size: 0.9rem;
 }
 

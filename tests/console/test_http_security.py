@@ -230,7 +230,14 @@ def test_route_inventory_is_public_only_for_health(
             "/unknown",
         ):
             assert client.get(protected_path).status_code == 403
-        assert client.post("/session/logout").status_code == 403
+        for protected_path in (
+            "/session/logout",
+            "/workflows",
+            "/workflows/00000000-0000-4000-8000-000000000001/confirm",
+            "/workflows/00000000-0000-4000-8000-000000000001/retry",
+            "/workflows/00000000-0000-4000-8000-000000000001/cancel",
+        ):
+            assert client.post(protected_path).status_code == 403
 
 
 def test_authenticated_shell_sets_exact_cookie_headers_and_local_assets(

@@ -99,7 +99,7 @@ def test_ready_validation_success_and_duplicate_confirmation_are_one_capture(
         review = client.get(review_path, headers=_identity_headers())
         assert review.status_code == 200
         assert "Confirm strategy hypothesis" in review.text
-        assert "preregistered" in review.text
+        assert "pending preregistration" in review.text
         assert "Expected Sharpe" in review.text
         assert "Original source text" in review.text
         assert "not verified by the immutable hash" in review.text
@@ -168,6 +168,31 @@ def test_ready_validation_success_and_duplicate_confirmation_are_one_capture(
             assert value in receipt.text
         assert "committed" in receipt.text
         assert fake_backend.receipt_requests == [fake_backend.response.prediction_id]
+
+
+def test_stale_version_confirmation_is_rejected_without_capture(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+    clock: MutableClock,
+) -> None:
+    app, config, store, _sessions = _build_app(tmp_path, fake_backend, clock)
+
+    with _client(app, config) as client:
+        workflow_id, review_path = _start_ready_workflow(client, fake_backend)
+        review = client.get(review_path, headers=_identity_headers())
+        stale = _review_data(review.text, workflow_id)
+        stale["version"] = str(int(stale["version"]) - 1)
+
+        response = client.post(
+            f"/workflows/{workflow_id}/confirm",
+            headers=_post_headers(),
+            data=stale,
+        )
+
+        assert response.status_code == 409
+        assert "Workflow changed" in response.text
+        assert fake_backend.capture_requests == []
+        assert store.get_workflow(workflow_id, IDENTITY).state is WorkflowState.REVIEWING
 
 
 def test_unable_extraction_preserves_editable_source_and_reuses_transient_workflow(

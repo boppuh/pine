@@ -4,7 +4,7 @@
   <p class="eyebrow">Review</p>
   <h1 id="review-heading">Confirm strategy hypothesis</h1>
   <div class="record-meta" aria-label="Proposal identity">
-    <span class="badge is-fixed">preregistered</span>
+    <span class="badge is-fixed">pending preregistration</span>
     <code>{{ proposal.schema_id }}</code>
     <code title="{{ proposal.schema_hash }}">{{ proposal.schema_hash[:15] }}...</code>
   </div>
@@ -121,7 +121,7 @@
       <h2 id="binding-heading">What confirmation will freeze</h2>
     </div>
     <dl class="definition-grid">
-      <div><dt>Registration</dt><dd>preregistered</dd></div>
+      <div><dt>Registration</dt><dd>pending preregistration</dd></div>
       <div><dt>Schema</dt><dd><code>{{ proposal.schema_id }}</code></dd></div>
       <div class="span-all"><dt>Schema hash</dt><dd><code class="wrap-code">{{ proposal.schema_hash }}</code></dd></div>
       <div><dt>Extracted</dt><dd><time datetime="{{ workflow.updated_at.isoformat() }}">{{ workflow.updated_at.strftime('%Y-%m-%d %H:%M UTC') }}</time></dd></div>
@@ -144,7 +144,7 @@
   </div>
 </form>
 
-<form class="secondary-form" method="post" action="/workflows/{{ workflow.workflow_id }}/cancel">
+<form class="secondary-form" method="post" action="/workflows/{{ workflow.workflow_id }}/cancel" data-submit-once>
   <input type="hidden" name="csrf_token" value="{{ cancel_csrf_token }}">
   <input type="hidden" name="version" value="{{ workflow.version }}">
   <button class="quiet-button" type="submit">Cancel draft</button>
