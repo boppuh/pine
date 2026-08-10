@@ -18,6 +18,15 @@ from ledger.extraction import (
     HypothesisExtractionRequest,
 )
 from ledger.integrity import PredictionStatus, PreregisteredCaptureRequest, RegistrationStatus
+from ledger.read_models import (
+    IntegrityState,
+    LedgerStatus,
+    PredictionDetail,
+    PredictionPage,
+    PredictionSummary,
+    ResultState,
+)
+from ledger.run import RunState
 
 
 class MutableClock:
@@ -42,6 +51,89 @@ class FakeBackend:
         self.draft_requests: list[HypothesisExtractionRequest] = []
         self.receipt_requests: list[str] = []
         self.receipt_outcomes: list[AuthoritativeReceipt | BaseException] = []
+        committed_at = datetime(2026, 8, 7, 12, 1, tzinfo=UTC)
+        summary = PredictionSummary(
+            prediction_id=response.prediction_id,
+            run_id=response.run_id,
+            registration_status=RegistrationStatus.PREREGISTERED,
+            status=PredictionStatus.OPEN,
+            transaction_state="committed",
+            strategy_id=proposal.forecast.strategy_id,
+            schema_id=response.schema_id,
+            out_of_sample_window=proposal.forecast.out_of_sample_window.model_dump(mode="json"),
+            created_at=datetime(2026, 8, 7, 12, 0, tzinfo=UTC),
+            committed_at=committed_at,
+            run_state=RunState.REGISTERED,
+            result_state=ResultState.ABSENT,
+            integrity_state=IntegrityState.VERIFIED,
+        )
+        self.prediction_page = PredictionPage(items=(summary,), next_cursor=None)
+        self.prediction_detail = PredictionDetail.model_validate(
+            {
+                "prediction_id": response.prediction_id,
+                "run_id": response.run_id,
+                "schema_id": response.schema_id,
+                "schema_hash": response.schema_hash,
+                "registration_status": "preregistered",
+                "forecast": proposal.forecast.model_dump(mode="json"),
+                "decision": proposal.decision,
+                "snapshot_ref": response.snapshot_ref,
+                "snapshot": {
+                    "strategy_id": proposal.forecast.strategy_id,
+                    "strategy_spec_hash": f"sha256:{'c' * 64}",
+                    "git_commit": "d" * 40,
+                    "parameter_count": 4,
+                    "data_as_of_version": "2026-08-07T11:59:00Z",
+                    "dataset_version": f"sha256:{'e' * 64}",
+                    "in_sample_window": proposal.forecast.in_sample_window.model_dump(mode="json"),
+                    "out_of_sample_window": proposal.forecast.out_of_sample_window.model_dump(
+                        mode="json"
+                    ),
+                    "cost_model_version": "cost-v1",
+                    "slippage_model_version": "slippage-v1",
+                    "metric_definition_version": "metrics-v1",
+                    "engine_version": "msm-v1",
+                    "random_seed": 17,
+                    "captured_at": "2026-08-07T12:00:30Z",
+                },
+                "lineage": proposal.lineage,
+                "immutable_hash": response.immutable_hash,
+                "body": proposal.body,
+                "status": "open",
+                "outcome": None,
+                "grade": None,
+                "resolution_metadata": None,
+                "transaction_state": "committed",
+                "created_at": "2026-08-07T12:00:00Z",
+                "committed_at": committed_at,
+                "run": {
+                    "run_id": response.run_id,
+                    "prediction_id": response.prediction_id,
+                    "started_at": "2026-08-07T12:00:00Z",
+                    "state": "registered",
+                    "execution_started_at": None,
+                    "completed_at": None,
+                    "exit_code": None,
+                    "failure_note": None,
+                    "binding": None,
+                },
+                "result": None,
+                "integrity_violations": [],
+                "integrity_state": "verified",
+            }
+        )
+        self.ledger_status = LedgerStatus(
+            registry_version=7,
+            committed_predictions=1,
+            quarantined_predictions=0,
+            integrity_violations=0,
+            run_results=0,
+        )
+        self.prediction_list_requests: list[dict[str, object]] = []
+        self.prediction_detail_requests: list[str] = []
+        self.prediction_list_outcomes: list[PredictionPage | BaseException] = []
+        self.prediction_detail_outcomes: list[PredictionDetail | BaseException] = []
+        self.status_outcomes: list[LedgerStatus | BaseException] = []
 
     def health(self) -> HealthResponse:
         return HealthResponse()
@@ -98,6 +190,50 @@ class FakeBackend:
             snapshot_ref=self.response.snapshot_ref,
             committed_at=datetime(2026, 8, 7, 12, 1, tzinfo=UTC),
         )
+
+    def list_predictions(
+        self,
+        *,
+        limit: int = 25,
+        cursor: str | None = None,
+        registration_status: RegistrationStatus | None = None,
+        status: PredictionStatus | None = None,
+        strategy_id: str | None = None,
+        result_state: ResultState | None = None,
+    ) -> PredictionPage:
+        self.prediction_list_requests.append(
+            {
+                "limit": limit,
+                "cursor": cursor,
+                "registration_status": registration_status,
+                "status": status,
+                "strategy_id": strategy_id,
+                "result_state": result_state,
+            }
+        )
+        if self.prediction_list_outcomes:
+            outcome = self.prediction_list_outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+        return self.prediction_page
+
+    def get_prediction(self, prediction_id: str) -> PredictionDetail:
+        self.prediction_detail_requests.append(prediction_id)
+        if self.prediction_detail_outcomes:
+            outcome = self.prediction_detail_outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+        return self.prediction_detail
+
+    def get_status(self) -> LedgerStatus:
+        if self.status_outcomes:
+            outcome = self.status_outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+        return self.ledger_status
 
 
 @pytest.fixture

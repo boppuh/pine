@@ -19,7 +19,11 @@ from ledger.console.errors import (
 )
 from ledger.console.models import CaptureInput
 from ledger.extraction import DraftProposal, HypothesisExtractionRequest
+from ledger.integrity import PredictionStatus, RegistrationStatus
 from ledger.json_utils import canonical_json
+from ledger.read_models import ResultState
+
+from .conftest import FakeBackend
 
 TOKEN = "console-backend-token-" + "x" * 48
 
@@ -165,6 +169,171 @@ def test_authoritative_receipt_rejects_wrong_prediction_binding(
 
     with pytest.raises(BackendProtocolError, match="prediction binding"):
         _client(tmp_path, handler).get_receipt("pred_client")
+
+
+def test_prediction_list_encodes_filters_and_accepts_additive_fields(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+) -> None:
+    strategy_id = fake_backend.prediction_detail.forecast.strategy_id
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/predictions"
+        assert dict(request.url.params) == {
+            "limit": "10",
+            "cursor": "cursor+/=",
+            "registration_status": "preregistered",
+            "status": "open",
+            "strategy_id": strategy_id,
+            "result_state": "absent",
+        }
+        payload = fake_backend.prediction_page.model_dump(mode="json")
+        payload["future_page"] = True
+        payload["items"][0]["future_summary"] = True
+        return httpx.Response(200, json=payload)
+
+    page = _client(tmp_path, handler).list_predictions(
+        limit=10,
+        cursor="cursor+/=",
+        registration_status=RegistrationStatus.PREREGISTERED,
+        status=PredictionStatus.OPEN,
+        strategy_id=strategy_id,
+        result_state=ResultState.ABSENT,
+    )
+
+    assert page == fake_backend.prediction_page
+
+
+def test_prediction_list_rejects_unverified_forecast_fields(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+) -> None:
+    payload = fake_backend.prediction_page.model_dump(mode="json")
+    payload["items"][0]["integrity_state"] = "failed"
+    payload["items"][0]["integrity_reason"] = "record_unverified"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with pytest.raises(BackendProtocolError, match="exposes unverified data"):
+        _client(tmp_path, handler).list_predictions()
+
+
+def test_prediction_list_rejects_result_before_completed_run(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+) -> None:
+    payload = fake_backend.prediction_page.model_dump(mode="json")
+    payload["items"][0]["result_state"] = "present"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with pytest.raises(BackendProtocolError, match="result state"):
+        _client(tmp_path, handler).list_predictions()
+
+
+def test_prediction_detail_and_status_validate_authoritative_bindings(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/status":
+            payload = fake_backend.ledger_status.model_dump(mode="json")
+            payload["future_status"] = True
+            return httpx.Response(200, json=payload)
+        payload = fake_backend.prediction_detail.model_dump(mode="json")
+        payload["future_detail"] = True
+        payload["snapshot"]["future_snapshot"] = True
+        return httpx.Response(200, json=payload)
+
+    client = _client(tmp_path, handler)
+
+    assert (
+        client.get_prediction(fake_backend.prediction_detail.prediction_id)
+        == fake_backend.prediction_detail
+    )
+    assert client.get_status() == fake_backend.ledger_status
+
+
+def test_status_rejects_more_quarantined_than_committed_predictions(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+) -> None:
+    payload = fake_backend.ledger_status.model_dump(mode="json")
+    payload["quarantined_predictions"] = payload["committed_predictions"] + 1
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with pytest.raises(BackendProtocolError, match="status counters"):
+        _client(tmp_path, handler).get_status()
+
+
+def test_prediction_detail_rejects_wrong_run_binding(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+) -> None:
+    payload = fake_backend.prediction_detail.model_dump(mode="json")
+    payload["run"]["run_id"] = "run_different"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with pytest.raises(BackendProtocolError, match="detail binding"):
+        _client(tmp_path, handler).get_prediction(fake_backend.prediction_detail.prediction_id)
+
+
+def test_prediction_list_classifies_unsafe_response_ids_as_protocol_errors(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+) -> None:
+    payload = fake_backend.prediction_page.model_dump(mode="json")
+    payload["items"][0]["prediction_id"] = "../unsafe"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with pytest.raises(BackendProtocolError, match="response identifier"):
+        _client(tmp_path, handler).list_predictions()
+
+
+def test_prediction_detail_classifies_unsafe_response_ids_as_protocol_errors(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+) -> None:
+    payload = fake_backend.prediction_detail.model_dump(mode="json")
+    payload["run_id"] = "../unsafe"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with pytest.raises(BackendProtocolError, match="response identifier"):
+        _client(tmp_path, handler).get_prediction(fake_backend.prediction_detail.prediction_id)
+
+
+def test_verified_reads_use_the_dedicated_read_timeout(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+) -> None:
+    observed_timeout: dict[str, float] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed_timeout.update(request.extensions["timeout"])
+        return httpx.Response(200, json=fake_backend.ledger_status.model_dump(mode="json"))
+
+    config = _config(tmp_path).model_copy(
+        update={"health_timeout_seconds": 1.0, "read_timeout_seconds": 17.0}
+    )
+    client = ConsoleBackendClient(
+        config,
+        token=TOKEN,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.get_status() == fake_backend.ledger_status
+    assert observed_timeout["read"] == 17.0
+    assert observed_timeout["connect"] == config.connect_timeout_seconds
 
 
 @pytest.mark.parametrize("prediction_id", [".", ".."])
@@ -505,12 +674,14 @@ def test_config_loads_private_credential_and_rejects_unsafe_networks(
         "PINE_CONSOLE_SOCKET_PATH": str(tmp_path / "console.sock"),
         "PINE_CONSOLE_STATE_PATH": str(tmp_path / "console.db"),
         "PINE_CONSOLE_BACKEND_CREDENTIAL_PATH": str(credential),
+        "PINE_CONSOLE_READ_TIMEOUT_SECONDS": "17.5",
     }
 
     config = ConsoleConfig.from_env(environment)
 
     assert config.read_backend_token() == TOKEN
     assert config.backend_url == "http://127.0.0.1:8765"
+    assert config.read_timeout_seconds == 17.5
     assert config.allowed_identities == ("user@example.com",)
     without_identities = {
         key: value for key, value in environment.items() if key != "PINE_CONSOLE_ALLOWED_IDENTITIES"
