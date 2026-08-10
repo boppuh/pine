@@ -231,7 +231,9 @@ def browser_server(
     tmp_path: Path,
     fake_backend: FakeBackend,
     clock: MutableClock,
+    caplog: pytest.LogCaptureFixture,
 ) -> Iterator[_BrowserServer]:
+    caplog.set_level(logging.INFO)
     socket_path = tmp_path / "console.sock"
     credential = tmp_path / "backend-token"
     credential.write_text(TOKEN, encoding="ascii")
@@ -698,7 +700,6 @@ def test_browser_traffic_storage_and_assets_exclude_server_secrets(
         str(browser_server.credential_path),
         "/run/credentials/pine-console.service/backend-token",
     )
-    caplog.set_level(logging.INFO)
 
     def assert_no_server_secrets(_probe: _BrowserProbe) -> None:
         assert har_path.is_file()
@@ -754,9 +755,12 @@ def test_browser_traffic_storage_and_assets_exclude_server_secrets(
         javascript = probe.page.request.get(f"{base_url}/assets/console.js")
         stylesheet = probe.page.request.get(f"{base_url}/assets/console.css")
         assert readiness.ok and javascript.ok and stylesheet.ok
+        readiness_headers = {name.casefold(): value for name, value in readiness.headers.items()}
+        assert "authorization" not in readiness_headers
         browser_material_parts.extend(
             [
                 readiness.text(),
+                json.dumps(readiness_headers, sort_keys=True),
                 javascript.text(),
                 stylesheet.text(),
                 json.dumps(probe.context.storage_state(), sort_keys=True),
