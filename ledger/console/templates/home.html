@@ -13,7 +13,10 @@
     <div>
       {% if inspection_available %}
       <strong>Ledger view verified</strong>
-      <span>{{ ledger_status.committed_predictions }} committed prediction{% if ledger_status.committed_predictions != 1 %}s{% endif %} available.</span>
+      <span>
+        {{ standard_view_predictions }} committed prediction{% if standard_view_predictions != 1 %}s{% endif %} in the standard view.{% if ledger_status.quarantined_predictions %}
+        {{ ledger_status.quarantined_predictions }} quarantined and withheld.{% endif %}
+      </span>
       {% else %}
       <strong>Ledger view unavailable</strong>
       <span>Capture remains available. Inspection can be retried shortly.</span>
@@ -39,6 +42,14 @@
       <div>
         <dt>Committed</dt>
         <dd>{{ ledger_status.committed_predictions }} prediction{% if ledger_status.committed_predictions != 1 %}s{% endif %}</dd>
+      </div>
+      <div>
+        <dt>Standard view</dt>
+        <dd>{{ standard_view_predictions }} prediction{% if standard_view_predictions != 1 %}s{% endif %}</dd>
+      </div>
+      <div>
+        <dt>Quarantined</dt>
+        <dd>{{ ledger_status.quarantined_predictions }} withheld</dd>
       </div>
       <div>
         <dt>Warnings</dt>
@@ -85,8 +96,13 @@
   </div>
   {% elif inspection_available %}
   <div class="empty-state">
+    {% if ledger_status.quarantined_predictions %}
+    <h3>No predictions in the standard view</h3>
+    <p>{{ ledger_status.quarantined_predictions }} committed prediction{% if ledger_status.quarantined_predictions != 1 %}s are{% else %} is{% endif %} quarantined and withheld.</p>
+    {% else %}
     <h3>No committed predictions yet</h3>
     <p>Your first confirmed hypothesis will appear here after verification.</p>
+    {% endif %}
   </div>
   {% else %}
   <div class="notice is-warning">

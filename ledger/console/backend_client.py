@@ -499,13 +499,17 @@ class ConsoleBackendClient:
         status = _validated_read_projection(payload, LedgerStatus, operation="ledger status")
         if status.status != "ok" or status.api_version != "v1":
             raise BackendProtocolError("backend ledger status contract is incompatible")
-        if status.registry_version < 1 or any(
-            value < 0
-            for value in (
-                status.committed_predictions,
-                status.quarantined_predictions,
-                status.integrity_violations,
-                status.run_results,
+        if (
+            status.registry_version < 1
+            or status.quarantined_predictions > status.committed_predictions
+            or any(
+                value < 0
+                for value in (
+                    status.committed_predictions,
+                    status.quarantined_predictions,
+                    status.integrity_violations,
+                    status.run_results,
+                )
             )
         ):
             raise BackendProtocolError("backend ledger status counters are invalid")

@@ -195,11 +195,15 @@ def create_console_app(
         try:
             recent_predictions = backend.list_predictions(limit=5).items
             ledger_status = backend.get_status()
+            standard_view_predictions = (
+                ledger_status.committed_predictions - ledger_status.quarantined_predictions
+            )
             inspection_available = True
         except BackendError:
             LOGGER.warning("console_dashboard_projection_unavailable")
             recent_predictions = ()
             ledger_status = None
+            standard_view_predictions = 0
             inspection_available = False
         return templates.TemplateResponse(
             request=request,
@@ -208,6 +212,7 @@ def create_console_app(
                 **_page_context(request, page_title="Research Console", active_page="home"),
                 "recent_predictions": recent_predictions,
                 "ledger_status": ledger_status,
+                "standard_view_predictions": standard_view_predictions,
                 "inspection_available": inspection_available,
             },
         )

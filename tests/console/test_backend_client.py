@@ -256,6 +256,20 @@ def test_prediction_detail_and_status_validate_authoritative_bindings(
     assert client.get_status() == fake_backend.ledger_status
 
 
+def test_status_rejects_more_quarantined_than_committed_predictions(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+) -> None:
+    payload = fake_backend.ledger_status.model_dump(mode="json")
+    payload["quarantined_predictions"] = payload["committed_predictions"] + 1
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with pytest.raises(BackendProtocolError, match="status counters"):
+        _client(tmp_path, handler).get_status()
+
+
 def test_prediction_detail_rejects_wrong_run_binding(
     tmp_path: Path,
     fake_backend: FakeBackend,

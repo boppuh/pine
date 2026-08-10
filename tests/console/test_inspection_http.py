@@ -30,7 +30,8 @@ def test_dashboard_uses_verified_recent_predictions_and_authoritative_counts(
     assert response.status_code == 200
     assert "Decision evidence you can inspect" in response.text
     assert fake_backend.prediction_detail.forecast.strategy_id in response.text
-    assert "1 committed prediction available" in response.text
+    assert "1 committed prediction" in response.text
+    assert "in the standard view" in response.text
     assert fake_backend.prediction_list_requests == [
         {
             "limit": 5,
@@ -105,6 +106,29 @@ def test_prediction_links_encode_opaque_ids_as_path_segments(
     assert 'href="/predictions/pred?query#fragment"' not in listing.text
 
 
+def test_dashboard_separates_quarantined_predictions_from_the_standard_view(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+    clock: MutableClock,
+) -> None:
+    fake_backend.prediction_page = PredictionPage(items=(), next_cursor=None)
+    fake_backend.ledger_status = fake_backend.ledger_status.model_copy(
+        update={"quarantined_predictions": 1}
+    )
+    app, config, _store, _sessions = _build_app(tmp_path, fake_backend, clock)
+
+    with _client(app, config) as client:
+        response = client.get("/", headers=_identity_headers())
+
+    assert response.status_code == 200
+    assert "0 committed predictions" in response.text
+    assert "in the standard view" in response.text
+    assert "1 quarantined and withheld" in response.text
+    assert "No predictions in the standard view" in response.text
+    assert "1 committed prediction is quarantined and withheld" in response.text
+    assert "No committed predictions yet" not in response.text
+
+
 def test_failed_summary_does_not_render_unverified_forecast_fields(
     tmp_path: Path,
     fake_backend: FakeBackend,
@@ -154,7 +178,18 @@ def test_prediction_detail_is_verified_plain_text_and_renders_result_evidence(
             "metric_units": "finance/strategy-edge:decimal-v1",
             "in_sample_metrics": metrics,
             "out_of_sample_metrics": {**metrics, "sharpe": 0.96, "trade_count": 12},
-            "regime_breakdown": [],
+            "regime_breakdown": [
+                {
+                    "sample": "out_of_sample",
+                    "regime_id": "high_volatility",
+                    "metrics": {
+                        **metrics,
+                        "max_drawdown": 0.15,
+                        "expectancy": 0.02,
+                        "trade_count": 8,
+                    },
+                }
+            ],
             "artifacts": [
                 {
                     "relative_path": "summary.csv",
@@ -193,6 +228,11 @@ def test_prediction_detail_is_verified_plain_text_and_renders_result_evidence(
     assert "Evidence verified" in response.text
     assert "Out-of-sample result" in response.text
     assert "summary.csv" in response.text
+    assert "high_volatility" in response.text
+    assert response.text.count("<dt>Max drawdown</dt>") == 3
+    assert response.text.count("<dt>Expectancy</dt>") == 3
+    assert "<dd>0.15</dd>" in response.text
+    assert "<dd>0.02</dd>" in response.text
     assert "Allocated at" in response.text
     assert "Execution started" in response.text
     assert "Exit code" in response.text

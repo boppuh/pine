@@ -98,6 +98,8 @@
       <dl class="compact-metrics">
         <div><dt>Sharpe</dt><dd>{{ prediction.result.in_sample_metrics.sharpe }}</dd></div>
         <div><dt>Win rate</dt><dd>{{ prediction.result.in_sample_metrics.win_rate }}</dd></div>
+        <div><dt>Max drawdown</dt><dd>{{ prediction.result.in_sample_metrics.max_drawdown }}</dd></div>
+        <div><dt>Expectancy</dt><dd>{{ prediction.result.in_sample_metrics.expectancy }}</dd></div>
         <div><dt>Return</dt><dd>{{ prediction.result.in_sample_metrics.total_return }}</dd></div>
         <div><dt>Trades</dt><dd>{{ prediction.result.in_sample_metrics.trade_count }}</dd></div>
       </dl>
@@ -107,6 +109,8 @@
       <dl class="compact-metrics">
         <div><dt>Sharpe</dt><dd>{{ prediction.result.out_of_sample_metrics.sharpe }}</dd></div>
         <div><dt>Win rate</dt><dd>{{ prediction.result.out_of_sample_metrics.win_rate }}</dd></div>
+        <div><dt>Max drawdown</dt><dd>{{ prediction.result.out_of_sample_metrics.max_drawdown }}</dd></div>
+        <div><dt>Expectancy</dt><dd>{{ prediction.result.out_of_sample_metrics.expectancy }}</dd></div>
         <div><dt>Return</dt><dd>{{ prediction.result.out_of_sample_metrics.total_return }}</dd></div>
         <div><dt>Trades</dt><dd>{{ prediction.result.out_of_sample_metrics.trade_count }}</dd></div>
       </dl>
@@ -122,6 +126,8 @@
         <dl class="compact-metrics">
           <div><dt>Sharpe</dt><dd>{{ regime.metrics.sharpe }}</dd></div>
           <div><dt>Win rate</dt><dd>{{ regime.metrics.win_rate }}</dd></div>
+          <div><dt>Max drawdown</dt><dd>{{ regime.metrics.max_drawdown }}</dd></div>
+          <div><dt>Expectancy</dt><dd>{{ regime.metrics.expectancy }}</dd></div>
           <div><dt>Return</dt><dd>{{ regime.metrics.total_return }}</dd></div>
           <div><dt>Trades</dt><dd>{{ regime.metrics.trade_count }}</dd></div>
         </dl>
