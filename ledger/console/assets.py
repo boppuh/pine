@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -31,13 +32,32 @@ REQUIRED_FILES = (
 def verify_packaged_assets(release_root: str | Path | None = None) -> dict[str, Any]:
     """Require every server-rendered asset from the selected Pine release."""
 
+    source_root: Path | None = None
     if release_root is not None:
         root = Path(release_root).expanduser().resolve(strict=True)
         source_root = (root / "pine").resolve(strict=True)
         if not PACKAGE_ROOT.is_relative_to(source_root):
             raise ConsoleConfigError("console package is outside the selected release")
     for path in REQUIRED_FILES:
-        if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
+        try:
+            relative = path.relative_to(PACKAGE_ROOT)
+            if not relative.parts:
+                raise ConsoleConfigError("console package contains an invalid asset path")
+            current = PACKAGE_ROOT
+            metadata = current.lstat()
+            for part in relative.parts:
+                current /= part
+                metadata = current.lstat()
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise ConsoleConfigError("console package contains a symlinked asset path")
+            resolved = path.resolve(strict=True)
+        except (OSError, ValueError) as exc:
+            raise ConsoleConfigError("console package is missing a required asset") from exc
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size == 0
+            or (source_root is not None and not resolved.is_relative_to(source_root))
+        ):
             raise ConsoleConfigError("console package is missing a required asset")
     return {
         "asset_count": len(REQUIRED_FILES),

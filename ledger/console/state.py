@@ -65,14 +65,20 @@ class ConsoleStateStore:
         if ordinary_retention <= timedelta(0) or receipt_retention <= timedelta(0):
             raise ValueError("console retention durations must be positive")
         self._prepare_path(create=migrate_schema)
-        connection = self.connect() if migrate_schema else self._read_only_connect()
+        connection: sqlite3.Connection | None = None
         try:
+            connection = self.connect() if migrate_schema else self._read_only_connect()
             if migrate_schema:
                 migrate(connection)
             elif schema_version(connection) != CONSOLE_SCHEMA_VERSION:
                 raise ConsoleStateError("console state requires an installer migration")
+        except sqlite3.DatabaseError as exc:
+            if not migrate_schema:
+                raise ConsoleStateError("console state could not be read safely") from exc
+            raise
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
 
     def connect(self) -> sqlite3.Connection:
         """Open a hardened WAL connection to console state only."""
@@ -638,8 +644,15 @@ class ConsoleStateStore:
             raise ConsoleStateError("console state database must not be group/world accessible")
 
     def _read_only_connect(self) -> sqlite3.Connection:
+        wal_path = Path(f"{self.db_path}-wal")
+        shm_path = Path(f"{self.db_path}-shm")
+        # A checkpointed WAL database has no sidecars, but SQLite otherwise tries to
+        # create shared-memory state even for mode=ro. Immutable access is safe only
+        # in that checkpointed case; a live WAL must remain visible to readiness.
+        immutable = not wal_path.exists() and not shm_path.exists()
+        immutable_parameter = "&immutable=1" if immutable else ""
         connection = sqlite3.connect(
-            f"{self.db_path.as_uri()}?mode=ro",
+            f"{self.db_path.as_uri()}?mode=ro{immutable_parameter}",
             uri=True,
             timeout=30.0,
         )

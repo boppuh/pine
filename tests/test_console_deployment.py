@@ -66,17 +66,38 @@ def test_console_environment_example_contains_no_credential_value() -> None:
 def test_installer_runs_all_console_gates_before_selecting_the_release() -> None:
     installer = _unit("install-release.sh")
     switch = installer.index('mv -Tf "$temporary_link" "$current_link"')
+    migration = installer.index('pine-console-state" migrate')
 
     assert installer.index('pine-research-console" release-check') < switch
     assert installer.index('pine-research-console" socket-check') < switch
-    assert installer.index('pine-console-state" migrate') < switch
+    assert migration < switch
     assert installer.index('pine-console-state" preflight') < switch
+    assert installer.index('pine-ledger-backend" health') < migration
     assert installer.index("systemctl daemon-reload") > switch
     assert installer.index('cleanup_release=""', switch) > switch
     assert installer.index("systemctl stop pine-console.service") < switch
     assert 'install -d -m 0700 -o "$console_user"' in installer
     assert 'chmod 0755 "$release_root"' in installer
     assert "stat -c '%a:%U:%G' /run/pine/console.sock" in installer
+    assert "while [[ ! -S /run/pine/console.sock ]]" in installer
+    assert "systemctl is-active --quiet pine-console.service" in installer
+    assert "socket_deadline=$((SECONDS + 30))" in installer
+
+    migration_recovery_disarmed = installer.index("restart_console_on_failure=false", migration)
+    recovery_after_switch = installer.index(
+        "restart_console_on_failure=$console_was_active", switch
+    )
+    socket_validated = installer.index("console Unix socket identity or mode is unsafe")
+    recovery_disarmed = installer.index("restart_console_on_failure=false", recovery_after_switch)
+    assert migration < migration_recovery_disarmed < switch
+    assert switch < recovery_after_switch < socket_validated < recovery_disarmed
+
+
+def test_deployment_ci_does_not_persist_the_workflow_credential() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    deployment_job = workflow.split("  deployment:\n", 1)[1].split("  browser:\n", 1)[0]
+
+    assert "persist-credentials: false" in deployment_job
 
 
 def test_deployment_shell_script_has_valid_bash_syntax() -> None:

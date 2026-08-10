@@ -27,6 +27,7 @@ release_root="/opt/decision-edge/releases/$release_id"
 current_link=/opt/decision-edge/current
 stage_root="/opt/decision-edge/releases/.${release_id}.$$.tmp"
 cleanup_release=""
+console_was_active=false
 restart_console_on_failure=false
 
 if [[ -e "$release_root" ]]; then
@@ -140,7 +141,14 @@ if ! systemd-run --quiet --wait --pipe --collect \
     exit 2
 fi
 
+if [[ -f /var/lib/pine/vault/.ledger/backend.json ]]; then
+    runuser -u "$service_user" -- \
+        "$release_root/venv/bin/pine-ledger-backend" health \
+        --vault-root /var/lib/pine/vault --timeout-seconds 3 >/dev/null
+fi
+
 if systemctl is-active --quiet pine-console.service; then
+    console_was_active=true
     systemctl stop pine-console.service
     restart_console_on_failure=true
 fi
@@ -151,21 +159,20 @@ console_migration=$(
         --state-path /var/lib/pine/console/console.db \
         --backup-root /var/backups/pine-console
 )
+# A successful migration may no longer be readable by the previous release. Do
+# not restart that release on a later preselection failure.
+restart_console_on_failure=false
 runuser -u "$console_user" -- \
     "$release_root/venv/bin/pine-console-state" preflight \
     --state-path /var/lib/pine/console/console.db >/dev/null
-
-if [[ -f /var/lib/pine/vault/.ledger/backend.json ]]; then
-    runuser -u "$service_user" -- \
-        "$release_root/venv/bin/pine-ledger-backend" health \
-        --vault-root /var/lib/pine/vault --timeout-seconds 3 >/dev/null
-fi
 
 temporary_link="/opt/decision-edge/.current-$release_id"
 ln -s "$release_root" "$temporary_link"
 mv -Tf "$temporary_link" "$current_link"
 cleanup_release=""
-restart_console_on_failure=false
+# From this point the recovery trap starts the selected release, never the
+# potentially schema-incompatible previous release.
+restart_console_on_failure=$console_was_active
 
 install -m 0644 "$release_root/pine/deploy/pine-backend.service" /etc/systemd/system/pine-backend.service
 install -m 0644 "$release_root/pine/deploy/pine-backend-readiness.service" /etc/systemd/system/pine-backend-readiness.service
@@ -191,19 +198,33 @@ if grep -Eq '^OPENAI_API_KEY=[^[:space:]]+$' /etc/pine/backend.env; then
     systemctl start pine-backup.service
     systemctl start pine-backend-readiness.service
     systemctl restart pine-console.service
-    systemctl start pine-console-readiness.timer
-    systemctl start pine-console-readiness.service
-    if [[ ! -S /run/pine/console.sock ]]; then
-        echo "console service did not publish its Unix socket" >&2
+    socket_deadline=$((SECONDS + 30))
+    while [[ ! -S /run/pine/console.sock ]]; do
+        if ! systemctl is-active --quiet pine-console.service; then
+            echo "console service exited before publishing its Unix socket" >&2
+            exit 2
+        fi
+        if ((SECONDS >= socket_deadline)); then
+            echo "console service did not publish its Unix socket before the deadline" >&2
+            exit 2
+        fi
+        sleep 0.1
+    done
+    if ! systemctl is-active --quiet pine-console.service; then
+        echo "console service exited after publishing its Unix socket" >&2
         exit 2
     fi
     if [[ $(stat -c '%a:%U:%G' /run/pine/console.sock) != "660:$console_user:$console_group" ]]; then
         echo "console Unix socket identity or mode is unsafe" >&2
         exit 2
     fi
+    restart_console_on_failure=false
+    systemctl start pine-console-readiness.timer
+    systemctl start pine-console-readiness.service
     echo "backend_started=true"
     echo "console_started=true"
 else
+    restart_console_on_failure=false
     echo "backend_started=false"
     echo "console_started=false"
     echo "configure OPENAI_API_KEY in /etc/pine/backend.env, then enable and start the Pine units"

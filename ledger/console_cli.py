@@ -16,7 +16,7 @@ from ledger.console.app import create_console_app
 from ledger.console.assets import verify_packaged_assets
 from ledger.console.backend_client import ConsoleBackend, ConsoleBackendClient
 from ledger.console.config import ConsoleConfig
-from ledger.console.errors import BackendError, ConsoleError
+from ledger.console.errors import BackendError, BackendTransportError, ConsoleError
 from ledger.console.migrations import (
     CONSOLE_SCHEMA_VERSION,
     MINIMUM_COMPATIBLE_SCHEMA_VERSION,
@@ -118,7 +118,7 @@ def run_cli(
         backend = backend_factory(config)
         health = backend.ready()
         if args.command == "check":
-            status = store.get_status()
+            status = store.get_readonly_status()
             print(
                 json.dumps(
                     {
@@ -132,6 +132,9 @@ def run_cli(
             return 0
         (serve_runner or run_console_app)(config, store, backend)
         return 0
+    except BackendTransportError:
+        print("pine-research-console: backend readiness temporarily unavailable", file=sys.stderr)
+        return 75
     except BackendError:
         print("pine-research-console: backend readiness failed", file=sys.stderr)
         return 2
