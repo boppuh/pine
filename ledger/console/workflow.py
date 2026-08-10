@@ -99,6 +99,30 @@ class WorkflowService:
             )
         return self.store.finish_extraction(workflow_id, user_id, result)
 
+    def revise_and_extract(
+        self,
+        workflow_id: str,
+        user_id: str,
+        *,
+        source_text: str,
+        schema_id: str,
+        expected_version: int | None = None,
+    ) -> ConsoleWorkflow:
+        """Replace failed transient source and run a fresh side-effect-free extraction."""
+
+        revised = self.store.revise_source(
+            workflow_id,
+            user_id,
+            source_text=source_text,
+            schema_id=schema_id,
+            expected_version=expected_version,
+        )
+        return self.extract(
+            workflow_id,
+            user_id,
+            expected_version=revised.version,
+        )
+
     def confirm(
         self,
         workflow_id: str,
@@ -166,6 +190,11 @@ class WorkflowService:
         )
         try:
             response = self.backend.capture(request.to_backend_request())
+            committed = self.store.record_capture_response(
+                workflow.workflow_id,
+                user_id,
+                response,
+            )
         except BackendDomainError as exc:
             state = _failure_state(exc.disposition)
             logger.warning(
@@ -208,7 +237,6 @@ class WorkflowService:
                 code="console_internal_error",
                 details=("capture outcome requires exact replay",),
             )
-        committed = self.store.record_capture_response(workflow.workflow_id, user_id, response)
         logger.info(
             "console_capture_receipt_persisted",
             extra={

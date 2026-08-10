@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -104,6 +105,85 @@ def test_capture_sends_canonical_bytes_once_and_accepts_additive_receipt(
     assert calls == [canonical_json(request.model_dump(mode="json")).encode()]
 
 
+def test_authoritative_receipt_validates_committed_projection(
+    tmp_path: Path,
+    proposal: DraftProposal,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/predictions/pred_client"
+        assert request.headers["authorization"] == f"Bearer {TOKEN}"
+        return httpx.Response(
+            200,
+            json={
+                "prediction_id": "pred_client",
+                "run_id": "run_client",
+                "registration_status": "preregistered",
+                "forecast": proposal.forecast.model_dump(mode="json"),
+                "decision": proposal.decision,
+                "lineage": proposal.lineage,
+                "status": "open",
+                "transaction_state": "committed",
+                "schema_id": "finance/strategy-edge:1",
+                "schema_hash": f"sha256:{'a' * 64}",
+                "immutable_hash": f"sha256:{'b' * 64}",
+                "snapshot_ref": ".ledger/snapshots/pred_client.json",
+                "committed_at": datetime(2026, 8, 7, 12, 1, tzinfo=UTC).isoformat(),
+                "future_detail": True,
+            },
+        )
+
+    receipt = _client(tmp_path, handler).get_receipt("pred_client")
+
+    assert receipt.transaction_state == "committed"
+    assert receipt.registration_status == "preregistered"
+    assert receipt.committed_at.tzinfo is not None
+
+
+def test_authoritative_receipt_rejects_wrong_prediction_binding(
+    tmp_path: Path,
+    proposal: DraftProposal,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "prediction_id": "different_prediction",
+                "run_id": "run_client",
+                "registration_status": "preregistered",
+                "forecast": proposal.forecast.model_dump(mode="json"),
+                "decision": proposal.decision,
+                "lineage": proposal.lineage,
+                "status": "open",
+                "transaction_state": "committed",
+                "schema_id": "finance/strategy-edge:1",
+                "schema_hash": f"sha256:{'a' * 64}",
+                "immutable_hash": f"sha256:{'b' * 64}",
+                "snapshot_ref": ".ledger/snapshots/pred_client.json",
+                "committed_at": datetime(2026, 8, 7, 12, 1, tzinfo=UTC).isoformat(),
+            },
+        )
+
+    with pytest.raises(BackendProtocolError, match="prediction binding"):
+        _client(tmp_path, handler).get_receipt("pred_client")
+
+
+@pytest.mark.parametrize("prediction_id", [".", ".."])
+def test_authoritative_receipt_rejects_dot_segment_before_request(
+    tmp_path: Path,
+    prediction_id: str,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500)
+
+    with pytest.raises(ValueError, match="identifier is unsafe"):
+        _client(tmp_path, handler).get_receipt(prediction_id)
+
+    assert requests == []
+
+
 def test_frozen_capture_requires_canonical_console_uuid(
     capture_input: CaptureInput,
 ) -> None:
@@ -197,6 +277,31 @@ def test_capture_receipt_must_bind_schema_and_artifact_names(
                 "snapshot_ref": ".ledger/snapshots/pred_client.json",
                 "schema_id": "other/schema:1",
                 "schema_hash": f"sha256:{'a' * 64}",
+                "immutable_hash": f"sha256:{'b' * 64}",
+                "created": True,
+            },
+        )
+
+    with pytest.raises(BackendProtocolError, match="binding"):
+        _client(tmp_path, handler).capture(request)
+
+
+def test_capture_receipt_must_bind_reviewed_schema_hash(
+    tmp_path: Path,
+    capture_input: CaptureInput,
+) -> None:
+    request = capture_input.freeze("console-00000000-0000-4000-8000-000000000001")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "prediction_id": "pred_client",
+                "run_id": "run_client",
+                "record_ref": "predictions/pred_client.md",
+                "snapshot_ref": ".ledger/snapshots/pred_client.json",
+                "schema_id": "finance/strategy-edge:1",
+                "schema_hash": f"sha256:{'c' * 64}",
                 "immutable_hash": f"sha256:{'b' * 64}",
                 "created": True,
             },

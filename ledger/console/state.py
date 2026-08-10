@@ -197,6 +197,43 @@ class ConsoleStateStore:
             updated = self._get_row(connection, workflow_id, identity)
         return self._workflow_from_row(updated)
 
+    def revise_source(
+        self,
+        workflow_id: str,
+        user_id: str,
+        *,
+        source_text: str,
+        schema_id: str,
+        expected_version: int | None = None,
+    ) -> ConsoleWorkflow:
+        """Replace transient source after a failed extraction, before trying again."""
+
+        request = HypothesisExtractionRequest(text=source_text, schema_id=schema_id)
+        identity = normalize_user_identity(user_id)
+        now = self._now()
+        with self.transaction() as connection:
+            row = self._get_row(connection, workflow_id, identity)
+            self._require_state(row, WorkflowState.EDITING)
+            self._require_version(row, expected_version)
+            if request.schema_id != row["schema_id"]:
+                raise WorkflowConflictError("workflow schema cannot be changed")
+            self._update(
+                connection,
+                workflow_id,
+                """
+                source_text = ?, proposal_json = NULL, error_code = NULL,
+                error_details_json = NULL, updated_at = ?, expires_at = ?,
+                version = version + 1
+                """,
+                (
+                    request.text,
+                    _timestamp(now),
+                    _timestamp(now + self.ordinary_retention),
+                ),
+            )
+            updated = self._get_row(connection, workflow_id, identity)
+        return self._workflow_from_row(updated)
+
     def finish_extraction(
         self,
         workflow_id: str,
@@ -304,6 +341,13 @@ class ConsoleStateStore:
             )
             if capture_input.schema_id != row["schema_id"]:
                 raise WorkflowConflictError("capture schema differs from the workflow schema")
+            proposal = self._workflow_from_row(row).proposal
+            if proposal is None:
+                raise WorkflowConflictError("reviewing workflow lacks a proposal")
+            if capture_input.schema_hash != proposal.schema_hash:
+                raise WorkflowConflictError(
+                    "capture schema hash differs from the reviewed proposal"
+                )
             request = capture_input.freeze(row["idempotency_key"])
             self._update(
                 connection,

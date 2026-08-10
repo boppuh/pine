@@ -59,6 +59,7 @@ def _build_app(
     *,
     allowed_identities: tuple[str, ...] = (IDENTITY,),
     socket_path: Path | None = None,
+    retention_sweep_interval_seconds: float = 300.0,
 ):
     socket_path = socket_path or tmp_path / "console.sock"
     state_path = tmp_path / "state" / "console.db"
@@ -79,7 +80,13 @@ def _build_app(
         idle_lifetime=config.session_idle_lifetime,
         clock=clock,
     )
-    app = create_console_app(config, store, backend, sessions=sessions)
+    app = create_console_app(
+        config,
+        store,
+        backend,
+        sessions=sessions,
+        retention_sweep_interval_seconds=retention_sweep_interval_seconds,
+    )
     return app, config, store, sessions
 
 
@@ -95,6 +102,36 @@ def _identity_headers(identity: str = IDENTITY) -> dict[str, str]:
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Dest": "document",
     }
+
+
+def test_long_running_console_continuously_removes_expired_workflows(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+    clock: MutableClock,
+) -> None:
+    app, config, store, _sessions = _build_app(
+        tmp_path,
+        fake_backend,
+        clock,
+        retention_sweep_interval_seconds=0.01,
+    )
+
+    with _client(app, config) as client:
+        assert client.get("/", headers=_identity_headers()).status_code == 200
+        store.create_workflow(user_id=IDENTITY, source_text="Temporary hypothesis")
+        clock.advance(timedelta(hours=25))
+        deadline = time.monotonic() + 2
+        remaining = 1
+        while remaining and time.monotonic() < deadline:
+            connection = store.connect()
+            try:
+                remaining = connection.execute("SELECT COUNT(*) FROM workflows").fetchone()[0]
+            finally:
+                connection.close()
+            if remaining:
+                time.sleep(0.01)
+
+    assert remaining == 0
 
 
 def _csrf_from_html(content: str) -> str:
@@ -181,9 +218,26 @@ def test_route_inventory_is_public_only_for_health(
     with _client(app, config) as client:
         for public_path in ("/healthz", "/livez", "/readyz"):
             assert client.get(public_path).status_code == 200
-        for protected_path in ("/", "/status", "/assets/console.css", "/unknown"):
+        for protected_path in (
+            "/",
+            "/hypotheses/new",
+            "/status",
+            "/assets/console.css",
+            "/assets/console.js",
+            "/workflows/00000000-0000-4000-8000-000000000001/review",
+            "/workflows/00000000-0000-4000-8000-000000000001/status",
+            "/workflows/00000000-0000-4000-8000-000000000001/receipt",
+            "/unknown",
+        ):
             assert client.get(protected_path).status_code == 403
-        assert client.post("/session/logout").status_code == 403
+        for protected_path in (
+            "/session/logout",
+            "/workflows",
+            "/workflows/00000000-0000-4000-8000-000000000001/confirm",
+            "/workflows/00000000-0000-4000-8000-000000000001/retry",
+            "/workflows/00000000-0000-4000-8000-000000000001/cancel",
+        ):
+            assert client.post(protected_path).status_code == 403
 
 
 def test_authenticated_shell_sets_exact_cookie_headers_and_local_assets(
@@ -235,7 +289,7 @@ def test_authenticated_shell_sets_exact_cookie_headers_and_local_assets(
         assert "https://" not in asset.text
         assert "http://" not in asset.text
         assert "@import" not in asset.text
-        assert response.text.count("(not yet available)") == 2
+        assert response.text.count("(not yet available)") == 1
         assert ".visually-hidden" in asset.text
 
     connection = store.connect()

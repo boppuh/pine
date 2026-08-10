@@ -6,11 +6,13 @@ import json
 import re
 import time
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
+from urllib.parse import quote
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator
 
 from ledger.api import CaptureResponse, HealthResponse
 from ledger.console.config import ConsoleConfig
@@ -25,7 +27,12 @@ from ledger.extraction import (
     ExtractionStatus,
     HypothesisExtractionRequest,
 )
-from ledger.integrity import PreregisteredCaptureRequest
+from ledger.integrity import (
+    PredictionStatus,
+    PreregisteredCaptureRequest,
+    RegistrationStatus,
+    StrategyEdgeForecast,
+)
 from ledger.json_utils import canonical_json
 
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -40,6 +47,7 @@ _EXPECTED_ERROR_STATUSES = {
     "idempotency_conflict": 409,
     "snapshot_unavailable": 503,
     "integrity_error": 409,
+    "prediction_not_found": 404,
     "internal_error": 500,
 }
 
@@ -66,6 +74,48 @@ class ConsoleBackend(Protocol):
         """Submit one exact preregistration request without automatic retry."""
 
         ...
+
+    def get_receipt(self, prediction_id: str) -> AuthoritativeReceipt:
+        """Return verified committed fields for a capture receipt."""
+
+        ...
+
+
+class AuthoritativeReceipt(BaseModel):
+    """Small verified projection required to call a capture committed."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    prediction_id: str = Field(min_length=1, max_length=128)
+    run_id: str = Field(min_length=1, max_length=128)
+    registration_status: Literal[RegistrationStatus.PREREGISTERED]
+    forecast: StrategyEdgeForecast
+    decision: str = Field(min_length=1)
+    lineage: dict[str, JsonValue]
+    status: PredictionStatus
+    transaction_state: Literal["committed"]
+    schema_id: str = Field(min_length=1, max_length=256)
+    schema_hash: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    immutable_hash: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    snapshot_ref: str
+    committed_at: datetime
+
+    @field_validator("prediction_id", "run_id")
+    @classmethod
+    def identifiers_are_not_paths(cls, value: str) -> str:
+        return _safe_identifier(value)
+
+    @field_validator("snapshot_ref")
+    @classmethod
+    def snapshot_reference_is_safe(cls, value: str) -> str:
+        return _safe_relative_reference(value)
+
+    @field_validator("committed_at")
+    @classmethod
+    def committed_at_is_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("backend receipt timestamp must be timezone-aware")
+        return value.astimezone(UTC)
 
 
 class _WireHealth(BaseModel):
@@ -111,23 +161,30 @@ class _WireCapture(BaseModel):
     @field_validator("prediction_id", "run_id")
     @classmethod
     def identifiers_are_not_paths(cls, value: str) -> str:
-        if any(character in value for character in ("/", "\\", "\x00")):
-            raise ValueError("backend identifier is unsafe")
-        return value
+        return _safe_identifier(value)
 
     @field_validator("record_ref", "snapshot_ref")
     @classmethod
     def references_are_safe_relative_paths(cls, value: str) -> str:
-        path = PurePosixPath(value)
-        if (
-            not value
-            or len(value) > 4096
-            or path.is_absolute()
-            or str(path) != value
-            or any(part in {"", ".", ".."} for part in path.parts)
-        ):
-            raise ValueError("backend artifact reference is unsafe")
-        return value
+        return _safe_relative_reference(value)
+
+
+class _WireReceipt(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    prediction_id: str
+    run_id: str
+    registration_status: str
+    forecast: dict[str, Any]
+    decision: str
+    lineage: dict[str, Any]
+    status: str
+    transaction_state: str
+    schema_id: str
+    schema_hash: str
+    immutable_hash: str
+    snapshot_ref: str
+    committed_at: datetime
 
 
 class _WireErrorBody(BaseModel):
@@ -240,11 +297,33 @@ class ConsoleBackendClient:
             raise BackendProtocolError("backend capture response is invalid") from exc
         if (
             response.schema_id != request.schema_id
+            or (
+                request.expected_schema_hash is not None
+                and response.schema_hash != request.expected_schema_hash
+            )
             or response.record_ref != f"predictions/{response.prediction_id}.md"
             or response.snapshot_ref != f".ledger/snapshots/{response.prediction_id}.json"
         ):
             raise BackendProtocolError("backend capture receipt binding is invalid")
         return response
+
+    def get_receipt(self, prediction_id: str) -> AuthoritativeReceipt:
+        """Read verified committed fields and reject a mismatched prediction binding."""
+
+        safe_prediction_id = _safe_identifier(prediction_id)
+        payload = self._request(
+            "GET",
+            f"/v1/predictions/{quote(safe_prediction_id, safe='')}",
+            timeout=self.config.health_timeout_seconds,
+        )
+        try:
+            wire = _WireReceipt.model_validate(payload)
+            receipt = AuthoritativeReceipt.model_validate(wire.model_dump(mode="json"))
+        except ValidationError as exc:
+            raise BackendProtocolError("backend receipt response is invalid") from exc
+        if receipt.prediction_id != safe_prediction_id:
+            raise BackendProtocolError("backend receipt prediction binding is invalid")
+        return receipt
 
     def _request(
         self,
@@ -311,6 +390,30 @@ def _validated_health(payload: Mapping[str, Any], *, operation: str) -> HealthRe
     if response.status != "ok" or response.api_version != "v1":
         raise BackendProtocolError(f"backend {operation} contract is incompatible")
     return response
+
+
+def _safe_identifier(value: str) -> str:
+    if (
+        not value
+        or value in {".", ".."}
+        or len(value) > 128
+        or any(character in value for character in ("/", "\\", "\x00"))
+    ):
+        raise ValueError("backend identifier is unsafe")
+    return value
+
+
+def _safe_relative_reference(value: str) -> str:
+    path = PurePosixPath(value)
+    if (
+        not value
+        or len(value) > 4096
+        or path.is_absolute()
+        or str(path) != value
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise ValueError("backend artifact reference is unsafe")
+    return value
 
 
 def sanitize_backend_details(details: tuple[str, ...]) -> tuple[str, ...]:

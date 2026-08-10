@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-heading" aria-labelledby="error-page-heading">
+  <p class="eyebrow">Console</p>
+  <h1 id="error-page-heading">{{ heading }}</h1>
+  <p class="lede">{{ message }}</p>
+  <a class="primary-action" href="/hypotheses/new">Start a new hypothesis</a>
+</section>
+{% endblock %}

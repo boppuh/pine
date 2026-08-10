@@ -15,7 +15,7 @@ from ledger.console.errors import (
     BackendTransportError,
     WorkflowConflictError,
 )
-from ledger.console.models import CaptureInput, WorkflowState
+from ledger.console.models import CaptureInput, ConsoleWorkflow, WorkflowState
 from ledger.console.state import ConsoleStateStore
 from ledger.console.workflow import WorkflowService
 from ledger.errors import IntegrityError
@@ -69,6 +69,7 @@ def test_successful_confirmation_freezes_request_and_receipt_once(
     )
     assert committed.frozen_request is not None
     assert committed.frozen_request.idempotency_key == reviewing.idempotency_key
+    assert committed.frozen_request.expected_schema_hash == proposal.schema_hash
     with pytest.raises(IntegrityError, match="immutable"):
         committed.frozen_request.lineage["family_id"] = "changed"
     with pytest.raises(ValidationError, match="frozen"):
@@ -91,6 +92,36 @@ def test_successful_confirmation_freezes_request_and_receipt_once(
             )
     finally:
         connection.close()
+
+
+def test_confirmation_rejects_a_schema_hash_other_than_the_reviewed_proposal(
+    console_store: ConsoleStateStore,
+    fake_backend: FakeBackend,
+    proposal: DraftProposal,
+    capture_input: CaptureInput,
+) -> None:
+    service = WorkflowService(console_store, fake_backend)
+    reviewing = _ready_workflow(service, proposal)
+    mismatched = CaptureInput.model_validate(
+        {
+            **capture_input.model_dump(mode="json"),
+            "schema_hash": f"sha256:{'c' * 64}",
+        }
+    )
+
+    with pytest.raises(WorkflowConflictError, match="reviewed proposal"):
+        service.confirm(
+            reviewing.workflow_id,
+            reviewing.user_id,
+            mismatched,
+            expected_version=reviewing.version,
+        )
+
+    assert fake_backend.capture_requests == []
+    assert (
+        console_store.get_workflow(reviewing.workflow_id, reviewing.user_id).state
+        is WorkflowState.REVIEWING
+    )
 
 
 def test_lost_response_retry_replays_byte_equivalent_frozen_request(
@@ -124,6 +155,40 @@ def test_lost_response_retry_replays_byte_equivalent_frozen_request(
     ]
     assert request_bytes[0] == request_bytes[1]
     assert uncertain.frozen_request == retried.frozen_request
+
+
+def test_receipt_persistence_failure_becomes_recoverable_without_restart(
+    console_store: ConsoleStateStore,
+    fake_backend: FakeBackend,
+    proposal: DraftProposal,
+    capture_input: CaptureInput,
+    capture_response: CaptureResponse,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = WorkflowService(console_store, fake_backend)
+    reviewing = _ready_workflow(service, proposal)
+    persist_response = console_store.record_capture_response
+
+    def fail_persistence(*_args: object, **_kwargs: object) -> ConsoleWorkflow:
+        raise sqlite3.OperationalError("transient persistence failure")
+
+    monkeypatch.setattr(console_store, "record_capture_response", fail_persistence)
+    uncertain = service.confirm(reviewing.workflow_id, reviewing.user_id, capture_input)
+
+    assert uncertain.state is WorkflowState.UNCERTAIN
+    assert uncertain.error_code == "console_internal_error"
+    assert len(fake_backend.capture_requests) == 1
+
+    monkeypatch.setattr(console_store, "record_capture_response", persist_response)
+    fake_backend.capture_outcomes.append(capture_response.model_copy(update={"created": False}))
+    committed = service.retry(
+        uncertain.workflow_id,
+        uncertain.user_id,
+        expected_version=uncertain.version,
+    )
+
+    assert committed.state is WorkflowState.COMMITTED
+    assert len(fake_backend.capture_requests) == 2
 
 
 @pytest.mark.parametrize(

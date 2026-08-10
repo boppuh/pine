@@ -274,10 +274,14 @@ class PreregisteredCaptureRequest(_WriteOnceModel):
     preregistered record and therefore cannot promote an exploratory record.
     """
 
-    _integrity_fields = frozenset({"forecast", "decision", "lineage"})
+    _integrity_fields = frozenset({"expected_schema_hash", "forecast", "decision", "lineage"})
 
     idempotency_key: str = Field(min_length=1, max_length=256)
     schema_id: str = "finance/strategy-edge:1"
+    expected_schema_hash: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+    )
     forecast: StrategyEdgeForecast
     decision: str = Field(min_length=1)
     lineage: dict[str, JsonValue]

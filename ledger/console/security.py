@@ -211,12 +211,15 @@ class ConsoleSecurityMiddleware:
                 await _send_plain(secured_send, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Too Large")
                 return
 
-            if state_changing and csrf_header is None:
-                form_token, form_field_names = _form_csrf(body)
-                if form_token is None or not session.validates_csrf(form_token, method, path):
+            if state_changing and _is_urlencoded(scope):
+                form_token, form_field_names, form_values = _form_csrf(body)
+                state["pine.form_field_names"] = form_field_names
+                state["pine.form_values"] = form_values
+                if csrf_header is None and (
+                    form_token is None or not session.validates_csrf(form_token, method, path)
+                ):
                     await _send_plain(secured_send, HTTPStatus.FORBIDDEN, "Forbidden")
                     return
-                state["pine.form_field_names"] = form_field_names
 
             await self.app(scope, _replay_body(body), secured_send)
         except _RequestDisconnected:
@@ -300,6 +303,20 @@ def require_form_fields(scope: Scope) -> frozenset[str]:
     return field_names
 
 
+def require_form_values(scope: Scope) -> dict[str, tuple[str, ...]]:
+    """Return bounded form values parsed once by the security boundary."""
+
+    values = _request_state(scope).get("pine.form_values")
+    if not isinstance(values, dict) or not all(
+        isinstance(field, str)
+        and isinstance(items, tuple)
+        and all(isinstance(item, str) for item in items)
+        for field, items in values.items()
+    ):
+        raise RuntimeError("validated console form values are unavailable")
+    return values
+
+
 def clear_session_cookie(scope: Scope) -> None:
     """Tell the response boundary to expire the authenticated browser cookie."""
 
@@ -373,7 +390,9 @@ def _is_urlencoded(scope: Scope) -> bool:
     return content_type.partition(";")[0].strip().lower() == "application/x-www-form-urlencoded"
 
 
-def _form_csrf(body: bytes) -> tuple[str | None, frozenset[str]]:
+def _form_csrf(
+    body: bytes,
+) -> tuple[str | None, frozenset[str], dict[str, tuple[str, ...]]]:
     try:
         parsed = parse_qs(
             body.decode("utf-8"),
@@ -382,10 +401,11 @@ def _form_csrf(body: bytes) -> tuple[str | None, frozenset[str]]:
             max_num_fields=64,
         )
     except (UnicodeDecodeError, ValueError):
-        return None, frozenset()
+        return None, frozenset(), {}
     values = parsed.get("csrf_token")
     token = values[0] if values is not None and len(values) == 1 else None
-    return token, frozenset(parsed)
+    frozen_values = {field: tuple(items) for field, items in parsed.items()}
+    return token, frozenset(parsed), frozen_values
 
 
 async def _read_bounded_body(receive: Receive, limit: int) -> bytes | None:

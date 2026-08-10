@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="receipt-hero" aria-labelledby="receipt-heading">
+  <div>
+    <p class="eyebrow">Capture receipt</p>
+    <h1 id="receipt-heading">{% if verification_state == 'verified' %}Preregistration committed{% elif verification_state == 'integrity_failure' %}Receipt integrity check failed{% else %}Capture response retained{% endif %}</h1>
+    <p class="lede">{% if verification_state == 'verified' %}The capture response matches a subsequent verified read from the authoritative ledger.{% elif verification_state == 'integrity_failure' %}The retained capture response could not be reconciled with authoritative ledger evidence.{% else %}Pine retained the validated capture response, but the authoritative follow-up read is temporarily unavailable.{% endif %}</p>
+  </div>
+  <span class="receipt-mark{% if verification_state != 'verified' %} is-pending{% endif %}" aria-hidden="true">{% if verification_state == 'verified' %}✓{% elif verification_state == 'integrity_failure' %}!{% else %}…{% endif %}</span>
+</section>
+
+{% if verification_state == 'integrity_failure' %}
+<div class="notice is-warning" role="alert">
+  Do not rely on this receipt. The authoritative evidence failed verification or did not match the capture response. Escalate for integrity review.
+</div>
+{% elif verification_state == 'unavailable' %}
+<div class="notice is-warning" role="status">
+  Transaction state is not being inferred from the capture response. Reload this page to verify the authoritative read.
+</div>
+{% endif %}
+
+<section class="receipt-panel" aria-label="Capture response details">
+  <dl class="definition-grid receipt-grid">
+    <div><dt>Prediction ID</dt><dd><code>{{ receipt.prediction_id }}</code></dd></div>
+    <div><dt>Run ID</dt><dd><code>{{ receipt.run_id }}</code></dd></div>
+    {% if authority %}
+    <div><dt>Registration</dt><dd>{{ authority.registration_status.value }}</dd></div>
+    <div><dt>Transaction</dt><dd>{{ authority.transaction_state }}</dd></div>
+    <div><dt>Prediction status</dt><dd>{{ authority.status.value }}</dd></div>
+    <div><dt>Committed</dt><dd><time datetime="{{ authority.committed_at.isoformat() }}">{{ authority.committed_at.strftime('%Y-%m-%d %H:%M UTC') }}</time></dd></div>
+    {% endif %}
+    <div><dt>Capture result</dt><dd>{% if receipt.created %}Created once{% else %}Existing idempotent result recovered{% endif %}</dd></div>
+    <div><dt>Schema</dt><dd><code>{{ receipt.schema_id }}</code></dd></div>
+    <div class="span-all"><dt>Schema hash</dt><dd><code class="wrap-code">{{ receipt.schema_hash }}</code></dd></div>
+    <div class="span-all"><dt>Immutable hash</dt><dd><code class="wrap-code">{{ receipt.immutable_hash }}</code></dd></div>
+    <div class="span-all"><dt>Record reference</dt><dd><code class="wrap-code">{{ receipt.record_ref }}</code></dd></div>
+    <div class="span-all"><dt>Snapshot reference</dt><dd><code class="wrap-code">{{ receipt.snapshot_ref }}</code></dd></div>
+  </dl>
+</section>
+
+<div class="form-actions">
+  <a class="text-action" href="/">Back to home</a>
+  <a class="primary-action no-margin" href="/hypotheses/new">Capture another hypothesis</a>
+</div>
+{% endblock %}

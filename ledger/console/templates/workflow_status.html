@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-heading compact-heading" aria-labelledby="workflow-status-heading">
+  <p class="eyebrow">Capture status</p>
+  {% if workflow.state.value == 'extracting' %}
+  <h1 id="workflow-status-heading">Extracting proposal</h1>
+  <p class="lede">Pine is validating the source and preparing a reviewable proposal. No ledger record has been created.</p>
+  {% elif workflow.state.value in ['frozen', 'submitting'] %}
+  <h1 id="workflow-status-heading">Submitting frozen request</h1>
+  <p class="lede">The reviewed request is locked while Pine waits for an authoritative result.</p>
+  {% elif workflow.state.value == 'uncertain' %}
+  <h1 id="workflow-status-heading">Commit outcome needs checking</h1>
+  <p class="lede">The connection ended without a validated receipt. Pine can safely replay only the exact frozen request.</p>
+  {% elif workflow.state.value == 'retryable_failure' %}
+  <h1 id="workflow-status-heading">Exact retry is available</h1>
+  <p class="lede">The backend returned a safe, retryable failure. Your reviewed request remains frozen.</p>
+  {% else %}
+  <h1 id="workflow-status-heading">Action required</h1>
+  <p class="lede">The authoritative backend rejected this frozen request. It cannot be edited or retried.</p>
+  {% endif %}
+</section>
+
+<section class="status-card" aria-label="Workflow state">
+  <div class="status-card-heading">
+    <span class="badge{% if workflow.state.value == 'terminal_failure' %} is-warning{% endif %}">{{ workflow.state.value | replace('_', ' ') }}</span>
+    <code>{{ workflow.workflow_id }}</code>
+  </div>
+  {% if error_details %}
+  <ul class="safe-error-list">
+    {% for key, detail in error_details.items() %}<li>{{ detail }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+  {% if workflow.state.value == 'extracting' %}
+  <p class="field-help">Extraction is proposal-only. Return to this status page to continue when it completes.</p>
+  {% else %}
+  <p class="field-help">No fields can change after confirmation. The stored idempotency key remains bound to the frozen request.</p>
+  {% endif %}
+</section>
+
+<div class="form-actions status-actions">
+  <a class="text-action" href="/hypotheses/new">Start a new hypothesis</a>
+  {% if retry_allowed %}
+  <form method="post" action="/workflows/{{ workflow.workflow_id }}/retry" data-submit-once>
+    <input type="hidden" name="csrf_token" value="{{ retry_csrf_token }}">
+    <input type="hidden" name="version" value="{{ workflow.version }}">
+    <button class="primary-button" type="submit" data-pending-label="Checking exact request...">Retry exact frozen request</button>
+  </form>
+  {% endif %}
+</div>
+{% endblock %}
