@@ -19,7 +19,11 @@ from ledger.console.errors import (
 )
 from ledger.console.models import CaptureInput
 from ledger.extraction import DraftProposal, HypothesisExtractionRequest
+from ledger.integrity import PredictionStatus, RegistrationStatus
 from ledger.json_utils import canonical_json
+from ledger.read_models import ResultState
+
+from .conftest import FakeBackend
 
 TOKEN = "console-backend-token-" + "x" * 48
 
@@ -165,6 +169,105 @@ def test_authoritative_receipt_rejects_wrong_prediction_binding(
 
     with pytest.raises(BackendProtocolError, match="prediction binding"):
         _client(tmp_path, handler).get_receipt("pred_client")
+
+
+def test_prediction_list_encodes_filters_and_accepts_additive_fields(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+) -> None:
+    strategy_id = fake_backend.prediction_detail.forecast.strategy_id
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/predictions"
+        assert dict(request.url.params) == {
+            "limit": "10",
+            "cursor": "cursor+/=",
+            "registration_status": "preregistered",
+            "status": "open",
+            "strategy_id": strategy_id,
+            "result_state": "absent",
+        }
+        payload = fake_backend.prediction_page.model_dump(mode="json")
+        payload["future_page"] = True
+        payload["items"][0]["future_summary"] = True
+        return httpx.Response(200, json=payload)
+
+    page = _client(tmp_path, handler).list_predictions(
+        limit=10,
+        cursor="cursor+/=",
+        registration_status=RegistrationStatus.PREREGISTERED,
+        status=PredictionStatus.OPEN,
+        strategy_id=strategy_id,
+        result_state=ResultState.ABSENT,
+    )
+
+    assert page == fake_backend.prediction_page
+
+
+def test_prediction_list_rejects_unverified_forecast_fields(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+) -> None:
+    payload = fake_backend.prediction_page.model_dump(mode="json")
+    payload["items"][0]["integrity_state"] = "failed"
+    payload["items"][0]["integrity_reason"] = "record_unverified"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with pytest.raises(BackendProtocolError, match="exposes unverified data"):
+        _client(tmp_path, handler).list_predictions()
+
+
+def test_prediction_list_rejects_result_before_completed_run(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+) -> None:
+    payload = fake_backend.prediction_page.model_dump(mode="json")
+    payload["items"][0]["result_state"] = "present"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with pytest.raises(BackendProtocolError, match="result state"):
+        _client(tmp_path, handler).list_predictions()
+
+
+def test_prediction_detail_and_status_validate_authoritative_bindings(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/status":
+            payload = fake_backend.ledger_status.model_dump(mode="json")
+            payload["future_status"] = True
+            return httpx.Response(200, json=payload)
+        payload = fake_backend.prediction_detail.model_dump(mode="json")
+        payload["future_detail"] = True
+        payload["snapshot"]["future_snapshot"] = True
+        return httpx.Response(200, json=payload)
+
+    client = _client(tmp_path, handler)
+
+    assert (
+        client.get_prediction(fake_backend.prediction_detail.prediction_id)
+        == fake_backend.prediction_detail
+    )
+    assert client.get_status() == fake_backend.ledger_status
+
+
+def test_prediction_detail_rejects_wrong_run_binding(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+) -> None:
+    payload = fake_backend.prediction_detail.model_dump(mode="json")
+    payload["run"]["run_id"] = "run_different"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with pytest.raises(BackendProtocolError, match="detail binding"):
+        _client(tmp_path, handler).get_prediction(fake_backend.prediction_detail.prediction_id)
 
 
 @pytest.mark.parametrize("prediction_id", [".", ".."])

@@ -70,7 +70,7 @@ jobs:
         working-directory: obsidian-plugin
 
   browser:
-    name: Capture browser acceptance
+    name: Console browser acceptance
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -91,7 +91,7 @@ jobs:
       - name: Install browser runtimes
         run: uv run playwright install --with-deps chromium webkit
 
-      - name: Run capture browser acceptance
+      - name: Run console browser acceptance
         env:
           PINE_BROWSER_EVIDENCE_DIR: test-results/browser
           PINE_RUN_BROWSER_TESTS: "1"
@@ -101,6 +101,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: capture-browser-traces
+          name: console-browser-traces
           path: test-results/browser/*.zip
           if-no-files-found: warn

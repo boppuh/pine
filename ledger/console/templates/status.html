@@ -17,7 +17,7 @@
   <div class="status-row">
     <div>
       <h2>Ledger backend</h2>
-      <p>Loopback API v1</p>
+      <p>Authenticated verified read API</p>
     </div>
     <span class="status-value{% if backend_status != 'ok' %} is-muted{% endif %}">
       <span class="status-dot" aria-hidden="true"></span>{{ backend_status | capitalize }}
@@ -29,6 +29,27 @@
       <p>Transient workflow schema</p>
     </div>
     <span class="status-value">Version {{ schema_version }}</span>
+  </div>
+  <div class="status-row">
+    <div>
+      <h2>Committed predictions</h2>
+      <p>Authoritative registry count</p>
+    </div>
+    <span class="status-value is-plain">{% if ledger_status %}{{ ledger_status.committed_predictions }}{% else %}Unavailable{% endif %}</span>
+  </div>
+  <div class="status-row">
+    <div>
+      <h2>Integrity violations</h2>
+      <p>Recorded evidence warnings</p>
+    </div>
+    <span class="status-value is-plain">{% if ledger_status %}{{ ledger_status.integrity_violations }}{% else %}Unavailable{% endif %}</span>
+  </div>
+  <div class="status-row">
+    <div>
+      <h2>Verified run results</h2>
+      <p>Immutable MSM result evidence</p>
+    </div>
+    <span class="status-value is-plain">{% if ledger_status %}{{ ledger_status.run_results }}{% else %}Unavailable{% endif %}</span>
   </div>
 </section>
 {% endblock %}

@@ -235,3 +235,94 @@ def test_capture_layout_has_no_horizontal_overflow_at_supported_widths(
             context.close()
     finally:
         browser.close()
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_verified_inspection_flow_in_chromium_and_webkit(
+    playwright_runtime: Playwright,
+    browser_server: tuple[str, FakeBackend],
+    tmp_path: Path,
+    engine: str,
+) -> None:
+    base_url, backend = browser_server
+    strategy_id = backend.prediction_detail.forecast.strategy_id
+    browser_type: BrowserType = getattr(playwright_runtime, engine)
+    browser = browser_type.launch()
+    evidence_root = Path(
+        os.environ.get("PINE_BROWSER_EVIDENCE_DIR", str(tmp_path / "browser-evidence"))
+    )
+    trace_path = evidence_root / f"inspection-{engine}.zip"
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    context = browser.new_context(base_url=base_url, viewport={"width": 1280, "height": 900})
+    context.tracing.start(screenshots=True, snapshots=True, sources=True)
+    page = context.new_page()
+    browser_errors: list[str] = []
+    page.on("pageerror", lambda error: browser_errors.append(str(error)))
+    page.on(
+        "console",
+        lambda message: browser_errors.append(message.text) if message.type == "error" else None,
+    )
+    try:
+        page.goto("/")
+        expect(
+            page.get_by_role("heading", name="Decision evidence you can inspect")
+        ).to_be_visible()
+        page.get_by_role("link", name="Predictions").first.click()
+        expect(page.get_by_role("heading", name="Predictions", exact=True)).to_be_visible()
+        page.get_by_label("Strategy ID").fill(strategy_id)
+        page.get_by_role("button", name="Apply filters").click()
+        expect(page.get_by_role("link", name=strategy_id)).to_be_visible()
+        assert backend.prediction_list_requests[-1]["strategy_id"] == strategy_id
+        page.get_by_role("link", name=strategy_id).click()
+        expect(page.get_by_role("heading", name=strategy_id, exact=True)).to_be_visible()
+        expect(page.get_by_text("Evidence verified", exact=True)).to_be_visible()
+        expect(page.get_by_text("No result evidence attached", exact=True)).to_be_visible()
+        assert backend.capture_requests == []
+        assert browser_errors == []
+    finally:
+        context.tracing.stop(path=trace_path)
+        context.close()
+        browser.close()
+    assert trace_path.is_file()
+    assert trace_path.stat().st_size > 0
+
+
+def test_inspection_layout_has_no_horizontal_overflow_at_supported_widths(
+    playwright_runtime: Playwright,
+    browser_server: tuple[str, FakeBackend],
+) -> None:
+    base_url, backend = browser_server
+    browser = playwright_runtime.chromium.launch()
+    paths = (
+        "/",
+        "/predictions",
+        f"/predictions/{backend.prediction_detail.prediction_id}",
+        "/status",
+    )
+    try:
+        for width, height in ((390, 844), (768, 1024), (1440, 1000)):
+            context = browser.new_context(
+                base_url=base_url,
+                viewport={"width": width, "height": height},
+            )
+            page: Page = context.new_page()
+            for path in paths:
+                page.goto(path)
+                overflow = page.evaluate(
+                    "document.documentElement.scrollWidth > document.documentElement.clientWidth"
+                )
+                assert overflow is False, f"horizontal overflow for {path} at {width}x{height}"
+            context.close()
+        dark_context = browser.new_context(
+            base_url=base_url,
+            viewport={"width": 1280, "height": 900},
+            color_scheme="dark",
+        )
+        dark_page = dark_context.new_page()
+        dark_page.goto(f"/predictions/{backend.prediction_detail.prediction_id}")
+        assert dark_page.evaluate("getComputedStyle(document.body).backgroundColor") == (
+            "rgb(16, 20, 17)"
+        )
+        dark_context.close()
+    finally:
+        browser.close()

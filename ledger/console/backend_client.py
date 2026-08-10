@@ -8,8 +8,8 @@ import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
-from typing import Any, Literal, Protocol
-from urllib.parse import quote
+from typing import Any, Literal, Protocol, TypeVar
+from urllib.parse import quote, urlencode
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator
@@ -34,6 +34,14 @@ from ledger.integrity import (
     StrategyEdgeForecast,
 )
 from ledger.json_utils import canonical_json
+from ledger.read_models import (
+    IntegrityState,
+    LedgerStatus,
+    PredictionDetail,
+    PredictionPage,
+    ResultState,
+)
+from ledger.run import RunState
 
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _SECRET_PATTERN = re.compile(r"(?i)(bearer\s+|password|secret|token|api[_-]?key|authorization)")
@@ -48,8 +56,11 @@ _EXPECTED_ERROR_STATUSES = {
     "snapshot_unavailable": 503,
     "integrity_error": 409,
     "prediction_not_found": 404,
+    "invalid_cursor": 422,
     "internal_error": 500,
 }
+
+_ReadProjection = TypeVar("_ReadProjection", bound=BaseModel)
 
 
 class ConsoleBackend(Protocol):
@@ -77,6 +88,30 @@ class ConsoleBackend(Protocol):
 
     def get_receipt(self, prediction_id: str) -> AuthoritativeReceipt:
         """Return verified committed fields for a capture receipt."""
+
+        ...
+
+    def list_predictions(
+        self,
+        *,
+        limit: int = 25,
+        cursor: str | None = None,
+        registration_status: RegistrationStatus | None = None,
+        status: PredictionStatus | None = None,
+        strategy_id: str | None = None,
+        result_state: ResultState | None = None,
+    ) -> PredictionPage:
+        """Return one verified, cursor-paginated prediction page."""
+
+        ...
+
+    def get_prediction(self, prediction_id: str) -> PredictionDetail:
+        """Return one fully verified prediction projection."""
+
+        ...
+
+    def get_status(self) -> LedgerStatus:
+        """Return non-secret authoritative ledger counts."""
 
         ...
 
@@ -325,6 +360,157 @@ class ConsoleBackendClient:
             raise BackendProtocolError("backend receipt prediction binding is invalid")
         return receipt
 
+    def list_predictions(
+        self,
+        *,
+        limit: int = 25,
+        cursor: str | None = None,
+        registration_status: RegistrationStatus | None = None,
+        status: PredictionStatus | None = None,
+        strategy_id: str | None = None,
+        result_state: ResultState | None = None,
+    ) -> PredictionPage:
+        """Read one list page and enforce its requested filters locally."""
+
+        if isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise ValueError("prediction page limit must be between 1 and 100")
+        if cursor is not None and (not cursor or len(cursor) > 4096 or "\x00" in cursor):
+            raise ValueError("prediction cursor is invalid")
+        if strategy_id is not None and (
+            not strategy_id
+            or len(strategy_id) > 256
+            or strategy_id != strategy_id.strip()
+            or "\x00" in strategy_id
+        ):
+            raise ValueError("strategy_id must be 1 to 256 normalized characters")
+
+        parameters: list[tuple[str, str]] = [("limit", str(limit))]
+        for name, value in (
+            ("cursor", cursor),
+            (
+                "registration_status",
+                None if registration_status is None else registration_status.value,
+            ),
+            ("status", None if status is None else status.value),
+            ("strategy_id", strategy_id),
+            ("result_state", None if result_state is None else result_state.value),
+        ):
+            if value is not None:
+                parameters.append((name, value))
+        payload = self._request(
+            "GET",
+            f"/v1/predictions?{urlencode(parameters)}",
+            timeout=self.config.health_timeout_seconds,
+        )
+        page = _validated_read_projection(payload, PredictionPage, operation="prediction list")
+        if len(page.items) > limit:
+            raise BackendProtocolError("backend prediction list exceeds the requested limit")
+        if page.next_cursor is not None and (
+            not page.next_cursor or len(page.next_cursor) > 4096 or "\x00" in page.next_cursor
+        ):
+            raise BackendProtocolError("backend prediction cursor is invalid")
+
+        seen: set[str] = set()
+        for item in page.items:
+            _safe_identifier(item.prediction_id)
+            _safe_identifier(item.run_id)
+            if item.prediction_id in seen:
+                raise BackendProtocolError("backend prediction list contains duplicate identities")
+            seen.add(item.prediction_id)
+            if item.integrity_state is IntegrityState.VERIFIED and (
+                item.integrity_reason is not None
+                or item.strategy_id is None
+                or item.out_of_sample_window is None
+            ):
+                raise BackendProtocolError("backend verified prediction summary is incomplete")
+            if item.integrity_state is IntegrityState.FAILED and (
+                item.integrity_reason is None
+                or item.strategy_id is not None
+                or item.out_of_sample_window is not None
+            ):
+                raise BackendProtocolError(
+                    "backend failed prediction summary exposes unverified data"
+                )
+            if (
+                registration_status is not None
+                and item.registration_status is not registration_status
+            ):
+                raise BackendProtocolError("backend prediction registration filter is invalid")
+            if status is not None and item.status is not status:
+                raise BackendProtocolError("backend prediction status filter is invalid")
+            if strategy_id is not None and item.strategy_id != strategy_id:
+                raise BackendProtocolError("backend prediction strategy filter is invalid")
+            if result_state is not None and item.result_state is not result_state:
+                raise BackendProtocolError("backend prediction result filter is invalid")
+            if (
+                item.integrity_state is IntegrityState.VERIFIED
+                and item.result_state is ResultState.PRESENT
+                and item.run_state is not RunState.COMPLETED
+            ):
+                raise BackendProtocolError("backend prediction result state is invalid")
+        return page
+
+    def get_prediction(self, prediction_id: str) -> PredictionDetail:
+        """Read one verified detail projection and enforce its identity bindings."""
+
+        safe_prediction_id = _safe_identifier(prediction_id)
+        payload = self._request(
+            "GET",
+            f"/v1/predictions/{quote(safe_prediction_id, safe='')}",
+            timeout=self.config.health_timeout_seconds,
+        )
+        detail = _validated_read_projection(
+            payload, PredictionDetail, operation="prediction detail"
+        )
+        _safe_identifier(detail.prediction_id)
+        _safe_identifier(detail.run_id)
+        _safe_relative_reference(detail.snapshot_ref)
+        binding = detail.run.binding
+        if (
+            detail.prediction_id != safe_prediction_id
+            or detail.run.prediction_id != detail.prediction_id
+            or detail.run.run_id != detail.run_id
+            or detail.snapshot.strategy_id != detail.forecast.strategy_id
+            or detail.snapshot.in_sample_window.model_dump(mode="json")
+            != detail.forecast.in_sample_window.model_dump(mode="json")
+            or detail.snapshot.out_of_sample_window.model_dump(mode="json")
+            != detail.forecast.out_of_sample_window.model_dump(mode="json")
+            or (detail.result is not None and detail.run.state is not RunState.COMPLETED)
+            or (
+                binding is not None
+                and (
+                    binding.registration_status is not detail.registration_status
+                    or binding.strategy_id != detail.forecast.strategy_id
+                    or binding.dataset_version != detail.snapshot.dataset_version
+                )
+            )
+        ):
+            raise BackendProtocolError("backend prediction detail binding is invalid")
+        return detail
+
+    def get_status(self) -> LedgerStatus:
+        """Read and validate the non-secret authoritative ledger status."""
+
+        payload = self._request(
+            "GET",
+            "/v1/status",
+            timeout=self.config.health_timeout_seconds,
+        )
+        status = _validated_read_projection(payload, LedgerStatus, operation="ledger status")
+        if status.status != "ok" or status.api_version != "v1":
+            raise BackendProtocolError("backend ledger status contract is incompatible")
+        if status.registry_version < 1 or any(
+            value < 0
+            for value in (
+                status.committed_predictions,
+                status.quarantined_predictions,
+                status.integrity_violations,
+                status.run_results,
+            )
+        ):
+            raise BackendProtocolError("backend ledger status counters are invalid")
+        return status
+
     def _request(
         self,
         method: str,
@@ -390,6 +576,20 @@ def _validated_health(payload: Mapping[str, Any], *, operation: str) -> HealthRe
     if response.status != "ok" or response.api_version != "v1":
         raise BackendProtocolError(f"backend {operation} contract is incompatible")
     return response
+
+
+def _validated_read_projection(
+    payload: Mapping[str, Any],
+    model: type[_ReadProjection],
+    *,
+    operation: str,
+) -> _ReadProjection:
+    """Validate a strict read model while tolerating additive backend fields."""
+
+    try:
+        return model.model_validate(payload, extra="ignore")
+    except ValidationError as exc:
+        raise BackendProtocolError(f"backend {operation} response is invalid") from exc
 
 
 def _safe_identifier(value: str) -> str:

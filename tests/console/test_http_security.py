@@ -221,6 +221,8 @@ def test_route_inventory_is_public_only_for_health(
         for protected_path in (
             "/",
             "/hypotheses/new",
+            "/predictions",
+            "/predictions/pred_console_01",
             "/status",
             "/assets/console.css",
             "/assets/console.js",
@@ -289,7 +291,8 @@ def test_authenticated_shell_sets_exact_cookie_headers_and_local_assets(
         assert "https://" not in asset.text
         assert "http://" not in asset.text
         assert "@import" not in asset.text
-        assert response.text.count("(not yet available)") == 1
+        assert 'href="/predictions"' in response.text
+        assert "(not yet available)" not in response.text
         assert ".visually-hidden" in asset.text
 
     connection = store.connect()

@@ -2,18 +2,22 @@
 {% block content %}
 <section class="intro" aria-labelledby="page-heading">
   <div>
-    <p class="eyebrow">Authenticated workspace</p>
-    <h1 id="page-heading">Research decisions, with a durable paper trail.</h1>
+    <p class="eyebrow">Research workspace</p>
+    <h1 id="page-heading">Decision evidence you can inspect.</h1>
     <p class="lede">
-      Draft and review a strategy hypothesis here. The ledger remains untouched until
-      you explicitly confirm the exact preregistration request.
+      Capture a strategy hypothesis, then trace the verified record, snapshot, run, and result.
     </p>
   </div>
   <div class="assurance" aria-label="Session assurance">
     <span class="status-dot" aria-hidden="true"></span>
     <div>
-      <strong>Private session active</strong>
-      <span>Identity, browser, and transport checks passed.</span>
+      {% if inspection_available %}
+      <strong>Ledger view verified</strong>
+      <span>{{ ledger_status.committed_predictions }} committed prediction{% if ledger_status.committed_predictions != 1 %}s{% endif %} available.</span>
+      {% else %}
+      <strong>Ledger view unavailable</strong>
+      <span>Capture remains available. Inspection can be retried shortly.</span>
+      {% endif %}
     </div>
   </div>
 </section>
@@ -28,22 +32,67 @@
     </p>
     <a class="primary-action" href="/hypotheses/new">New hypothesis</a>
   </article>
-  <aside class="boundary-list" aria-labelledby="boundary-heading">
-    <h2 id="boundary-heading">Boundaries in force</h2>
+  <aside class="boundary-list" aria-labelledby="integrity-heading">
+    <h2 id="integrity-heading">Integrity overview</h2>
+    {% if ledger_status %}
     <dl>
       <div>
-        <dt>Ingress</dt>
-        <dd>Tailscale identity on the configured Unix socket</dd>
+        <dt>Committed</dt>
+        <dd>{{ ledger_status.committed_predictions }} prediction{% if ledger_status.committed_predictions != 1 %}s{% endif %}</dd>
       </div>
       <div>
-        <dt>Browser</dt>
-        <dd>Server session, strict origin checks, and local assets</dd>
+        <dt>Warnings</dt>
+        <dd>{{ ledger_status.integrity_violations }} recorded integrity violations</dd>
       </div>
       <div>
-        <dt>Authority</dt>
-        <dd>SQLite registry and immutable ledger evidence</dd>
+        <dt>Results</dt>
+        <dd>{{ ledger_status.run_results }} verified run results</dd>
       </div>
     </dl>
+    {% else %}
+    <p class="muted-copy">Authoritative counts are temporarily unavailable.</p>
+    {% endif %}
   </aside>
+</section>
+
+<section class="recent-section" aria-labelledby="recent-heading">
+  <div class="section-heading">
+    <div>
+      <p class="section-label">Ledger</p>
+      <h2 id="recent-heading">Recent predictions</h2>
+    </div>
+    <a class="text-action" href="/predictions">View all predictions</a>
+  </div>
+  {% if inspection_available and recent_predictions %}
+  <div class="prediction-list">
+    {% for prediction in recent_predictions %}
+    <article class="prediction-row{% if prediction.integrity_state.value == 'failed' %} is-unverified{% endif %}">
+      <div class="prediction-primary">
+        {% if prediction.integrity_state.value == 'verified' %}
+        <a href="/predictions/{{ prediction.prediction_id }}">{{ prediction.strategy_id }}</a>
+        <span>{{ prediction.prediction_id }}</span>
+        {% else %}
+        <strong>Verification failed</strong>
+        <span>{{ prediction.prediction_id }}</span>
+        {% endif %}
+      </div>
+      <div class="prediction-secondary">
+        <span>{{ prediction.registration_status.value | replace('_', ' ') }}</span>
+        <span>{{ prediction.committed_at | timestamp }}</span>
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+  {% elif inspection_available %}
+  <div class="empty-state">
+    <h3>No committed predictions yet</h3>
+    <p>Your first confirmed hypothesis will appear here after verification.</p>
+  </div>
+  {% else %}
+  <div class="notice is-warning">
+    <strong>Recent predictions could not be loaded.</strong>
+    <span>Use the Predictions page to retry the verified read.</span>
+  </div>
+  {% endif %}
 </section>
 {% endblock %}

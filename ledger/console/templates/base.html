@@ -19,7 +19,7 @@
         <nav class="primary-nav" aria-label="Primary navigation">
           <a href="/"{% if active_page == 'home' %} aria-current="page"{% endif %}>Home</a>
           <a href="/hypotheses/new"{% if active_page == 'capture' %} aria-current="page"{% endif %}>Capture</a>
-          <span aria-disabled="true">Predictions <span class="visually-hidden">(not yet available)</span></span>
+          <a href="/predictions"{% if active_page == 'predictions' %} aria-current="page"{% endif %}>Predictions</a>
           <a href="/status"{% if active_page == 'status' %} aria-current="page"{% endif %}>Status</a>
         </nav>
         {% if csrf_token is defined %}

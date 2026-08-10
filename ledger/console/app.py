@@ -40,6 +40,11 @@ from ledger.console.forms import (
     HypothesisForm,
     ReviewForm,
 )
+from ledger.console.inspection import (
+    display_json,
+    display_timestamp,
+    parse_prediction_query,
+)
 from ledger.console.models import ConsoleWorkflow, WorkflowState
 from ledger.console.rate_limit import ConsoleAbuseControls, ConsoleRateLimiter
 from ledger.console.security import (
@@ -53,6 +58,7 @@ from ledger.console.security import (
 from ledger.console.sessions import ConsoleSessionStore, hash_user_identity
 from ledger.console.state import ConsoleStateStore
 from ledger.console.workflow import WorkflowService
+from ledger.read_models import LedgerStatus
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent
 _TEMPLATE_ROOT = _PACKAGE_ROOT / "templates"
@@ -68,6 +74,8 @@ _REQUIRED_FILES = (
     _TEMPLATE_ROOT / "hypothesis_review.html",
     _TEMPLATE_ROOT / "workflow_status.html",
     _TEMPLATE_ROOT / "hypothesis_receipt.html",
+    _TEMPLATE_ROOT / "predictions.html",
+    _TEMPLATE_ROOT / "prediction_detail.html",
     _TEMPLATE_ROOT / "error.html",
     _STATIC_ROOT / "console.css",
     _STATIC_ROOT / "console.js",
@@ -182,10 +190,124 @@ def create_console_app(
 
     @app.get("/", response_class=HTMLResponse)
     def home(request: Request) -> HTMLResponse:
+        try:
+            recent_predictions = backend.list_predictions(limit=5).items
+            ledger_status = backend.get_status()
+            inspection_available = True
+        except BackendError:
+            LOGGER.warning("console_dashboard_projection_unavailable")
+            recent_predictions = ()
+            ledger_status = None
+            inspection_available = False
         return templates.TemplateResponse(
             request=request,
             name="home.html",
-            context=_page_context(request, page_title="Research Console", active_page="home"),
+            context={
+                **_page_context(request, page_title="Research Console", active_page="home"),
+                "recent_predictions": recent_predictions,
+                "ledger_status": ledger_status,
+                "inspection_available": inspection_available,
+            },
+        )
+
+    @app.get("/predictions", response_class=HTMLResponse)
+    def predictions(request: Request) -> HTMLResponse:
+        try:
+            query = parse_prediction_query(request.query_params.multi_items())
+        except (ValidationError, ValueError):
+            return _error_response(
+                templates,
+                request,
+                status_code=422,
+                title="Invalid prediction filters",
+                message="Check the filter values or reopen the prediction list.",
+            )
+        try:
+            page = backend.list_predictions(
+                limit=25,
+                cursor=query.cursor,
+                registration_status=query.registration_status,
+                status=query.status,
+                strategy_id=query.strategy_id,
+                result_state=query.result_state,
+            )
+        except BackendDomainError as exc:
+            return _inspection_domain_error(templates, request, exc)
+        except BackendError:
+            LOGGER.warning("console_prediction_list_unavailable")
+            return _error_response(
+                templates,
+                request,
+                status_code=503,
+                title="Predictions unavailable",
+                message="The verified ledger view could not be loaded. Try again shortly.",
+            )
+        return templates.TemplateResponse(
+            request=request,
+            name="predictions.html",
+            context={
+                **_page_context(request, page_title="Predictions", active_page="predictions"),
+                "predictions": page.items,
+                "filters": query.filter_values(),
+                "next_page_url": (
+                    None if page.next_cursor is None else query.page_url(cursor=page.next_cursor)
+                ),
+            },
+        )
+
+    @app.get("/predictions/{prediction_id}", response_class=HTMLResponse)
+    def prediction_detail(request: Request, prediction_id: str) -> HTMLResponse:
+        try:
+            prediction = backend.get_prediction(prediction_id)
+        except ValueError:
+            return _error_response(
+                templates,
+                request,
+                status_code=404,
+                title="Prediction not found",
+                message="No verified prediction exists at this address.",
+            )
+        except BackendDomainError as exc:
+            return _inspection_domain_error(templates, request, exc)
+        except BackendProtocolError:
+            LOGGER.error(
+                "console_prediction_detail_integrity_failed",
+                extra={"prediction_id": prediction_id},
+            )
+            return _error_response(
+                templates,
+                request,
+                status_code=409,
+                title="Evidence could not be verified",
+                message="Pine refused to render a partial or untrusted prediction.",
+            )
+        except BackendError:
+            LOGGER.warning(
+                "console_prediction_detail_unavailable",
+                extra={"prediction_id": prediction_id},
+            )
+            return _error_response(
+                templates,
+                request,
+                status_code=503,
+                title="Prediction unavailable",
+                message="The verified prediction could not be loaded. Try again shortly.",
+            )
+        return templates.TemplateResponse(
+            request=request,
+            name="prediction_detail.html",
+            context={
+                **_page_context(
+                    request,
+                    page_title=prediction.forecast.strategy_id,
+                    active_page="predictions",
+                ),
+                "prediction": prediction,
+                "lineage_json": display_json(prediction.lineage),
+                "outcome_json": display_json(prediction.outcome),
+                "grade_json": display_json(prediction.grade),
+                "resolution_json": display_json(prediction.resolution_metadata),
+            },
         )
 
     @app.get("/hypotheses/new", response_class=HTMLResponse)
@@ -394,9 +516,9 @@ def create_console_app(
     def console_status(request: Request) -> HTMLResponse:
         state_status = store.get_status()
         try:
-            backend_status = backend.health().status
-        except Exception:
-            backend_status = "unavailable"
+            ledger_status: LedgerStatus | None = backend.get_status()
+        except BackendError:
+            ledger_status = None
         return templates.TemplateResponse(
             request=request,
             name="status.html",
@@ -406,7 +528,8 @@ def create_console_app(
                     page_title="System status",
                     active_page="status",
                 ),
-                "backend_status": backend_status,
+                "backend_status": "ok" if ledger_status is not None else "unavailable",
+                "ledger_status": ledger_status,
                 "schema_version": state_status["schema_version"],
             },
         )
@@ -526,6 +649,47 @@ def _error_response(
             "heading": title,
             "message": message,
         },
+    )
+
+
+def _inspection_domain_error(
+    templates: Jinja2Templates,
+    request: Request,
+    exc: BackendDomainError,
+) -> HTMLResponse:
+    """Map stable backend read failures to safe, browser-facing states."""
+
+    if exc.code == "prediction_not_found":
+        return _error_response(
+            templates,
+            request,
+            status_code=404,
+            title="Prediction not found",
+            message="No verified prediction exists at this address.",
+        )
+    if exc.code == "integrity_error":
+        return _error_response(
+            templates,
+            request,
+            status_code=409,
+            title="Evidence could not be verified",
+            message="Pine refused to render a partial or untrusted prediction.",
+        )
+    if exc.code in {"invalid_cursor", "invalid_request"}:
+        return _error_response(
+            templates,
+            request,
+            status_code=422,
+            title="Invalid prediction filters",
+            message="Check the filter values or reopen the prediction list.",
+        )
+    LOGGER.warning("console_inspection_domain_error", extra={"backend_code": exc.code})
+    return _error_response(
+        templates,
+        request,
+        status_code=503,
+        title="Verified view unavailable",
+        message="The ledger could not provide a trusted read. Try again shortly.",
     )
 
 
@@ -776,6 +940,7 @@ def _templates() -> Jinja2Templates:
         undefined=StrictUndefined,
         enable_async=False,
     )
+    environment.filters["timestamp"] = display_timestamp
     return Jinja2Templates(env=environment)
 
 

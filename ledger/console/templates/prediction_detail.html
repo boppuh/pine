@@ -1,0 +1,179 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="detail-hero" aria-labelledby="prediction-heading">
+  <div>
+    <p class="eyebrow">Verified prediction</p>
+    <h1 id="prediction-heading">{{ prediction.forecast.strategy_id }}</h1>
+    <p class="lede">{{ prediction.decision }}</p>
+    <div class="record-meta">
+      <span class="badge">{{ prediction.registration_status.value }}</span>
+      <span>{{ prediction.status.value | title }}</span>
+      <span>{{ prediction.transaction_state | title }}</span>
+      <code>{{ prediction.prediction_id }}</code>
+    </div>
+  </div>
+  <aside class="integrity-seal" aria-label="Integrity state">
+    <strong>Evidence verified</strong>
+    <span>Record, schema, snapshot, run, and result layers passed.</span>
+  </aside>
+</section>
+
+<section class="detail-section" aria-labelledby="forecast-heading">
+  <div class="section-heading">
+    <h2 id="forecast-heading">Forecast</h2>
+    <code>{{ prediction.schema_id }}</code>
+  </div>
+  <div class="metric-grid">
+    <div><span>Expected Sharpe</span><strong>{{ prediction.forecast.expected_metrics.sharpe }}</strong></div>
+    <div><span>Win rate</span><strong>{{ prediction.forecast.expected_metrics.win_rate }}</strong></div>
+    <div><span>Max drawdown</span><strong>{{ prediction.forecast.expected_metrics.max_drawdown }}</strong></div>
+    <div><span>Expectancy</span><strong>{{ prediction.forecast.expected_metrics.expectancy }}</strong></div>
+  </div>
+  <dl class="definition-grid detail-definitions">
+    <div><dt>In-sample window</dt><dd>{{ prediction.forecast.in_sample_window.start }} to {{ prediction.forecast.in_sample_window.end }}</dd></div>
+    <div><dt>Out-of-sample window</dt><dd>{{ prediction.forecast.out_of_sample_window.start }} to {{ prediction.forecast.out_of_sample_window.end }}</dd></div>
+    <div><dt>Invalidation</dt><dd>{{ prediction.forecast.invalidation }}</dd></div>
+    <div><dt>Edge source</dt><dd>{{ prediction.forecast.edge_source }}</dd></div>
+  </dl>
+</section>
+
+<section class="detail-section" aria-labelledby="snapshot-heading">
+  <div class="section-heading"><h2 id="snapshot-heading">Snapshot provenance</h2></div>
+  <dl class="definition-grid detail-definitions">
+    <div><dt>Dataset version</dt><dd><code class="wrap-code">{{ prediction.snapshot.dataset_version }}</code></dd></div>
+    <div><dt>Git commit</dt><dd><code class="wrap-code">{{ prediction.snapshot.git_commit }}</code></dd></div>
+    <div><dt>Data as of</dt><dd>{{ prediction.snapshot.data_as_of_version | timestamp }}</dd></div>
+    <div><dt>Captured</dt><dd>{{ prediction.snapshot.captured_at | timestamp }}</dd></div>
+    <div><dt>Strategy spec hash</dt><dd><code class="wrap-code">{{ prediction.snapshot.strategy_spec_hash }}</code></dd></div>
+    <div><dt>Parameter count</dt><dd>{{ prediction.snapshot.parameter_count }}</dd></div>
+    <div><dt>Engine version</dt><dd>{{ prediction.snapshot.engine_version }}</dd></div>
+    <div><dt>Random seed</dt><dd>{{ prediction.snapshot.random_seed }}</dd></div>
+    <div><dt>Cost model</dt><dd>{{ prediction.snapshot.cost_model_version }}</dd></div>
+    <div><dt>Slippage model</dt><dd>{{ prediction.snapshot.slippage_model_version }}</dd></div>
+    <div><dt>Metric definitions</dt><dd>{{ prediction.snapshot.metric_definition_version }}</dd></div>
+    <div><dt>Snapshot reference</dt><dd><code class="wrap-code">{{ prediction.snapshot_ref }}</code></dd></div>
+    <div><dt>Schema hash</dt><dd><code class="wrap-code">{{ prediction.schema_hash }}</code></dd></div>
+    <div><dt>Immutable hash</dt><dd><code class="wrap-code">{{ prediction.immutable_hash }}</code></dd></div>
+  </dl>
+</section>
+
+<section class="detail-section" aria-labelledby="run-heading">
+  <div class="section-heading"><h2 id="run-heading">Run and result</h2></div>
+  <dl class="definition-grid detail-definitions">
+    <div><dt>Run ID</dt><dd><code>{{ prediction.run_id }}</code></dd></div>
+    <div><dt>Run state</dt><dd>{{ prediction.run.state.value }}</dd></div>
+    <div><dt>Started</dt><dd>{{ prediction.run.started_at | timestamp }}</dd></div>
+    <div><dt>Completed</dt><dd>{{ prediction.run.completed_at | timestamp }}</dd></div>
+    <div><dt>Prediction created</dt><dd>{{ prediction.created_at | timestamp }}</dd></div>
+    <div><dt>Prediction committed</dt><dd>{{ prediction.committed_at | timestamp }}</dd></div>
+  </dl>
+  {% if prediction.run.binding %}
+  <div class="evidence-group">
+    <h3>Immutable run binding</h3>
+    <dl class="definition-grid detail-definitions">
+      <div><dt>Strategy</dt><dd>{{ prediction.run.binding.strategy_id }}</dd></div>
+      <div><dt>Registration</dt><dd>{{ prediction.run.binding.registration_status.value }}</dd></div>
+      <div><dt>Dataset version</dt><dd><code class="wrap-code">{{ prediction.run.binding.dataset_version }}</code></dd></div>
+      <div><dt>Envelope hash</dt><dd><code class="wrap-code">{{ prediction.run.binding.envelope_hash }}</code></dd></div>
+      <div><dt>Request hash</dt><dd><code class="wrap-code">{{ prediction.run.binding.request_hash }}</code></dd></div>
+      <div><dt>Bound at</dt><dd>{{ prediction.run.binding.bound_at | timestamp }}</dd></div>
+    </dl>
+  </div>
+  {% else %}
+  <p class="muted-copy">No immutable execution binding has been attached.</p>
+  {% endif %}
+  {% if prediction.result %}
+  <dl class="definition-grid detail-definitions">
+    <div><dt>Result evidence hash</dt><dd><code class="wrap-code">{{ prediction.result.evidence_hash }}</code></dd></div>
+    <div><dt>Metric units</dt><dd>{{ prediction.result.metric_units }}</dd></div>
+    <div><dt>Source timestamp</dt><dd>{{ prediction.result.source_timestamp | timestamp }}</dd></div>
+    <div><dt>Ingested at</dt><dd>{{ prediction.result.ingested_at | timestamp }}</dd></div>
+  </dl>
+  <div class="result-samples">
+    <article>
+      <h3>In-sample result</h3>
+      <dl class="compact-metrics">
+        <div><dt>Sharpe</dt><dd>{{ prediction.result.in_sample_metrics.sharpe }}</dd></div>
+        <div><dt>Win rate</dt><dd>{{ prediction.result.in_sample_metrics.win_rate }}</dd></div>
+        <div><dt>Return</dt><dd>{{ prediction.result.in_sample_metrics.total_return }}</dd></div>
+        <div><dt>Trades</dt><dd>{{ prediction.result.in_sample_metrics.trade_count }}</dd></div>
+      </dl>
+    </article>
+    <article>
+      <h3>Out-of-sample result</h3>
+      <dl class="compact-metrics">
+        <div><dt>Sharpe</dt><dd>{{ prediction.result.out_of_sample_metrics.sharpe }}</dd></div>
+        <div><dt>Win rate</dt><dd>{{ prediction.result.out_of_sample_metrics.win_rate }}</dd></div>
+        <div><dt>Return</dt><dd>{{ prediction.result.out_of_sample_metrics.total_return }}</dd></div>
+        <div><dt>Trades</dt><dd>{{ prediction.result.out_of_sample_metrics.trade_count }}</dd></div>
+      </dl>
+    </article>
+  </div>
+  {% if prediction.result.regime_breakdown %}
+  <div class="evidence-group">
+    <h3>Regime breakdown</h3>
+    <div class="regime-list">
+      {% for regime in prediction.result.regime_breakdown %}
+      <article>
+        <div><strong>{{ regime.regime_id }}</strong><span>{{ regime.sample | replace('_', ' ') }}</span></div>
+        <dl class="compact-metrics">
+          <div><dt>Sharpe</dt><dd>{{ regime.metrics.sharpe }}</dd></div>
+          <div><dt>Win rate</dt><dd>{{ regime.metrics.win_rate }}</dd></div>
+          <div><dt>Return</dt><dd>{{ regime.metrics.total_return }}</dd></div>
+          <div><dt>Trades</dt><dd>{{ regime.metrics.trade_count }}</dd></div>
+        </dl>
+      </article>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+  {% if prediction.result.artifacts %}
+  <div class="evidence-group">
+    <h3>Result artifacts</h3>
+    <ul class="artifact-list">
+      {% for artifact in prediction.result.artifacts %}
+      <li><code>{{ artifact.relative_path }}</code><span>{{ artifact.size_bytes }} bytes</span><code class="wrap-code">{{ artifact.sha256 }}</code></li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+  {% else %}
+  <div class="empty-state compact-empty">
+    <h3>No result evidence attached</h3>
+    <p>The prediction is committed, but no verified MSM result has been ingested.</p>
+  </div>
+  {% endif %}
+</section>
+
+<section class="detail-section detail-split" aria-label="Lineage and record context">
+  <article>
+    <h2>Lineage</h2>
+    <pre class="plain-text structured-text">{{ lineage_json }}</pre>
+  </article>
+  <article>
+    <h2>Mutable record context</h2>
+    <p class="muted-copy">This body is displayed as plain text and is not trusted as immutable evidence.</p>
+    <pre class="plain-text structured-text">{{ prediction.body }}</pre>
+  </article>
+</section>
+
+<section class="detail-section" aria-labelledby="resolution-heading">
+  <div class="section-heading"><h2 id="resolution-heading">Resolution metadata</h2></div>
+  <div class="structured-grid">
+    <article><h3>Outcome</h3><pre class="plain-text structured-text">{{ outcome_json }}</pre></article>
+    <article><h3>Grade</h3><pre class="plain-text structured-text">{{ grade_json }}</pre></article>
+    <article><h3>Resolution</h3><pre class="plain-text structured-text">{{ resolution_json }}</pre></article>
+  </div>
+</section>
+
+{% if prediction.integrity_violations %}
+<section class="detail-section" aria-labelledby="violations-heading">
+  <div class="section-heading"><h2 id="violations-heading">Recorded integrity violations</h2></div>
+  <ul class="violation-list">
+    {% for violation in prediction.integrity_violations %}
+    <li><strong>{{ violation.field }}</strong><span>{{ violation.detected_at | timestamp }}</span><p>{{ violation.note }}</p></li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+{% endblock %}
