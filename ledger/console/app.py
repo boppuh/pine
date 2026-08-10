@@ -7,7 +7,6 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -20,6 +19,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoes
 from pydantic import ValidationError
 from starlette.templating import Jinja2Templates
 
+from ledger.console.assets import STATIC_ROOT, TEMPLATE_ROOT, verify_packaged_assets
 from ledger.console.backend_client import (
     AuthoritativeReceipt,
     ConsoleBackend,
@@ -62,26 +62,7 @@ from ledger.console.workflow import WorkflowService
 from ledger.integrity import PredictionStatus, RegistrationStatus
 from ledger.read_models import LedgerStatus, ResultState
 
-_PACKAGE_ROOT = Path(__file__).resolve().parent
-_TEMPLATE_ROOT = _PACKAGE_ROOT / "templates"
-_STATIC_ROOT = _PACKAGE_ROOT / "static"
 LOGGER = logging.getLogger("ledger.console.app")
-_REQUIRED_FILES = (
-    _TEMPLATE_ROOT / "base.html",
-    _TEMPLATE_ROOT / "home.html",
-    _TEMPLATE_ROOT / "status.html",
-    _TEMPLATE_ROOT / "signed_out.html",
-    _TEMPLATE_ROOT / "plain_text.html",
-    _TEMPLATE_ROOT / "hypothesis_new.html",
-    _TEMPLATE_ROOT / "hypothesis_review.html",
-    _TEMPLATE_ROOT / "workflow_status.html",
-    _TEMPLATE_ROOT / "hypothesis_receipt.html",
-    _TEMPLATE_ROOT / "predictions.html",
-    _TEMPLATE_ROOT / "prediction_detail.html",
-    _TEMPLATE_ROOT / "error.html",
-    _STATIC_ROOT / "console.css",
-    _STATIC_ROOT / "console.js",
-)
 
 
 def create_console_app(
@@ -142,7 +123,7 @@ def create_console_app(
 
     app.mount(
         "/assets",
-        StaticFiles(directory=_STATIC_ROOT, check_dir=True),
+        StaticFiles(directory=STATIC_ROOT, check_dir=True),
         name="console_asset",
     )
 
@@ -175,10 +156,9 @@ def create_console_app(
     def ready() -> JSONResponse:
         try:
             config.read_backend_token()
-            _verify_packaged_assets()
-            store.check_writable()
+            verify_packaged_assets()
             backend_health = backend.ready()
-            status = store.get_status()
+            status = store.get_readonly_status()
         except Exception:
             LOGGER.error("console_readiness_failed", exc_info=True)
             return JSONResponse(status_code=503, content={"status": "unavailable"})
@@ -945,7 +925,7 @@ async def _retention_cleanup_loop(
 
 def _templates() -> Jinja2Templates:
     environment = Environment(
-        loader=FileSystemLoader(_TEMPLATE_ROOT),
+        loader=FileSystemLoader(TEMPLATE_ROOT),
         autoescape=select_autoescape(enabled_extensions=("html",), default_for_string=True),
         undefined=StrictUndefined,
         enable_async=False,
@@ -956,6 +936,6 @@ def _templates() -> Jinja2Templates:
 
 
 def _verify_packaged_assets() -> None:
-    for path in _REQUIRED_FILES:
-        if not path.is_file() or path.is_symlink() or path.stat().st_size < 1:
-            raise RuntimeError("required console asset is unavailable")
+    """Backward-compatible internal wrapper for existing test imports."""
+
+    verify_packaged_assets()

@@ -28,6 +28,7 @@ pine-ledger-backend = "ledger.backend_cli:main"
 pine-ledger-backup = "ledger.backup_cli:main"
 pine-obsidian-bridge = "ledger.bridge_cli:main"
 pine-research-console = "ledger.console_cli:main"
+pine-console-state = "ledger.console.operations:main"
 
 [project.optional-dependencies]
 dev = [
