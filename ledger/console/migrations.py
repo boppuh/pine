@@ -6,7 +6,7 @@ import sqlite3
 
 from ledger.console.errors import ConsoleStateError
 
-CONSOLE_SCHEMA_VERSION = 1
+CONSOLE_SCHEMA_VERSION = 2
 MINIMUM_COMPATIBLE_SCHEMA_VERSION = 1
 
 _MIGRATION_1 = """
@@ -183,7 +183,51 @@ BEGIN
 END;
 """
 
-_MIGRATIONS = {1: _MIGRATION_1}
+_MIGRATION_2 = """
+CREATE TABLE console_sessions (
+    session_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    csrf_secret TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    absolute_expires_at TEXT NOT NULL,
+    idle_expires_at TEXT NOT NULL,
+    CHECK (LENGTH(session_hash) = 71),
+    CHECK (SUBSTR(session_hash, 1, 7) = 'sha256:'),
+    CHECK (SUBSTR(session_hash, 8) NOT GLOB '*[^0-9a-f]*'),
+    CHECK (LENGTH(user_id) BETWEEN 1 AND 320),
+    CHECK (LENGTH(csrf_secret) = 43),
+    CHECK (csrf_secret NOT GLOB '*[^A-Za-z0-9_-]*'),
+    CHECK (LENGTH(created_at) >= 20),
+    CHECK (LENGTH(last_seen_at) >= 20),
+    CHECK (LENGTH(absolute_expires_at) >= 20),
+    CHECK (LENGTH(idle_expires_at) >= 20),
+    CHECK (created_at <= last_seen_at),
+    CHECK (last_seen_at <= idle_expires_at),
+    CHECK (idle_expires_at <= absolute_expires_at)
+);
+
+CREATE INDEX console_sessions_expiry
+    ON console_sessions(idle_expires_at, absolute_expires_at);
+
+CREATE TRIGGER console_sessions_identity_write_once
+BEFORE UPDATE OF session_hash, user_id, csrf_secret, created_at, absolute_expires_at
+ON console_sessions
+BEGIN
+    SELECT RAISE(ABORT, 'console session identity is write-once');
+END;
+
+CREATE TRIGGER console_sessions_time_moves_forward
+BEFORE UPDATE OF last_seen_at, idle_expires_at ON console_sessions
+WHEN NEW.last_seen_at < OLD.last_seen_at
+  OR NEW.idle_expires_at < NEW.last_seen_at
+  OR NEW.idle_expires_at > NEW.absolute_expires_at
+BEGIN
+    SELECT RAISE(ABORT, 'console session time must move forward within absolute expiry');
+END;
+"""
+
+_MIGRATIONS = {1: _MIGRATION_1, 2: _MIGRATION_2}
 
 
 def migrate(connection: sqlite3.Connection) -> int:

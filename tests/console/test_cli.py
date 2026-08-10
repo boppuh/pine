@@ -3,17 +3,21 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import os
+import socket
+import stat
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
 from ledger.api import HealthResponse
-from ledger.console.app import create_core_app
+from ledger.console.app import create_console_app
 from ledger.console.config import ConsoleConfig
 from ledger.console.errors import ConsoleConfigError
 from ledger.console.models import CaptureInput, WorkflowState
 from ledger.console.state import ConsoleStateStore
-from ledger.console_cli import run_cli
+from ledger.console.unix_socket import CONSOLE_SOCKET_MODE
+from ledger.console_cli import run_cli, run_console_app
 from ledger.extraction import DraftProposal, ExtractionResult, ExtractionStatus
 
 TOKEN = "console-cli-token-" + "q" * 48
@@ -28,6 +32,9 @@ class FakeClient:
         self.health_calls += 1
         return HealthResponse()
 
+    def ready(self) -> HealthResponse:
+        return HealthResponse()
+
     def close(self) -> None:
         self.closed = True
 
@@ -38,6 +45,7 @@ def _environment(tmp_path: Path) -> dict[str, str]:
     os.chmod(credential, 0o600)
     return {
         "PINE_CONSOLE_ALLOWED_HOST": "pine.example.ts.net",
+        "PINE_CONSOLE_ALLOWED_IDENTITIES": "user@example.com",
         "PINE_CONSOLE_SOCKET_PATH": str(tmp_path / "console.sock"),
         "PINE_CONSOLE_STATE_PATH": str(tmp_path / "state" / "console.db"),
         "PINE_CONSOLE_BACKEND_CREDENTIAL_PATH": str(credential),
@@ -61,7 +69,7 @@ def test_check_reports_only_non_secret_readiness(
     output = capsys.readouterr()
     assert json.loads(output.out) == {
         "backend_api_version": "v1",
-        "console_schema_version": 1,
+        "console_schema_version": 2,
         "ready": True,
     }
     assert TOKEN not in output.out + output.err
@@ -89,9 +97,42 @@ def test_serve_runs_recovery_before_injected_socket_runner(tmp_path: Path) -> No
     )
     assert observed == {
         "socket": Path(environment["PINE_CONSOLE_SOCKET_PATH"]),
-        "status": {"schema_version": 1},
+        "status": {"schema_version": 2},
         "health": "ok",
     }
+
+
+def test_default_runner_passes_an_owner_only_prebound_socket_to_uvicorn(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    environment = _environment(tmp_path)
+    runtime_path = Path("/tmp") / f"pine-console-cli-{uuid4().hex[:12]}"
+    runtime_path.mkdir(mode=0o700)
+    environment["PINE_CONSOLE_SOCKET_PATH"] = str(runtime_path / "console.sock")
+    config = ConsoleConfig.from_env(environment)
+    store = ConsoleStateStore(config.state_path)
+    observed: dict[str, object] = {}
+
+    def fake_run(_app, **options) -> None:
+        assert "uds" not in options
+        duplicated = socket.fromfd(options["fd"], socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            socket_path = Path(duplicated.getsockname())
+        finally:
+            duplicated.close()
+        observed["path"] = socket_path
+        observed["mode"] = stat.S_IMODE(socket_path.stat().st_mode)
+
+    monkeypatch.setattr("ledger.console_cli.uvicorn.run", fake_run)
+    run_console_app(config, store, FakeClient(config))
+
+    assert observed == {
+        "path": config.socket_path,
+        "mode": CONSOLE_SOCKET_MODE,
+    }
+    assert not config.socket_path.exists()
+    runtime_path.rmdir()
 
 
 def test_serve_recovers_submitting_before_backend_initialization(
@@ -122,30 +163,35 @@ def test_serve_recovers_submitting_before_backend_initialization(
     assert recovered.state is WorkflowState.UNCERTAIN
 
 
-def test_core_app_exposes_health_only_and_fails_readiness_closed(tmp_path: Path) -> None:
+def test_console_app_keeps_health_public_and_all_other_routes_default_denied(
+    tmp_path: Path,
+) -> None:
     store = ConsoleStateStore(tmp_path / "console.db")
-    backend = FakeClient(
-        ConsoleConfig(
-            socket_path=tmp_path / "console.sock",
-            state_path=tmp_path / "console.db",
-            backend_credential_path=tmp_path / "credential",
-            allowed_host="pine.example.ts.net",
-        )
+    credential = tmp_path / "credential"
+    credential.write_text(TOKEN, encoding="ascii")
+    credential.chmod(0o600)
+    config = ConsoleConfig(
+        socket_path=tmp_path / "console.sock",
+        state_path=tmp_path / "console.db",
+        backend_credential_path=credential,
+        allowed_host="pine.example.ts.net",
+        allowed_identities=("user@example.com",),
     )
-    app = create_core_app(store, backend)
+    backend = FakeClient(config)
+    app = create_console_app(config, store, backend)
 
     with TestClient(app) as client:
         health = client.get("/healthz")
         ready = client.get("/readyz")
-        absent = client.get("/workflows")
+        denied = client.get("/workflows")
 
     assert health.json() == {"status": "ok"}
     assert ready.json() == {
         "status": "ok",
         "backend_api_version": "v1",
-        "console_schema_version": 1,
+        "console_schema_version": 2,
     }
-    assert absent.status_code == 404
+    assert denied.status_code == 403
 
 
 def test_wheel_entry_point_includes_console_cli() -> None:

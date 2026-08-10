@@ -29,6 +29,7 @@ def _config(tmp_path: Path) -> ConsoleConfig:
         state_path=tmp_path / "console.db",
         backend_credential_path=tmp_path / "backend-token",
         allowed_host="pine.example.ts.net",
+        allowed_identities=("user@example.com",),
     )
 
 
@@ -52,6 +53,24 @@ def test_health_omits_token_and_accepts_additive_response_fields(tmp_path: Path)
         )
 
     assert _client(tmp_path, handler).health().api_version == "v1"
+
+
+def test_readiness_uses_cached_workflow_token_on_authenticated_status(
+    tmp_path: Path,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/status"
+        assert request.headers["authorization"] == f"Bearer {TOKEN}"
+        return httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "api_version": "v1",
+                "registry_version": 7,
+            },
+        )
+
+    assert _client(tmp_path, handler).ready().api_version == "v1"
 
 
 def test_capture_sends_canonical_bytes_once_and_accepts_additive_receipt(
@@ -377,6 +396,7 @@ def test_config_loads_private_credential_and_rejects_unsafe_networks(
     os.chmod(credential, 0o600)
     environment = {
         "PINE_CONSOLE_ALLOWED_HOST": "pine.example.ts.net",
+        "PINE_CONSOLE_ALLOWED_IDENTITIES": "user@example.com",
         "PINE_CONSOLE_SOCKET_PATH": str(tmp_path / "console.sock"),
         "PINE_CONSOLE_STATE_PATH": str(tmp_path / "console.db"),
         "PINE_CONSOLE_BACKEND_CREDENTIAL_PATH": str(credential),
@@ -386,6 +406,24 @@ def test_config_loads_private_credential_and_rejects_unsafe_networks(
 
     assert config.read_backend_token() == TOKEN
     assert config.backend_url == "http://127.0.0.1:8765"
+    assert config.allowed_identities == ("user@example.com",)
+    without_identities = {
+        key: value for key, value in environment.items() if key != "PINE_CONSOLE_ALLOWED_IDENTITIES"
+    }
+    with pytest.raises(ConsoleConfigError, match="ALLOWED_IDENTITIES"):
+        ConsoleConfig.from_env(without_identities)
+    duplicates = dict(
+        environment,
+        PINE_CONSOLE_ALLOWED_IDENTITIES="User@Example.com,user@example.com",
+    )
+    with pytest.raises(ConsoleConfigError, match="invalid"):
+        ConsoleConfig.from_env(duplicates)
+    non_ascii = dict(
+        environment,
+        PINE_CONSOLE_ALLOWED_IDENTITIES="ßtrasse@example.com",
+    )
+    with pytest.raises(ConsoleConfigError, match="invalid"):
+        ConsoleConfig.from_env(non_ascii)
     unsafe = dict(environment, PINE_CONSOLE_BACKEND_URL="https://public.example.com")
     with pytest.raises(ConsoleConfigError, match="invalid"):
         ConsoleConfig.from_env(unsafe)

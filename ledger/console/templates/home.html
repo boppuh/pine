@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="intro" aria-labelledby="page-heading">
+  <div>
+    <p class="eyebrow">Authenticated workspace</p>
+    <h1 id="page-heading">Research decisions, with a durable paper trail.</h1>
+    <p class="lede">
+      This private console is connected to Pine's verified ledger boundary. Capture and
+      prediction views will arrive here without weakening the write-once record.
+    </p>
+  </div>
+  <div class="assurance" aria-label="Session assurance">
+    <span class="status-dot" aria-hidden="true"></span>
+    <div>
+      <strong>Private session active</strong>
+      <span>Identity, browser, and transport checks passed.</span>
+    </div>
+  </div>
+</section>
+
+<section class="workspace-grid" aria-label="Console capabilities">
+  <article class="next-action">
+    <p class="section-label">Next release</p>
+    <h2>Capture a strategy hypothesis</h2>
+    <p>
+      The guided review and confirmation workflow is next. It will freeze the exact request
+      before the authoritative ledger receives it.
+    </p>
+    <span class="pending-action" aria-disabled="true">Capture interface pending</span>
+  </article>
+  <aside class="boundary-list" aria-labelledby="boundary-heading">
+    <h2 id="boundary-heading">Boundaries in force</h2>
+    <dl>
+      <div>
+        <dt>Ingress</dt>
+        <dd>Tailscale identity on the configured Unix socket</dd>
+      </div>
+      <div>
+        <dt>Browser</dt>
+        <dd>Server session, strict origin checks, and local assets</dd>
+      </div>
+      <div>
+        <dt>Authority</dt>
+        <dd>SQLite registry and immutable ledger evidence</dd>
+      </div>
+    </dl>
+  </aside>
+</section>
+{% endblock %}

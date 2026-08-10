@@ -17,6 +17,18 @@ class ConsoleStateError(ConsoleError):
     """Raised when console state cannot be read or changed safely."""
 
 
+class ConsoleSessionError(ConsoleError):
+    """Raised when server-side session state cannot be trusted."""
+
+
+class RateLimitExceeded(ConsoleError):
+    """Raised before an abuse-controlled operation is invoked."""
+
+    def __init__(self, retry_after_seconds: int) -> None:
+        super().__init__("console request rate exceeded")
+        self.retry_after_seconds = max(1, retry_after_seconds)
+
+
 class WorkflowNotFoundError(ConsoleStateError):
     """Raised without distinguishing missing workflows from other users' workflows."""
 

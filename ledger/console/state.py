@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 from pydantic import JsonValue, ValidationError
 
 from ledger.api import CaptureResponse
+from ledger.console.auth import normalize_user_identity
 from ledger.console.errors import ConsoleStateError, WorkflowConflictError, WorkflowNotFoundError
 from ledger.console.migrations import CONSOLE_SCHEMA_VERSION, migrate, schema_version
 from ledger.console.models import (
@@ -522,6 +523,28 @@ class ConsoleStateStore:
         finally:
             connection.close()
 
+    def check_writable(self) -> None:
+        """Prove the durable console database can complete a write transaction."""
+
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "UPDATE console_schema_migrations SET applied_at = applied_at WHERE version = ?",
+                (CONSOLE_SCHEMA_VERSION,),
+            )
+            if cursor.rowcount != 1:
+                raise ConsoleStateError("console schema write check found no current stamp")
+            connection.commit()
+        except ConsoleStateError:
+            connection.rollback()
+            raise
+        except sqlite3.DatabaseError as exc:
+            connection.rollback()
+            raise ConsoleStateError("console database is not writable") from exc
+        finally:
+            connection.close()
+
     def _prepare_path(self) -> None:
         parent = self.db_path.parent
         if parent.is_symlink():
@@ -642,15 +665,6 @@ class ConsoleStateStore:
             )
         except (KeyError, TypeError, ValueError, ValidationError) as exc:
             raise ConsoleStateError("console workflow row failed validation") from exc
-
-
-def normalize_user_identity(value: str) -> str:
-    """Normalize an authenticated identity without logging or exposing it."""
-
-    normalized = value.strip().casefold()
-    if not normalized or len(normalized) > 320 or "\x00" in normalized:
-        raise ValueError("authenticated identity is invalid")
-    return normalized
 
 
 def _model_json(value: Any) -> str:

@@ -11,11 +11,12 @@ from typing import Protocol
 
 import uvicorn
 
-from ledger.console.app import create_core_app
+from ledger.console.app import create_console_app
 from ledger.console.backend_client import ConsoleBackend, ConsoleBackendClient
 from ledger.console.config import ConsoleConfig
 from ledger.console.errors import BackendError, ConsoleError
 from ledger.console.state import ConsoleStateStore
+from ledger.console.unix_socket import secure_unix_socket
 
 
 class ConsoleRunner(Protocol):
@@ -69,7 +70,7 @@ def run_cli(
             store.recover_abandoned_workflows()
             store.cleanup_expired()
         backend = backend_factory(config)
-        health = backend.health()
+        health = backend.ready()
         if args.command == "check":
             status = store.get_status()
             print(
@@ -104,15 +105,16 @@ def run_console_app(
     store: ConsoleStateStore,
     backend: ConsoleBackend,
 ) -> None:
-    """Serve the health-only PR 2 core through the configured Unix socket."""
+    """Serve the authenticated console exclusively through its Unix socket."""
 
-    app = create_core_app(store, backend)
-    uvicorn.run(
-        app,
-        uds=str(config.socket_path),
-        log_level=config.log_level,
-        access_log=False,
-    )
+    app = create_console_app(config, store, backend)
+    with secure_unix_socket(config.socket_path) as listener:
+        uvicorn.run(
+            app,
+            fd=listener.fileno(),
+            log_level=config.log_level,
+            access_log=False,
+        )
 
 
 def main() -> None:

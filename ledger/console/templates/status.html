@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-heading" aria-labelledby="status-heading">
+  <p class="eyebrow">System</p>
+  <h1 id="status-heading">Console status</h1>
+  <p class="lede">A narrow, non-secret view of the services that protect this workspace.</p>
+</section>
+
+<section class="status-table" aria-label="Service readiness">
+  <div class="status-row">
+    <div>
+      <h2>Browser boundary</h2>
+      <p>Authenticated session and request controls</p>
+    </div>
+    <span class="status-value"><span class="status-dot" aria-hidden="true"></span>Ready</span>
+  </div>
+  <div class="status-row">
+    <div>
+      <h2>Ledger backend</h2>
+      <p>Loopback API v1</p>
+    </div>
+    <span class="status-value{% if backend_status != 'ok' %} is-muted{% endif %}">
+      <span class="status-dot" aria-hidden="true"></span>{{ backend_status | capitalize }}
+    </span>
+  </div>
+  <div class="status-row">
+    <div>
+      <h2>Console state</h2>
+      <p>Transient workflow schema</p>
+    </div>
+    <span class="status-value">Version {{ schema_version }}</span>
+  </div>
+</section>
+{% endblock %}

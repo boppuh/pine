@@ -36,10 +36,20 @@ class FakeBackend:
         self.response = response
         self.capture_outcomes: list[CaptureResponse | BaseException] = []
         self.draft_outcomes: list[ExtractionResult | BaseException] = []
+        self.ready_outcomes: list[HealthResponse | BaseException] = []
         self.capture_requests: list[PreregisteredCaptureRequest] = []
         self.draft_requests: list[HypothesisExtractionRequest] = []
 
     def health(self) -> HealthResponse:
+        return HealthResponse()
+
+    def ready(self) -> HealthResponse:
+        if self.ready_outcomes:
+            outcome = self.ready_outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            assert isinstance(outcome, HealthResponse)
+            return outcome
         return HealthResponse()
 
     def create_draft(self, request: HypothesisExtractionRequest) -> ExtractionResult:
