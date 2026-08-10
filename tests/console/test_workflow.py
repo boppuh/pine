@@ -124,6 +124,36 @@ def test_confirmation_rejects_a_schema_hash_other_than_the_reviewed_proposal(
     )
 
 
+def test_failure_before_freeze_preserves_review_without_backend_call(
+    console_store: ConsoleStateStore,
+    fake_backend: FakeBackend,
+    proposal: DraftProposal,
+    capture_input: CaptureInput,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = WorkflowService(console_store, fake_backend)
+    reviewing = _ready_workflow(service, proposal)
+
+    def fail_before_freeze(*_args: object, **_kwargs: object) -> ConsoleWorkflow:
+        raise sqlite3.OperationalError("synthetic pre-freeze failure")
+
+    monkeypatch.setattr(console_store, "freeze_and_begin_submission", fail_before_freeze)
+
+    with pytest.raises(sqlite3.OperationalError, match="pre-freeze"):
+        service.confirm(
+            reviewing.workflow_id,
+            reviewing.user_id,
+            capture_input,
+            expected_version=reviewing.version,
+        )
+
+    unchanged = console_store.get_workflow(reviewing.workflow_id, reviewing.user_id)
+    assert unchanged.state is WorkflowState.REVIEWING
+    assert unchanged.frozen_request is None
+    assert unchanged.version == reviewing.version
+    assert fake_backend.capture_requests == []
+
+
 def test_lost_response_retry_replays_byte_equivalent_frozen_request(
     console_store: ConsoleStateStore,
     fake_backend: FakeBackend,
@@ -189,6 +219,42 @@ def test_receipt_persistence_failure_becomes_recoverable_without_restart(
 
     assert committed.state is WorkflowState.COMMITTED
     assert len(fake_backend.capture_requests) == 2
+
+
+def test_interruption_after_receipt_persistence_reuses_committed_response(
+    console_store: ConsoleStateStore,
+    fake_backend: FakeBackend,
+    proposal: DraftProposal,
+    capture_input: CaptureInput,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = WorkflowService(console_store, fake_backend)
+    reviewing = _ready_workflow(service, proposal)
+    persist_response = console_store.record_capture_response
+
+    def persist_then_interrupt(*args: object, **kwargs: object) -> ConsoleWorkflow:
+        persist_response(*args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(console_store, "record_capture_response", persist_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        service.confirm(reviewing.workflow_id, reviewing.user_id, capture_input)
+
+    committed = console_store.get_workflow(reviewing.workflow_id, reviewing.user_id)
+    assert committed.state is WorkflowState.COMMITTED
+    assert committed.capture_response is not None
+    assert len(fake_backend.capture_requests) == 1
+
+    monkeypatch.setattr(console_store, "record_capture_response", persist_response)
+    repeated = service.confirm(
+        reviewing.workflow_id,
+        reviewing.user_id,
+        {"changed": "fields are ignored after commit"},
+    )
+
+    assert repeated == committed
+    assert len(fake_backend.capture_requests) == 1
 
 
 @pytest.mark.parametrize(
@@ -263,8 +329,12 @@ def test_process_interruption_is_recovered_to_uncertain_without_backend_lookup(
     proposal: DraftProposal,
     capture_input: CaptureInput,
 ) -> None:
-    fake_backend.capture_outcomes = [KeyboardInterrupt()]
-    service = WorkflowService(console_store, fake_backend)
+    class InterruptBeforeSendBackend(FakeBackend):
+        def capture(self, request: PreregisteredCaptureRequest) -> CaptureResponse:
+            raise KeyboardInterrupt
+
+    backend = InterruptBeforeSendBackend(proposal, fake_backend.response)
+    service = WorkflowService(console_store, backend)
     reviewing = _ready_workflow(service, proposal)
 
     with pytest.raises(KeyboardInterrupt):
@@ -282,7 +352,7 @@ def test_process_interruption_is_recovered_to_uncertain_without_backend_lookup(
     assert recovered.expires_at is None
     assert recovered.frozen_request is not None
     assert canonical_json(recovered.frozen_request.model_dump(mode="json")) == frozen_json
-    assert len(fake_backend.capture_requests) == 1
+    assert backend.capture_requests == []
 
 
 def test_concurrent_double_confirm_makes_one_backend_call(
@@ -303,6 +373,7 @@ def test_concurrent_double_confirm_makes_one_backend_call(
 
     backend = BlockingBackend(proposal, capture_response)
     service = WorkflowService(console_store, backend)
+    second_session_service = WorkflowService(ConsoleStateStore(console_store.db_path), backend)
     reviewing = _ready_workflow(service, proposal)
     results: list[object] = []
 
@@ -323,7 +394,7 @@ def test_concurrent_double_confirm_makes_one_backend_call(
     worker.start()
     assert started.wait(5)
     with pytest.raises(WorkflowConflictError, match="expected reviewing"):
-        service.confirm(
+        second_session_service.confirm(
             reviewing.workflow_id,
             reviewing.user_id,
             capture_input,
