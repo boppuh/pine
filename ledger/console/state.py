@@ -47,6 +47,7 @@ class ConsoleStateStore:
         receipt_retention: timedelta = timedelta(hours=24),
         clock: Callable[[], datetime] | None = None,
         uuid_factory: Callable[[], UUID] | None = None,
+        migrate_schema: bool = True,
     ) -> None:
         requested_path = Path(db_path).expanduser().absolute()
         if requested_path.is_symlink():
@@ -63,12 +64,21 @@ class ConsoleStateStore:
         self.uuid_factory = uuid_factory or uuid4
         if ordinary_retention <= timedelta(0) or receipt_retention <= timedelta(0):
             raise ValueError("console retention durations must be positive")
-        self._prepare_path()
-        connection = self.connect()
+        self._prepare_path(create=migrate_schema)
+        connection: sqlite3.Connection | None = None
         try:
-            migrate(connection)
+            connection = self.connect() if migrate_schema else self._read_only_connect()
+            if migrate_schema:
+                migrate(connection)
+            elif schema_version(connection) != CONSOLE_SCHEMA_VERSION:
+                raise ConsoleStateError("console state requires an installer migration")
+        except sqlite3.DatabaseError as exc:
+            if not migrate_schema:
+                raise ConsoleStateError("console state could not be read safely") from exc
+            raise
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
 
     def connect(self) -> sqlite3.Connection:
         """Open a hardened WAL connection to console state only."""
@@ -567,6 +577,25 @@ class ConsoleStateStore:
         finally:
             connection.close()
 
+    def get_readonly_status(self) -> dict[str, int]:
+        """Return readiness state without changing rows or journal settings."""
+
+        connection = self._read_only_connect()
+        try:
+            quick_check = connection.execute("PRAGMA quick_check").fetchone()
+            if quick_check is None or quick_check[0] != "ok":
+                raise ConsoleStateError("console database failed SQLite quick_check")
+            rows = connection.execute(
+                "SELECT state, COUNT(*) AS count FROM workflows GROUP BY state"
+            ).fetchall()
+            result = {"schema_version": schema_version(connection)}
+            result.update({str(row["state"]): int(row["count"]) for row in rows})
+            return result
+        except sqlite3.DatabaseError as exc:
+            raise ConsoleStateError("console database readiness check failed") from exc
+        finally:
+            connection.close()
+
     def check_writable(self) -> None:
         """Prove the durable console database can complete a write transaction."""
 
@@ -589,18 +618,19 @@ class ConsoleStateStore:
         finally:
             connection.close()
 
-    def _prepare_path(self) -> None:
+    def _prepare_path(self, *, create: bool) -> None:
         parent = self.db_path.parent
         if parent.is_symlink():
             raise ConsoleStateError("console state directory must not be a symlink")
-        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if create:
+            parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if not parent.is_dir():
             raise ConsoleStateError("console state parent is not a directory")
         if stat.S_IMODE(parent.stat().st_mode) & 0o077:
             raise ConsoleStateError("console state directory must not be group/world accessible")
         if self.db_path.is_symlink() or (self.db_path.exists() and not self.db_path.is_file()):
             raise ConsoleStateError("console state path must be a regular file")
-        if not self.db_path.exists():
+        if create and not self.db_path.exists():
             try:
                 descriptor = os.open(self.db_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
             except FileExistsError:
@@ -612,6 +642,25 @@ class ConsoleStateStore:
         mode = stat.S_IMODE(self.db_path.stat().st_mode)
         if mode & 0o077:
             raise ConsoleStateError("console state database must not be group/world accessible")
+
+    def _read_only_connect(self) -> sqlite3.Connection:
+        wal_path = Path(f"{self.db_path}-wal")
+        shm_path = Path(f"{self.db_path}-shm")
+        # A checkpointed WAL database has no sidecars, but SQLite otherwise tries to
+        # create shared-memory state even for mode=ro. Immutable access is safe only
+        # in that checkpointed case; a live WAL must remain visible to readiness.
+        immutable = not wal_path.exists() and not shm_path.exists()
+        immutable_parameter = "&immutable=1" if immutable else ""
+        connection = sqlite3.connect(
+            f"{self.db_path.as_uri()}?mode=ro{immutable_parameter}",
+            uri=True,
+            timeout=30.0,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 30000")
+        return connection
 
     def _now(self) -> datetime:
         value = self.clock()

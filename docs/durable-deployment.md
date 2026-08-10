@@ -27,14 +27,25 @@ The installer creates:
 - `/opt/decision-edge/releases/<pine-sha>-<msm-sha>/` — immutable source and runtime;
 - `/opt/decision-edge/current` — atomically selected release;
 - `/var/lib/pine/vault` — authoritative ledger vault;
+- `/var/lib/pine/console` — non-authoritative console workflow state;
 - `/var/backups/pine` — verified local backups;
+- `/var/backups/pine-console` — separately verified console-state backups;
 - `/etc/pine/backend.env` — root-readable provider configuration;
-- hardened backend, readiness, and backup systemd units.
+- `/etc/pine/console.env` — root-readable, non-secret console configuration;
+- hardened backend, console, readiness, and backup systemd units.
 
 The shared virtual environment installs Pine and MSM editably from the immutable
 release checkouts. The installer rejects a runtime whose module paths resolve through
 copied `site-packages` trees instead of the pinned release sources, because MSM result
 evidence must inspect the exact Git checkout before emission.
+
+The installer also verifies the console's packaged templates/static assets,
+configuration, restricted Unix-socket bind, and state compatibility before selecting
+the release. Older console state is backed up online and verified before transactional
+migration. Configure `/etc/pine/console.env` before retrying a first install; an invalid
+or placeholder configuration leaves the prior `current` selection unchanged. See the
+[console deployment and rollback runbook](console-deployment-runbook.md) for Tailscale
+Serve, non-writing validation, smoke, and rollback gates.
 
 Use the host secret-management workflow to set `OPENAI_API_KEY` in
 `/etc/pine/backend.env`; do not put it in Git or shell history. Then start and verify:

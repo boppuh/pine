@@ -1,0 +1,28 @@
+[Unit]
+Description=Verify Pine Research Console readiness without changing console state
+After=pine-console.service
+
+[Service]
+Type=oneshot
+User=pine-console
+Group=pine-ingress
+EnvironmentFile=/etc/pine/console.env
+Environment="PATH=/opt/decision-edge/current/venv/bin:/usr/local/bin:/usr/bin:/bin"
+LoadCredential=backend-token:/var/lib/pine/vault/.ledger/backend.token
+ExecStart=/usr/bin/env PINE_CONSOLE_SOCKET_PATH=/run/pine/console.sock PINE_CONSOLE_STATE_PATH=/var/lib/pine/console/console.db PINE_CONSOLE_BACKEND_URL=http://127.0.0.1:8765 PINE_CONSOLE_BACKEND_CREDENTIAL_PATH=/run/credentials/pine-console-readiness.service/backend-token /opt/decision-edge/current/venv/bin/pine-research-console check
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/pine/console /var/lib/pine/vault
+InaccessiblePaths=/var/lib/pine/vault/.ledger/backend.token
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+StandardOutput=journal
+StandardError=journal

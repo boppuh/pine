@@ -11,12 +11,12 @@ from pathlib import Path
 
 from ledger.console.errors import ConsoleConfigError
 
-CONSOLE_SOCKET_MODE = 0o600
+CONSOLE_SOCKET_MODE = 0o660
 
 
 @contextmanager
 def secure_unix_socket(path: Path) -> Iterator[socket.socket]:
-    """Pre-bind an owner-only socket so Uvicorn cannot widen its permissions."""
+    """Pre-bind a user/group-only socket so Uvicorn cannot widen permissions."""
 
     _validate_parent(path.parent)
     try:
@@ -36,12 +36,14 @@ def secure_unix_socket(path: Path) -> Iterator[socket.socket]:
         if not stat.S_ISSOCK(bound_metadata.st_mode) or bound_metadata.st_uid != os.geteuid():
             raise ConsoleConfigError("console socket ownership is unsafe")
         created_identity = (bound_metadata.st_dev, bound_metadata.st_ino)
+        os.chown(path, -1, os.getegid())
         os.chmod(path, CONSOLE_SOCKET_MODE)
         metadata = path.lstat()
         if (
             not stat.S_ISSOCK(metadata.st_mode)
             or stat.S_IMODE(metadata.st_mode) != CONSOLE_SOCKET_MODE
             or metadata.st_uid != os.geteuid()
+            or metadata.st_gid != os.getegid()
         ):
             raise ConsoleConfigError("console socket permissions are unsafe")
         yield listener

@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from ledger.api import HealthResponse
 from ledger.console.app import create_console_app
 from ledger.console.config import ConsoleConfig
-from ledger.console.errors import ConsoleConfigError
+from ledger.console.errors import BackendTransportError, ConsoleConfigError
 from ledger.console.models import CaptureInput, WorkflowState
 from ledger.console.state import ConsoleStateStore
 from ledger.console.unix_socket import CONSOLE_SOCKET_MODE
@@ -43,13 +43,15 @@ def _environment(tmp_path: Path) -> dict[str, str]:
     credential = tmp_path / "credential"
     credential.write_text(TOKEN, encoding="ascii")
     os.chmod(credential, 0o600)
-    return {
+    environment = {
         "PINE_CONSOLE_ALLOWED_HOST": "pine.example.ts.net",
         "PINE_CONSOLE_ALLOWED_IDENTITIES": "user@example.com",
         "PINE_CONSOLE_SOCKET_PATH": str(tmp_path / "console.sock"),
         "PINE_CONSOLE_STATE_PATH": str(tmp_path / "state" / "console.db"),
         "PINE_CONSOLE_BACKEND_CREDENTIAL_PATH": str(credential),
     }
+    ConsoleStateStore(environment["PINE_CONSOLE_STATE_PATH"])
+    return environment
 
 
 def test_check_reports_only_non_secret_readiness(
@@ -77,6 +79,121 @@ def test_check_reports_only_non_secret_readiness(
     assert clients[0].closed is True
 
 
+def test_check_leaves_checkpointed_sqlite_state_unchanged_when_directory_is_read_only(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    environment = _environment(tmp_path)
+    state_path = Path(environment["PINE_CONSOLE_STATE_PATH"])
+    state_directory = state_path.parent
+    state_files = tuple(Path(f"{state_path}{suffix}") for suffix in ("", "-wal", "-shm"))
+
+    def snapshot() -> dict[str, tuple[int, int, bytes]]:
+        return {
+            path.name: (path.stat().st_mode, path.stat().st_mtime_ns, path.read_bytes())
+            for path in state_files
+            if path.exists()
+        }
+
+    before = snapshot()
+    state_directory.chmod(0o500)
+    try:
+        assert run_cli(["check"], environ=environment, backend_factory=FakeClient) == 0
+        after = snapshot()
+    finally:
+        state_directory.chmod(0o700)
+
+    assert after == before
+    output = capsys.readouterr()
+    assert json.loads(output.out)["ready"] is True
+
+
+def test_check_refuses_uninitialized_state_without_creating_it(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    environment = _environment(tmp_path)
+    state_path = Path(environment["PINE_CONSOLE_STATE_PATH"])
+    for suffix in ("-wal", "-shm", ""):
+        Path(f"{state_path}{suffix}").unlink(missing_ok=True)
+
+    assert run_cli(["check"], environ=environment, backend_factory=FakeClient) == 2
+
+    output = capsys.readouterr()
+    assert "state" in output.err
+    assert not state_path.exists()
+
+
+def test_check_reports_corrupt_state_without_a_traceback_or_path(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    environment = _environment(tmp_path)
+    state_path = Path(environment["PINE_CONSOLE_STATE_PATH"])
+    state_path.write_bytes(b"not a SQLite database")
+
+    assert run_cli(["check"], environ=environment, backend_factory=FakeClient) == 2
+
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "could not be read safely" in output.err
+    assert "Traceback" not in output.err
+    assert str(tmp_path) not in output.err
+
+
+def test_check_marks_backend_transport_failure_as_retryable(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    environment = _environment(tmp_path)
+
+    class UnavailableClient(FakeClient):
+        def ready(self) -> HealthResponse:
+            raise BackendTransportError("synthetic backend startup race")
+
+    assert run_cli(["check"], environ=environment, backend_factory=UnavailableClient) == 75
+
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "temporarily unavailable" in output.err
+    assert "synthetic" not in output.err
+
+
+def test_release_and_socket_preflights_are_non_secret_and_leave_no_socket(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    release_root = Path(__file__).resolve().parents[3]
+    assert run_cli(["release-check", "--release-root", str(release_root)]) == 0
+    release_output = json.loads(capsys.readouterr().out)
+    assert release_output == {
+        "asset_count": 14,
+        "assets_ready": True,
+        "console_schema_maximum": 2,
+        "console_schema_minimum": 1,
+        "ready": True,
+    }
+
+    environment = _environment(tmp_path)
+    probe_parent = Path("/tmp") / f"pine-console-probe-{uuid4().hex[:12]}"
+    probe_parent.mkdir(mode=0o700)
+    probe = probe_parent / "console.sock"
+    environment["PINE_CONSOLE_SOCKET_PATH"] = str(probe_parent / "configured.sock")
+    assert (
+        run_cli(
+            ["socket-check", "--socket-path", str(probe)],
+            environ=environment,
+            backend_factory=FakeClient,
+        )
+        == 0
+    )
+    socket_output = capsys.readouterr()
+    assert json.loads(socket_output.out) == {"ready": True, "socket_mode": "0660"}
+    assert TOKEN not in socket_output.out + socket_output.err
+    assert not probe.exists()
+    probe_parent.rmdir()
+
+
 def test_serve_runs_recovery_before_injected_socket_runner(tmp_path: Path) -> None:
     environment = _environment(tmp_path)
     observed: dict[str, object] = {}
@@ -102,7 +219,7 @@ def test_serve_runs_recovery_before_injected_socket_runner(tmp_path: Path) -> No
     }
 
 
-def test_default_runner_passes_an_owner_only_prebound_socket_to_uvicorn(
+def test_default_runner_passes_a_group_restricted_prebound_socket_to_uvicorn(
     tmp_path: Path,
     monkeypatch,
 ) -> None:

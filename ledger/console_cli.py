@@ -7,16 +7,22 @@ import json
 import logging
 import sys
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Protocol
 
 import uvicorn
 
 from ledger.console.app import create_console_app
+from ledger.console.assets import verify_packaged_assets
 from ledger.console.backend_client import ConsoleBackend, ConsoleBackendClient
 from ledger.console.config import ConsoleConfig
-from ledger.console.errors import BackendError, ConsoleError
+from ledger.console.errors import BackendError, BackendTransportError, ConsoleError
+from ledger.console.migrations import (
+    CONSOLE_SCHEMA_VERSION,
+    MINIMUM_COMPATIBLE_SCHEMA_VERSION,
+)
 from ledger.console.state import ConsoleStateStore
-from ledger.console.unix_socket import secure_unix_socket
+from ledger.console.unix_socket import CONSOLE_SOCKET_MODE, secure_unix_socket
 
 
 class ConsoleRunner(Protocol):
@@ -38,9 +44,19 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser(
         "check",
-        help="validate configuration, console state, and backend readiness",
+        help="read-only validation of configuration, state, and backend readiness",
     )
     subparsers.add_parser("serve", help="recover workflows and serve the console Unix socket")
+    release = subparsers.add_parser(
+        "release-check",
+        help="verify console code and assets come from one selected release",
+    )
+    release.add_argument("--release-root", type=Path, required=True)
+    socket_check = subparsers.add_parser(
+        "socket-check",
+        help="validate configuration and prove a restricted Unix socket can be bound",
+    )
+    socket_check.add_argument("--socket-path", type=Path, required=True)
     return parser
 
 
@@ -56,15 +72,45 @@ def run_cli(
     args = build_parser().parse_args(argv)
     backend: ConsoleBackendClient | None = None
     try:
+        if args.command == "release-check":
+            result = verify_packaged_assets(args.release_root)
+            print(
+                json.dumps(
+                    {
+                        **result,
+                        "console_schema_maximum": CONSOLE_SCHEMA_VERSION,
+                        "console_schema_minimum": MINIMUM_COMPATIBLE_SCHEMA_VERSION,
+                        "ready": True,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
         config = ConsoleConfig.from_env(environ)
         logging.basicConfig(
             level=getattr(logging, config.log_level.upper()),
             format="%(asctime)s %(levelname)s %(name)s %(message)s",
         )
+        if args.command == "socket-check":
+            probe_path = args.socket_path.expanduser().absolute()
+            if probe_path.parent.resolve(strict=True) != config.socket_path.parent.resolve(
+                strict=True
+            ):
+                raise ValueError("console socket probe must use the configured runtime directory")
+            with secure_unix_socket(probe_path):
+                pass
+            print(
+                json.dumps(
+                    {"ready": True, "socket_mode": f"{CONSOLE_SOCKET_MODE:04o}"},
+                    sort_keys=True,
+                )
+            )
+            return 0
         store = ConsoleStateStore(
             config.state_path,
             ordinary_retention=config.ordinary_retention,
             receipt_retention=config.receipt_retention,
+            migrate_schema=False,
         )
         if args.command == "serve":
             store.recover_abandoned_workflows()
@@ -72,7 +118,7 @@ def run_cli(
         backend = backend_factory(config)
         health = backend.ready()
         if args.command == "check":
-            status = store.get_status()
+            status = store.get_readonly_status()
             print(
                 json.dumps(
                     {
@@ -86,6 +132,9 @@ def run_cli(
             return 0
         (serve_runner or run_console_app)(config, store, backend)
         return 0
+    except BackendTransportError:
+        print("pine-research-console: backend readiness temporarily unavailable", file=sys.stderr)
+        return 75
     except BackendError:
         print("pine-research-console: backend readiness failed", file=sys.stderr)
         return 2

@@ -1,0 +1,54 @@
+[Unit]
+Description=Pine Research Console private Unix-socket service
+After=network-online.target pine-backend.service tailscaled.service
+Wants=network-online.target pine-backend.service
+StartLimitIntervalSec=5min
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=pine-console
+Group=pine-ingress
+WorkingDirectory=/opt/decision-edge/current/pine
+EnvironmentFile=/etc/pine/console.env
+Environment="PATH=/opt/decision-edge/current/venv/bin:/usr/local/bin:/usr/bin:/bin"
+LoadCredential=backend-token:/var/lib/pine/vault/.ledger/backend.token
+ExecStartPre=/usr/bin/env PINE_CONSOLE_SOCKET_PATH=/run/pine/console.sock PINE_CONSOLE_STATE_PATH=/var/lib/pine/console/console.db PINE_CONSOLE_BACKEND_URL=http://127.0.0.1:8765 PINE_CONSOLE_BACKEND_CREDENTIAL_PATH=/run/credentials/pine-console.service/backend-token /opt/decision-edge/current/venv/bin/pine-research-console check
+ExecStart=/usr/bin/env PINE_CONSOLE_SOCKET_PATH=/run/pine/console.sock PINE_CONSOLE_STATE_PATH=/var/lib/pine/console/console.db PINE_CONSOLE_BACKEND_URL=http://127.0.0.1:8765 PINE_CONSOLE_BACKEND_CREDENTIAL_PATH=/run/credentials/pine-console.service/backend-token /opt/decision-edge/current/venv/bin/pine-research-console serve
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0007
+RuntimeDirectory=pine
+RuntimeDirectoryMode=0750
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/pine/console /run/pine
+ReadOnlyPaths=/var/lib/pine/vault
+InaccessiblePaths=/var/lib/pine/vault/.ledger/backend.token
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
