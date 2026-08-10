@@ -1,16 +1,28 @@
 from __future__ import annotations
 
+import json
 import os
 import socket
 import threading
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+from zipfile import ZipFile
 
 import pytest
 import uvicorn
-from playwright.sync_api import BrowserType, Page, Playwright, expect, sync_playwright
+from playwright.sync_api import (
+    BrowserContext,
+    BrowserType,
+    Page,
+    Playwright,
+    expect,
+    sync_playwright,
+)
 
 from ledger.console.app import create_console_app
 from ledger.console.config import ConsoleConfig
@@ -21,6 +33,95 @@ from .conftest import FakeBackend, MutableClock
 from .test_http_security import HOST, IDENTITY, TOKEN
 
 pytestmark = pytest.mark.browser
+
+
+@dataclass(frozen=True, slots=True)
+class _BrowserProbe:
+    page: Page
+    context: BrowserContext
+    errors: list[str]
+    requests: list[str]
+    trace_path: Path
+
+
+@contextmanager
+def _browser_probe(
+    playwright_runtime: Playwright,
+    *,
+    base_url: str,
+    tmp_path: Path,
+    name: str,
+    engine: str = "chromium",
+    color_scheme: str = "light",
+    evidence_root: Path | None = None,
+    har_path: Path | None = None,
+) -> Iterator[_BrowserProbe]:
+    """Run one instrumented browser context and retain a trace only on failure."""
+
+    browser_type: BrowserType = getattr(playwright_runtime, engine)
+    browser = browser_type.launch()
+    trace_root = evidence_root or Path(
+        os.environ.get("PINE_BROWSER_EVIDENCE_DIR", str(tmp_path / "browser-evidence"))
+    )
+    trace_path = trace_root / f"{name}-{engine}.zip"
+    trace_path.unlink(missing_ok=True)
+    context_options: dict[str, Any] = {
+        "base_url": base_url,
+        "viewport": {"width": 1280, "height": 900},
+        "color_scheme": color_scheme,
+    }
+    if har_path is not None:
+        har_path.unlink(missing_ok=True)
+        context_options.update(
+            {
+                "record_har_path": str(har_path),
+                "record_har_content": "embed",
+                "record_har_mode": "full",
+            }
+        )
+    context = browser.new_context(**context_options)
+    context.tracing.start(screenshots=True, snapshots=True, sources=True)
+    page = context.new_page()
+    errors: list[str] = []
+    requests: list[str] = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.on(
+        "console",
+        lambda message: errors.append(message.text) if message.type == "error" else None,
+    )
+    page.on("request", lambda request: requests.append(request.url))
+    page.add_init_script(
+        """
+        window.__pineCspViolations = [];
+        document.addEventListener("securitypolicyviolation", (event) => {
+          window.__pineCspViolations.push({
+            blockedURI: event.blockedURI,
+            directive: event.effectiveDirective,
+          });
+        });
+        """
+    )
+    try:
+        try:
+            yield _BrowserProbe(
+                page=page,
+                context=context,
+                errors=errors,
+                requests=requests,
+                trace_path=trace_path,
+            )
+        except BaseException:
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                context.tracing.stop(path=trace_path)
+            except Exception:
+                pass
+            raise
+        else:
+            context.tracing.stop()
+    finally:
+        context.close()
+        browser.close()
 
 
 class _TrustedIngress:
@@ -151,23 +252,14 @@ def test_keyboard_capture_flow_in_chromium_and_webkit(
     engine: str,
 ) -> None:
     base_url, backend = browser_server
-    browser_type: BrowserType = getattr(playwright_runtime, engine)
-    browser = browser_type.launch()
-    evidence_root = Path(
-        os.environ.get("PINE_BROWSER_EVIDENCE_DIR", str(tmp_path / "browser-evidence"))
-    )
-    trace_path = evidence_root / f"capture-{engine}.zip"
-    trace_path.parent.mkdir(parents=True, exist_ok=True)
-    context = browser.new_context(base_url=base_url, viewport={"width": 1280, "height": 900})
-    context.tracing.start(screenshots=True, snapshots=True, sources=True)
-    page = context.new_page()
-    browser_errors: list[str] = []
-    page.on("pageerror", lambda error: browser_errors.append(str(error)))
-    page.on(
-        "console",
-        lambda message: browser_errors.append(message.text) if message.type == "error" else None,
-    )
-    try:
+    with _browser_probe(
+        playwright_runtime,
+        base_url=base_url,
+        tmp_path=tmp_path,
+        name="capture",
+        engine=engine,
+    ) as probe:
+        page = probe.page
         page.goto("/hypotheses/new")
         expect(page.get_by_role("heading", name="New strategy hypothesis")).to_be_visible()
         backend.proposal.body = "Keyboard-only operational hypothesis."
@@ -177,8 +269,8 @@ def test_keyboard_capture_flow_in_chromium_and_webkit(
         expect(page.get_by_role("heading", name="Check the source text")).to_be_visible()
         expect(page.locator("[data-error-summary]")).to_be_focused()
         assert backend.draft_requests == []
-        assert browser_errors and all("422" in message for message in browser_errors)
-        browser_errors.clear()
+        assert probe.errors and all("422" in message for message in probe.errors)
+        probe.errors.clear()
         page.get_by_label("Hypothesis source").focus()
         page.keyboard.type(backend.proposal.body)
         page.get_by_role("button", name="Extract proposal").focus()
@@ -205,13 +297,8 @@ def test_keyboard_capture_flow_in_chromium_and_webkit(
         expect(page.get_by_role("heading", name="Preregistration committed")).to_be_visible()
         expect(page.get_by_text(backend.response.prediction_id, exact=True)).to_be_visible()
         assert len(backend.capture_requests) == 1
-        assert browser_errors == []
-    finally:
-        context.tracing.stop(path=trace_path)
-        context.close()
-        browser.close()
-    assert trace_path.is_file()
-    assert trace_path.stat().st_size > 0
+        assert probe.errors == []
+    assert not probe.trace_path.exists()
 
 
 def test_capture_layout_has_no_horizontal_overflow_at_supported_widths(
@@ -246,23 +333,14 @@ def test_verified_inspection_flow_in_chromium_and_webkit(
 ) -> None:
     base_url, backend = browser_server
     strategy_id = backend.prediction_detail.forecast.strategy_id
-    browser_type: BrowserType = getattr(playwright_runtime, engine)
-    browser = browser_type.launch()
-    evidence_root = Path(
-        os.environ.get("PINE_BROWSER_EVIDENCE_DIR", str(tmp_path / "browser-evidence"))
-    )
-    trace_path = evidence_root / f"inspection-{engine}.zip"
-    trace_path.parent.mkdir(parents=True, exist_ok=True)
-    context = browser.new_context(base_url=base_url, viewport={"width": 1280, "height": 900})
-    context.tracing.start(screenshots=True, snapshots=True, sources=True)
-    page = context.new_page()
-    browser_errors: list[str] = []
-    page.on("pageerror", lambda error: browser_errors.append(str(error)))
-    page.on(
-        "console",
-        lambda message: browser_errors.append(message.text) if message.type == "error" else None,
-    )
-    try:
+    with _browser_probe(
+        playwright_runtime,
+        base_url=base_url,
+        tmp_path=tmp_path,
+        name="inspection",
+        engine=engine,
+    ) as probe:
+        page = probe.page
         page.goto("/")
         expect(
             page.get_by_role("heading", name="Decision evidence you can inspect")
@@ -278,13 +356,8 @@ def test_verified_inspection_flow_in_chromium_and_webkit(
         expect(page.get_by_text("Evidence verified", exact=True)).to_be_visible()
         expect(page.get_by_text("No result evidence attached", exact=True)).to_be_visible()
         assert backend.capture_requests == []
-        assert browser_errors == []
-    finally:
-        context.tracing.stop(path=trace_path)
-        context.close()
-        browser.close()
-    assert trace_path.is_file()
-    assert trace_path.stat().st_size > 0
+        assert probe.errors == []
+    assert not probe.trace_path.exists()
 
 
 def test_inspection_layout_has_no_horizontal_overflow_at_supported_widths(
@@ -313,16 +386,275 @@ def test_inspection_layout_has_no_horizontal_overflow_at_supported_widths(
                 )
                 assert overflow is False, f"horizontal overflow for {path} at {width}x{height}"
             context.close()
-        dark_context = browser.new_context(
-            base_url=base_url,
-            viewport={"width": 1280, "height": 900},
-            color_scheme="dark",
-        )
-        dark_page = dark_context.new_page()
-        dark_page.goto(f"/predictions/{backend.prediction_detail.prediction_id}")
-        assert dark_page.evaluate("getComputedStyle(document.body).backgroundColor") == (
-            "rgb(16, 20, 17)"
-        )
-        dark_context.close()
     finally:
         browser.close()
+
+
+def test_inspection_dark_mode_uses_a_distinct_background(
+    playwright_runtime: Playwright,
+    browser_server: tuple[str, FakeBackend],
+    tmp_path: Path,
+) -> None:
+    base_url, backend = browser_server
+    backgrounds: dict[str, str] = {}
+    for color_scheme in ("light", "dark"):
+        with _browser_probe(
+            playwright_runtime,
+            base_url=base_url,
+            tmp_path=tmp_path,
+            name=f"inspection-theme-{color_scheme}",
+            color_scheme=color_scheme,
+        ) as probe:
+            probe.page.goto(f"/predictions/{backend.prediction_detail.prediction_id}")
+            backgrounds[color_scheme] = probe.page.evaluate(
+                "getComputedStyle(document.body).backgroundColor"
+            )
+        assert not probe.trace_path.exists()
+
+    assert backgrounds["dark"] != backgrounds["light"]
+
+
+def _dom_accessibility_issues(page: Page) -> list[str]:
+    issues = page.evaluate(
+        """
+        () => {
+          const issues = [];
+          const main = document.querySelectorAll("main");
+          if (main.length !== 1) issues.push(`expected one main landmark, found ${main.length}`);
+          const headings = document.querySelectorAll("main h1");
+          if (headings.length !== 1) issues.push(`expected one main h1, found ${headings.length}`);
+          for (const landmark of document.querySelectorAll("nav")) {
+            if (!landmark.getAttribute("aria-label") && !landmark.getAttribute("aria-labelledby")) {
+              issues.push("navigation landmark lacks an accessible name");
+            }
+          }
+          const ids = new Set();
+          for (const element of document.querySelectorAll("[id]")) {
+            if (ids.has(element.id)) issues.push(`duplicate id: ${element.id}`);
+            ids.add(element.id);
+          }
+          for (const control of document.querySelectorAll(
+            'input:not([type="hidden"]), select, textarea'
+          )) {
+            const named = control.labels?.length > 0 ||
+              control.hasAttribute("aria-label") || control.hasAttribute("aria-labelledby");
+            if (!named) issues.push(`unlabelled control: ${control.tagName.toLowerCase()}`);
+          }
+          for (const control of document.querySelectorAll("a[href], button")) {
+            const name = control.getAttribute("aria-label") ||
+              control.getAttribute("aria-labelledby") || control.textContent?.trim() ||
+              control.getAttribute("title");
+            if (!name) issues.push(`unnamed interactive element: ${control.tagName.toLowerCase()}`);
+          }
+          for (const element of document.querySelectorAll("[tabindex]")) {
+            if (element.tabIndex > 0) {
+              issues.push(`positive tabindex: ${element.tagName.toLowerCase()}`);
+            }
+          }
+          for (const region of document.querySelectorAll("pre.structured-text")) {
+            if (region.tabIndex !== 0 || !region.getAttribute("aria-label")) {
+              issues.push("scrollable evidence region is not keyboard named and focusable");
+            }
+          }
+          return issues;
+        }
+        """
+    )
+    return [str(issue) for issue in issues]
+
+
+def _contrast_ratio(page: Page, foreground: str, background: str) -> float:
+    return float(
+        page.evaluate(
+            """
+            ({ foreground, background }) => {
+              const foregroundElement = document.querySelector(foreground);
+              const backgroundElement = document.querySelector(background);
+              if (!foregroundElement || !backgroundElement) {
+                throw new Error("contrast target missing");
+              }
+              const canvas = document.createElement("canvas");
+              canvas.width = 1;
+              canvas.height = 1;
+              const context = canvas.getContext("2d", { willReadFrequently: true });
+              const sample = (color) => {
+                context.clearRect(0, 0, 1, 1);
+                context.fillStyle = color;
+                context.fillRect(0, 0, 1, 1);
+                return Array.from(context.getImageData(0, 0, 1, 1).data).slice(0, 3);
+              };
+              const luminance = (rgb) => {
+                const channels = rgb.map((value) => {
+                  const normalized = value / 255;
+                  return normalized <= 0.04045
+                    ? normalized / 12.92
+                    : ((normalized + 0.055) / 1.055) ** 2.4;
+                });
+                return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+              };
+              const foregroundLuminance = luminance(
+                sample(getComputedStyle(foregroundElement).color)
+              );
+              const backgroundLuminance = luminance(
+                sample(getComputedStyle(backgroundElement).backgroundColor)
+              );
+              const lighter = Math.max(foregroundLuminance, backgroundLuminance);
+              const darker = Math.min(foregroundLuminance, backgroundLuminance);
+              return (lighter + 0.05) / (darker + 0.05);
+            }
+            """,
+            {"foreground": foreground, "background": background},
+        )
+    )
+
+
+@pytest.mark.parametrize("color_scheme", ["light", "dark"])
+def test_console_pages_pass_automated_accessibility_checks(
+    playwright_runtime: Playwright,
+    browser_server: tuple[str, FakeBackend],
+    tmp_path: Path,
+    color_scheme: str,
+) -> None:
+    base_url, backend = browser_server
+    paths = (
+        "/",
+        "/hypotheses/new",
+        "/predictions",
+        f"/predictions/{backend.prediction_detail.prediction_id}",
+        "/status",
+    )
+    with _browser_probe(
+        playwright_runtime,
+        base_url=base_url,
+        tmp_path=tmp_path,
+        name=f"accessibility-{color_scheme}",
+        color_scheme=color_scheme,
+    ) as probe:
+        for path in paths:
+            response = probe.page.goto(path)
+            assert response is not None
+            assert "default-src 'none'" in response.headers["content-security-policy"]
+            assert _dom_accessibility_issues(probe.page) == [], path
+            assert _contrast_ratio(probe.page, "body", "body") >= 4.5
+            assert _contrast_ratio(probe.page, ".lede", "body") >= 4.5
+            assert probe.page.evaluate("window.__pineCspViolations") == []
+
+        probe.page.goto("/")
+        probe.page.keyboard.press("Tab")
+        expect(probe.page.get_by_role("link", name="Skip to content")).to_be_focused()
+        probe.page.keyboard.press("Enter")
+        expect(probe.page.locator("main")).to_be_focused()
+
+        probe.page.goto("/hypotheses/new")
+        probe.page.get_by_label("Hypothesis source").fill("   ")
+        probe.page.get_by_role("button", name="Extract proposal").click()
+        error_summary = probe.page.locator("[data-error-summary]")
+        expect(error_summary).to_be_focused()
+        assert _dom_accessibility_issues(probe.page) == []
+        assert _contrast_ratio(probe.page, ".error-summary", ".error-summary") >= 4.5
+        assert probe.errors and all("422" in message for message in probe.errors)
+        probe.errors.clear()
+        assert probe.page.evaluate("window.__pineCspViolations") == []
+    assert not probe.trace_path.exists()
+
+
+def test_browser_traffic_storage_and_assets_exclude_server_secrets(
+    playwright_runtime: Playwright,
+    browser_server: tuple[str, FakeBackend],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    base_url, backend = browser_server
+    har_path = tmp_path / "browser-security.har"
+    rendered_pages: list[str] = []
+    with _browser_probe(
+        playwright_runtime,
+        base_url=base_url,
+        tmp_path=tmp_path,
+        name="browser-security",
+        har_path=har_path,
+    ) as probe:
+        for path in (
+            "/",
+            "/hypotheses/new",
+            "/predictions",
+            f"/predictions/{backend.prediction_detail.prediction_id}",
+            "/status",
+        ):
+            response = probe.page.goto(path)
+            assert response is not None and response.ok
+            rendered_pages.append(probe.page.content())
+            assert probe.page.evaluate("window.__pineCspViolations") == []
+
+        javascript = probe.page.request.get(f"{base_url}/assets/console.js")
+        stylesheet = probe.page.request.get(f"{base_url}/assets/console.css")
+        assert javascript.ok and stylesheet.ok
+        javascript_text = javascript.text()
+        stylesheet_text = stylesheet.text()
+        storage_state = json.dumps(probe.context.storage_state(), sort_keys=True)
+        assert probe.page.evaluate("localStorage.length") == 0
+        assert probe.page.evaluate("sessionStorage.length") == 0
+        assert probe.errors == []
+
+        expected_origin = urlsplit(base_url)
+        external_requests = {
+            request_url
+            for request_url in probe.requests
+            if (
+                urlsplit(request_url).scheme,
+                urlsplit(request_url).hostname,
+                urlsplit(request_url).port,
+            )
+            != (expected_origin.scheme, expected_origin.hostname, expected_origin.port)
+        }
+        assert external_requests == set()
+
+    assert har_path.is_file()
+    browser_material = "\n".join(
+        [
+            *rendered_pages,
+            javascript_text,
+            stylesheet_text,
+            storage_state,
+            har_path.read_text(encoding="utf-8"),
+            caplog.text,
+        ]
+    )
+    for forbidden in (
+        TOKEN,
+        "Authorization: Bearer",
+        '"name": "authorization"',
+        "/run/credentials/pine-console.service/backend-token",
+    ):
+        assert forbidden not in browser_material
+    har_path.unlink()
+    assert not probe.trace_path.exists()
+
+
+def test_browser_trace_is_retained_only_for_a_failed_journey(
+    playwright_runtime: Playwright,
+    browser_server: tuple[str, FakeBackend],
+    tmp_path: Path,
+) -> None:
+    base_url, _backend = browser_server
+    failure_evidence = tmp_path / "synthetic-failure-evidence"
+    trace_path = failure_evidence / "synthetic-failure-chromium.zip"
+
+    with pytest.raises(RuntimeError, match="synthetic browser failure"):
+        with _browser_probe(
+            playwright_runtime,
+            base_url=base_url,
+            tmp_path=tmp_path,
+            name="synthetic-failure",
+            evidence_root=failure_evidence,
+        ) as probe:
+            probe.page.goto("/")
+            raise RuntimeError("synthetic browser failure")
+
+    assert trace_path.is_file()
+    assert trace_path.stat().st_size > 0
+    with ZipFile(trace_path) as archive:
+        assert archive.testzip() is None
+        assert all(TOKEN.encode("ascii") not in archive.read(name) for name in archive.namelist())
+    trace_path.unlink()
+    assert list(failure_evidence.glob("*.zip")) == []

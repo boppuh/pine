@@ -12,6 +12,9 @@
   --action-bg: #0f5132;
   --action-ink: #ffffff;
   --focus: #146c94;
+  --warning: #b86000;
+  --warning-soft: #f3a83b;
+  --warning-ink: #7a3e00;
   --radius-panel: 12px;
   --radius-control: 8px;
   --content-width: 72rem;
@@ -33,6 +36,9 @@
     --action-bg: #66d69a;
     --action-ink: #0b2115;
     --focus: #7dd3fc;
+    --warning: #f3a83b;
+    --warning-soft: #b86000;
+    --warning-ink: #ffd18a;
   }
 }
 
@@ -336,9 +342,9 @@ code {
 }
 
 .badge.is-warning {
-  color: var(--warning-ink, #7a3e00);
-  border-color: color-mix(in srgb, #b86000 45%, var(--line));
-  background: color-mix(in srgb, #f3a83b 18%, var(--surface));
+  color: var(--warning-ink);
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--line));
+  background: color-mix(in srgb, var(--warning-soft) 18%, var(--surface));
 }
 
 .notice,
@@ -368,8 +374,8 @@ code {
 .notice.is-warning,
 .freshness-notice.is-warning,
 .error-summary {
-  border-color: color-mix(in srgb, #b86000 45%, var(--line));
-  background: color-mix(in srgb, #f3a83b 12%, var(--surface));
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--line));
+  background: color-mix(in srgb, var(--warning-soft) 12%, var(--surface));
 }
 
 .error-summary h2 {
@@ -841,9 +847,9 @@ textarea:hover {
 
 .prediction-row.is-unverified {
   padding-inline: 1rem;
-  border: 1px solid color-mix(in srgb, #b86000 45%, var(--line));
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, var(--line));
   border-top: 0;
-  background: color-mix(in srgb, #f3a83b 9%, var(--canvas));
+  background: color-mix(in srgb, var(--warning-soft) 9%, var(--canvas));
 }
 
 .prediction-primary a,

@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from ledger.api import CaptureResponse
+from ledger.console import migrations as console_migrations
 from ledger.console.errors import ConsoleStateError, WorkflowConflictError, WorkflowNotFoundError
 from ledger.console.migrations import (
     _MIGRATION_1,
@@ -129,6 +130,55 @@ def test_released_v1_database_migrates_sessions_without_reinitialization(tmp_pat
         )
     finally:
         migrated.close()
+
+
+def test_failed_state_migration_rolls_back_and_remains_recoverable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "failed-migration" / "console.db"
+    path.parent.mkdir(mode=0o700)
+    connection = sqlite3.connect(path)
+    for statement in _migration_statements(_MIGRATION_1):
+        connection.execute(statement)
+    connection.execute(
+        "INSERT INTO console_schema_migrations(version, applied_at) VALUES (1, 'v1')"
+    )
+    connection.execute("PRAGMA user_version = 1")
+    connection.commit()
+    connection.close()
+    path.chmod(0o600)
+
+    valid_migration = console_migrations._MIGRATIONS[2]
+    monkeypatch.setitem(
+        console_migrations._MIGRATIONS,
+        2,
+        valid_migration + "\nCREATE TABLE incomplete(\n",
+    )
+
+    with pytest.raises(ConsoleStateError, match="incomplete"):
+        ConsoleStateStore(path)
+
+    unchanged = sqlite3.connect(path)
+    try:
+        assert unchanged.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert (
+            unchanged.execute("SELECT MAX(version) FROM console_schema_migrations").fetchone()[0]
+            == 1
+        )
+        assert (
+            unchanged.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'console_sessions'"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        unchanged.close()
+
+    monkeypatch.setitem(console_migrations._MIGRATIONS, 2, valid_migration)
+    recovered = ConsoleStateStore(path)
+    assert recovered.get_status() == {"schema_version": CONSOLE_SCHEMA_VERSION}
 
 
 def test_state_path_rejects_ledger_symlink_and_permissive_parent(tmp_path: Path) -> None:

@@ -97,10 +97,11 @@ jobs:
           PINE_RUN_BROWSER_TESTS: "1"
         run: uv run pytest -m browser tests/console/test_capture_browser.py
 
-      - name: Upload browser traces
-        if: always()
+      - name: Upload browser failure evidence
+        if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: console-browser-traces
+          name: console-browser-failure-evidence
           path: test-results/browser/*.zip
-          if-no-files-found: warn
+          if-no-files-found: ignore
+          retention-days: 7
