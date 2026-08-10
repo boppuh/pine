@@ -53,6 +53,24 @@ def test_console_readiness_is_credentialed_and_uses_the_read_only_check() -> Non
     assert "OnUnitActiveSec=5min" in timer
 
 
+def test_console_prestart_checks_state_without_requesting_the_loaded_credential() -> None:
+    service = _unit("pine-console.service")
+    prestart = next(line for line in service.splitlines() if line.startswith("ExecStartPre="))
+    start = next(line for line in service.splitlines() if line.startswith("ExecStart="))
+
+    assert prestart == (
+        "ExecStartPre=/opt/decision-edge/current/venv/bin/pine-console-state preflight "
+        "--state-path /var/lib/pine/console/console.db"
+    )
+    assert "PINE_CONSOLE_BACKEND_CREDENTIAL_PATH" not in prestart
+    assert "pine-research-console check" not in prestart
+    assert (
+        "PINE_CONSOLE_BACKEND_CREDENTIAL_PATH="
+        "/run/credentials/pine-console.service/backend-token" in start
+    )
+    assert "/opt/decision-edge/current/venv/bin/pine-research-console serve" in start
+
+
 def test_console_environment_example_contains_no_credential_value() -> None:
     environment = _unit("console.env.example")
 
