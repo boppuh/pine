@@ -52,6 +52,7 @@ class _BrowserServer:
     base_url: str
     backend: FakeBackend
     credential_path: Path
+    raw_form_origins: list[str | None]
 
 
 @contextmanager
@@ -160,9 +161,16 @@ def _browser_probe(
 class _TrustedIngress:
     """Represent the header and socket metadata supplied by Tailscale Serve."""
 
-    def __init__(self, app: Any, socket_path: Path) -> None:
+    def __init__(
+        self,
+        app: Any,
+        socket_path: Path,
+        *,
+        raw_form_origins: list[str | None],
+    ) -> None:
         self.app = app
         self.socket_path = socket_path
+        self.raw_form_origins = raw_form_origins
 
     async def __call__(self, scope, receive, send) -> None:
         async def local_http_send(message) -> None:
@@ -185,6 +193,14 @@ class _TrustedIngress:
             scope = dict(scope)
             scope["client"] = None
             scope["server"] = (str(self.socket_path), None)
+            method = str(scope.get("method", "GET")).upper()
+            if method not in {"GET", "HEAD", "OPTIONS"}:
+                raw_origins = [
+                    value.decode("ascii", errors="replace")
+                    for name, value in scope.get("headers", [])
+                    if name.lower() == b"origin"
+                ]
+                self.raw_form_origins.append(raw_origins[0] if len(raw_origins) == 1 else None)
             stripped = {
                 b"host",
                 b"origin",
@@ -216,7 +232,7 @@ class _TrustedIngress:
                     (b"sec-fetch-dest", b"document"),
                 ]
             )
-            if str(scope.get("method", "GET")).upper() not in {"GET", "HEAD", "OPTIONS"}:
+            if method not in {"GET", "HEAD", "OPTIONS"}:
                 headers.append((b"origin", f"https://{HOST}".encode("ascii")))
             scope["headers"] = headers
         await self.app(scope, receive, local_http_send)
@@ -256,9 +272,11 @@ def browser_server(
         idle_lifetime=config.session_idle_lifetime,
         clock=clock,
     )
+    raw_form_origins: list[str | None] = []
     app = _TrustedIngress(
         create_console_app(config, store, fake_backend, sessions=sessions),
         socket_path,
+        raw_form_origins=raw_form_origins,
     )
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -279,6 +297,7 @@ def browser_server(
             base_url=f"http://localhost:{port}",
             backend=fake_backend,
             credential_path=credential,
+            raw_form_origins=raw_form_origins,
         )
     finally:
         server.should_exit = True
@@ -392,6 +411,8 @@ def test_keyboard_capture_flow_in_chromium_and_webkit(
         expect(page.get_by_role("heading", name="Preregistration committed")).to_be_visible()
         expect(page.get_by_text(backend.response.prediction_id, exact=True)).to_be_visible()
         assert len(backend.capture_requests) == 1
+        assert browser_server.raw_form_origins
+        assert set(browser_server.raw_form_origins) == {base_url}
         assert probe.errors == []
     assert not probe.trace_path.exists()
 
