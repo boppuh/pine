@@ -39,7 +39,8 @@ SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
     (b"content-security-policy", CONTENT_SECURITY_POLICY.encode("ascii")),
     (b"x-content-type-options", b"nosniff"),
     (b"x-frame-options", b"DENY"),
-    (b"referrer-policy", b"no-referrer"),
+    # Preserve same-origin POST identity without leaking referrers across origins.
+    (b"referrer-policy", b"same-origin"),
     (
         b"permissions-policy",
         b"camera=(), microphone=(), geolocation=(), payment=(), usb=(), "

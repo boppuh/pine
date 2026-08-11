@@ -305,7 +305,7 @@ def test_authenticated_shell_sets_exact_cookie_headers_and_local_assets(
         assert response.headers["content-security-policy"] == CONTENT_SECURITY_POLICY
         assert response.headers["x-content-type-options"] == "nosniff"
         assert response.headers["x-frame-options"] == "DENY"
-        assert response.headers["referrer-policy"] == "no-referrer"
+        assert response.headers["referrer-policy"] == "same-origin"
         assert response.headers["cross-origin-opener-policy"] == "same-origin"
         assert response.headers["cross-origin-resource-policy"] == "same-origin"
         assert response.headers["strict-transport-security"] == "max-age=31536000"
@@ -640,6 +640,14 @@ def test_csrf_origin_host_and_logout_are_enforced(
         form = {"csrf_token": csrf}
         missing_origin = client.post("/session/logout", headers=_identity_headers(), data=form)
         assert missing_origin.status_code == 403
+        assert (
+            client.post(
+                "/session/logout",
+                headers={**_identity_headers(), "Origin": "null"},
+                data=form,
+            ).status_code
+            == 403
+        )
         assert (
             client.post(
                 "/session/logout",
