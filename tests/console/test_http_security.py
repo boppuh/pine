@@ -97,7 +97,10 @@ def _client(app, config: ConsoleConfig, *, unix: bool = True) -> TestClient:
 
 def _identity_headers(identity: str = IDENTITY) -> dict[str, str]:
     return {
+        "Host": "localhost",
         "Tailscale-User-Login": identity,
+        "X-Forwarded-Host": HOST,
+        "X-Forwarded-Proto": "https",
         "Sec-Fetch-Site": "none",
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Dest": "document",
@@ -162,6 +165,45 @@ def test_identity_is_missing_unapproved_malformed_or_tcp_spoofed(
 
     with _client(app, config, unix=False) as tcp_client:
         assert tcp_client.get("/", headers=_identity_headers()).status_code == 403
+
+
+def test_tailscale_proxy_destination_is_exact_and_fails_closed(
+    tmp_path: Path,
+    fake_backend: FakeBackend,
+    clock: MutableClock,
+) -> None:
+    app, config, _store, _sessions = _build_app(tmp_path, fake_backend, clock)
+
+    with _client(app, config) as client:
+        assert client.get("/", headers=_identity_headers()).status_code == 200
+        for override in (
+            {"Host": HOST},
+            {"X-Forwarded-Host": "wrong.example"},
+            {"X-Forwarded-Host": f"{HOST}:8443"},
+            {"X-Forwarded-Proto": "http"},
+        ):
+            assert client.get("/", headers={**_identity_headers(), **override}).status_code == 400
+
+        missing_forwarded_host = _identity_headers()
+        del missing_forwarded_host["X-Forwarded-Host"]
+        assert client.get("/", headers=missing_forwarded_host).status_code == 400
+
+        duplicate_forwarded_host = client.get(
+            "/",
+            headers=[
+                *_identity_headers().items(),
+                ("X-Forwarded-Host", HOST),
+            ],
+        )
+        assert duplicate_forwarded_host.status_code == 400
+
+        assert (
+            client.get(
+                "/",
+                headers={**_identity_headers(), "X-Forwarded-Host": f"{HOST}:443"},
+            ).status_code
+            == 200
+        )
 
 
 def test_real_uvicorn_unix_socket_scope_establishes_identity(
@@ -486,7 +528,6 @@ def test_failure_after_response_start_does_not_emit_a_second_start(
     )
     headers = {
         **_identity_headers(),
-        "Host": HOST,
     }
     scope = {
         "type": "http",

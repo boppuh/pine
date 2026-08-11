@@ -189,6 +189,8 @@ class _TrustedIngress:
                 b"host",
                 b"origin",
                 b"tailscale-user-login",
+                b"x-forwarded-host",
+                b"x-forwarded-proto",
                 b"sec-fetch-site",
                 b"sec-fetch-mode",
                 b"sec-fetch-dest",
@@ -205,8 +207,10 @@ class _TrustedIngress:
             ]
             headers.extend(
                 [
-                    (b"host", HOST.encode("ascii")),
+                    (b"host", b"localhost"),
                     (b"tailscale-user-login", IDENTITY.encode("ascii")),
+                    (b"x-forwarded-host", HOST.encode("ascii")),
+                    (b"x-forwarded-proto", b"https"),
                     (b"sec-fetch-site", b"same-origin"),
                     (b"sec-fetch-mode", b"navigate"),
                     (b"sec-fetch-dest", b"document"),

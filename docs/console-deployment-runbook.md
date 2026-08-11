@@ -22,6 +22,12 @@ directories. The ledger vault is read-only at the service boundary and its sourc
 token path is inaccessible. `tailscaled` is the sole approved HTTPS/identity ingress;
 Tailscale Funnel is not approved.
 
+For a Unix-socket proxy, Tailscale Serve sends the internal `Host` as `localhost` and
+places the original HTTPS destination in `X-Forwarded-Host`. The console trusts that
+forwarded destination only after authenticating the approved Tailscale identity on the
+configured Unix socket, requires `X-Forwarded-Proto: https`, and accepts only the
+configured host with no port or the default `:443` port.
+
 ## Deploy an exact release
 
 1. Record the exact reviewed Pine and MSM commits and require clean source checkouts.
